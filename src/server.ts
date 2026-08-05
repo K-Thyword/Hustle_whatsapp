@@ -1,13 +1,44 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import { getSession, updateSession } from "./session";
-import { getAvailableProviders, findOrCreateUserByPhone, createOrder } from "./appApi";
+import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
+import { routeIntent } from "./intentRouter";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+
+// Any of these, anywhere in a message, hands the conversation to a human
+// agent — matches the Hustleapp policy that disputes/refunds and anything
+// the bot can't handle are resolved by a person, not automatically.
+const ESCALATION_TRIGGERS = [
+  "agent",
+  "human",
+  "more help",
+  "help",
+  "manager",
+  "sales representative",
+  "customer service",
+];
+
+// Interim measure while there's no real backend to receive booking
+// requests: notify these agent numbers directly over WhatsApp whenever a
+// request is submitted, so a human actually sees it. Comma-separated in
+// .env, digits only (no "+", no spaces) — e.g. "233556963137,233556937198".
+// Replace with a real notification path (backend webhook, dashboard, etc.)
+// once one exists — nothing else in this file needs to change.
+const AGENT_NOTIFY_NUMBERS = (process.env.AGENT_NOTIFY_NUMBERS || "")
+  .split(",")
+  .map((n) => n.trim())
+  .filter(Boolean);
+
+async function notifyAgents(message: string) {
+  for (const number of AGENT_NOTIFY_NUMBERS) {
+    await sendMessage(number, message);
+  }
+}
 
 // --- 1. Webhook verification (Meta calls this once, on setup) ---
 app.get("/webhook", (req: Request, res: Response) => {
@@ -45,64 +76,149 @@ app.post("/webhook", async (req: Request, res: Response) => {
   }
 });
 
-// --- 3. Minimal conversation logic ---
-// This is intentionally simple — a real intent layer (LLM or button-driven
-// WhatsApp Flow) replaces the string matching below. The point of this
-// skeleton is the session + backend-call wiring, not the NLU.
+// --- 3. Conversation logic ---
+// Hustleapp connects customers with artisans/professionals — there is no
+// live/real-time list of available providers. So this flow collects the
+// customer's request details and submits them as a booking request that a
+// human agent works manually, rather than showing a live list to pick from.
+//
+// Two paths after service type + location are collected:
+//   - "standard": also asks for a date, since the job may be scheduled ahead
+//   - "instant": skips the date, submitted for agents to find someone ASAP
+//
+// Escalation to a human can happen from any stage — checked first, always.
 async function handleMessage(phone: string, text: string) {
   const session = getSession(phone);
   const lower = text.toLowerCase();
 
+  if (session.stage !== "escalated" && ESCALATION_TRIGGERS.some((t) => lower.includes(t))) {
+    await sendMessage(
+      phone,
+      "Connecting you to a human agent — someone from our team will be with you here shortly."
+    );
+    updateSession(phone, { stage: "escalated" });
+    return;
+  }
+
+  if (session.stage === "escalated") {
+    await sendMessage(phone, "A human agent has been notified and will respond to you here shortly.");
+    return;
+  }
+
+  // General questions about the business get answered directly, without
+  // derailing the booking intake, at the two earliest stages.
+  if (session.stage === "greeting" || session.stage === "awaiting_mode") {
+    const routed = await routeIntent(text);
+    if (routed.intent === "question" && routed.reply) {
+      await sendMessage(phone, routed.reply);
+      return;
+    }
+  }
+
   if (session.stage === "greeting") {
-    await sendMessage(phone, "Hi! What do you need — a delivery, a ride, or something else?");
-    updateSession(phone, { stage: "awaiting_service_type" });
+    await sendMessage(
+      phone,
+      "Hi! Welcome to Hustleapp. Do you want this done on a specific date, or do you need it instantly (ASAP)?\n\nReply 'schedule' or 'instant'."
+    );
+    updateSession(phone, { stage: "awaiting_mode" });
+    return;
+  }
+
+  if (session.stage === "awaiting_mode") {
+    const mode: BookingMode = lower.includes("instant") ? "instant" : "standard";
+    await sendMessage(phone, "What service do you need? (e.g. plumber, electrician, accountant, tutor...)");
+    updateSession(phone, { stage: "awaiting_service_type", data: { mode } });
     return;
   }
 
   if (session.stage === "awaiting_service_type") {
-    const serviceType = lower.includes("ride") ? "ride" : "delivery";
-    const user = await findOrCreateUserByPhone(phone);
-    const providers = await getAvailableProviders(serviceType);
+    await sendMessage(phone, "What location/area is this for?");
+    updateSession(phone, { stage: "awaiting_location", data: { serviceType: text } });
+    return;
+  }
 
-    if (providers.length === 0) {
-      await sendMessage(phone, "No providers available right now — try again shortly.");
-      return;
+  if (session.stage === "awaiting_location") {
+    const mode = session.data.mode as BookingMode;
+    if (mode === "standard") {
+      await sendMessage(phone, "What date would you like this done?");
+      updateSession(phone, { stage: "awaiting_date", data: { location: text } });
+    } else {
+      await sendMessage(phone, "Please describe what you need done.");
+      updateSession(phone, { stage: "awaiting_description", data: { location: text } });
     }
+    return;
+  }
 
-    const list = providers
-      .map((p, i) => `${i + 1}. ${p.name} — ~${p.etaMinutes} min`)
-      .join("\n");
-    await sendMessage(phone, `Available now:\n${list}\n\nReply with a number to confirm.`);
-    updateSession(phone, {
-      stage: "awaiting_confirmation",
-      data: { serviceType, providers, userId: user.id },
-    });
+  if (session.stage === "awaiting_date") {
+    await sendMessage(phone, "Please describe what you need done.");
+    updateSession(phone, { stage: "awaiting_description", data: { dateWanted: text } });
+    return;
+  }
+
+  if (session.stage === "awaiting_description") {
+    const mode = session.data.mode as BookingMode;
+    const serviceType = session.data.serviceType as string;
+    const location = session.data.location as string;
+    const dateWanted = session.data.dateWanted as string | undefined;
+
+    const summaryLines = [
+      `Service: ${serviceType}`,
+      `Location: ${location}`,
+      ...(mode === "standard" ? [`Date: ${dateWanted}`] : []),
+      `Details: ${text}`,
+    ];
+    await sendMessage(
+      phone,
+      `Please confirm your request:\n${summaryLines.join("\n")}\n\nReply 'yes' to submit, or 'no' to start over.`
+    );
+    updateSession(phone, { stage: "awaiting_confirmation", data: { description: text } });
     return;
   }
 
   if (session.stage === "awaiting_confirmation") {
-    const providers = session.data.providers as { id: string; name: string }[];
-    const choice = parseInt(text, 10) - 1;
-    const picked = providers?.[choice];
-
-    if (!picked) {
-      await sendMessage(phone, "Please reply with a valid number from the list.");
+    if (!lower.includes("yes")) {
+      await sendMessage(phone, "No problem — let's start again. Reply 'schedule' or 'instant'.");
+      updateSession(phone, { stage: "greeting" });
       return;
     }
 
-    const order = await createOrder({
-      userId: session.data.userId as string,
-      providerId: picked.id,
+    const user = await findOrCreateUserByPhone(phone);
+    const mode = session.data.mode as BookingMode;
+    const result = await submitBookingRequest({
+      userId: user.id,
+      mode,
       serviceType: session.data.serviceType as string,
+      location: session.data.location as string,
+      dateWanted: session.data.dateWanted as string | undefined,
+      description: session.data.description as string,
       channel: "whatsapp",
     });
 
-    await sendMessage(phone, `Order confirmed with ${picked.name}. Order ID: ${order.orderId}`);
-    updateSession(phone, { stage: "order_placed" });
+    const turnaround =
+      mode === "instant"
+        ? "A few minutes up to about an hour — we'll update you if it's taking longer."
+        : "We'll confirm your provider ahead of your requested date.";
+
+    await sendMessage(
+      phone,
+      `Request submitted! Reference: ${result.requestId}\nOne of our agents will now find you a provider. ${turnaround}\n\nPayment happens once you're matched — your money is held in escrow until the job is done.`
+    );
+
+    await notifyAgents(
+      `New booking request (${mode})\n` +
+        `Reference: ${result.requestId}\n` +
+        `Customer: ${phone}\n` +
+        `Service: ${session.data.serviceType}\n` +
+        `Location: ${session.data.location}\n` +
+        (mode === "standard" ? `Date: ${session.data.dateWanted}\n` : "") +
+        `Details: ${session.data.description}`
+    );
+
+    updateSession(phone, { stage: "request_submitted" });
     return;
   }
 
-  // order_placed or unrecognized — reset for simplicity in this skeleton
+  // request_submitted or unrecognized — reset for simplicity in this skeleton
   updateSession(phone, { stage: "greeting" });
 }
 

@@ -6,9 +6,14 @@
 
 export type ConversationStage =
   | "greeting"
+  | "awaiting_mode"
   | "awaiting_service_type"
+  | "awaiting_location"
+  | "awaiting_date"
+  | "awaiting_description"
   | "awaiting_confirmation"
-  | "order_placed";
+  | "request_submitted"
+  | "escalated";
 
 export interface ConversationSession {
   phone: string;
