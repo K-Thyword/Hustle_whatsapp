@@ -91,17 +91,28 @@ async function handleMessage(phone: string, text: string) {
   const session = getSession(phone);
   const lower = text.toLowerCase();
 
+  // Lets a customer break out of "escalated" mode and start fresh, instead
+  // of being stuck getting the same "someone will be with you" line forever
+  // if an agent hasn't replied yet.
+  const RESTART_TRIGGERS = ["new request", "start over", "restart", "book again", "new booking"];
+
   if (session.stage !== "escalated" && ESCALATION_TRIGGERS.some((t) => lower.includes(t))) {
     await sendMessage(
       phone,
-      "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly."
+      "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly. (If you'd like to start a new request in the meantime, just say 'new request'.)"
     );
+    await notifyAgents(`Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"`);
     updateSession(phone, { stage: "escalated" });
     return;
   }
 
   if (session.stage === "escalated") {
-    await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly.");
+    if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
+      await sendMessage(phone, "No problem, let's get you sorted. Would you like this done on a specific date, or right away?\n\nJust reply 'schedule' or 'instant'.");
+      updateSession(phone, { stage: "awaiting_mode" });
+      return;
+    }
+    await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly. (Say 'new request' if you'd like to start something new while you wait.)");
     return;
   }
 
