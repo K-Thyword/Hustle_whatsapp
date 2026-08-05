@@ -94,14 +94,14 @@ async function handleMessage(phone: string, text: string) {
   if (session.stage !== "escalated" && ESCALATION_TRIGGERS.some((t) => lower.includes(t))) {
     await sendMessage(
       phone,
-      "Connecting you to a human agent — someone from our team will be with you here shortly."
+      "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly."
     );
     updateSession(phone, { stage: "escalated" });
     return;
   }
 
   if (session.stage === "escalated") {
-    await sendMessage(phone, "A human agent has been notified and will respond to you here shortly.");
+    await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly.");
     return;
   }
 
@@ -118,7 +118,7 @@ async function handleMessage(phone: string, text: string) {
   if (session.stage === "greeting") {
     await sendMessage(
       phone,
-      "Hi! Welcome to Hustleapp. Do you want this done on a specific date, or do you need it instantly (ASAP)?\n\nReply 'schedule' or 'instant'."
+      "Hi there, thanks for reaching out to Hustleapp! Would you like this done on a specific date, or do you need it handled right away?\n\nJust reply 'schedule' or 'instant' and we'll take it from there."
     );
     updateSession(phone, { stage: "awaiting_mode" });
     return;
@@ -126,13 +126,13 @@ async function handleMessage(phone: string, text: string) {
 
   if (session.stage === "awaiting_mode") {
     const mode: BookingMode = lower.includes("instant") ? "instant" : "standard";
-    await sendMessage(phone, "What service do you need? (e.g. plumber, electrician, accountant, tutor...)");
+    await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
     updateSession(phone, { stage: "awaiting_service_type", data: { mode } });
     return;
   }
 
   if (session.stage === "awaiting_service_type") {
-    await sendMessage(phone, "What location/area is this for?");
+    await sendMessage(phone, "Got it. Which area or location is this for?");
     updateSession(phone, { stage: "awaiting_location", data: { serviceType: text } });
     return;
   }
@@ -140,17 +140,17 @@ async function handleMessage(phone: string, text: string) {
   if (session.stage === "awaiting_location") {
     const mode = session.data.mode as BookingMode;
     if (mode === "standard") {
-      await sendMessage(phone, "What date would you like this done?");
+      await sendMessage(phone, "And what date would you like this done?");
       updateSession(phone, { stage: "awaiting_date", data: { location: text } });
     } else {
-      await sendMessage(phone, "Please describe what you need done.");
+      await sendMessage(phone, "Thanks — now tell me a bit more about what you need done.");
       updateSession(phone, { stage: "awaiting_description", data: { location: text } });
     }
     return;
   }
 
   if (session.stage === "awaiting_date") {
-    await sendMessage(phone, "Please describe what you need done.");
+    await sendMessage(phone, "Thanks — now tell me a bit more about what you need done.");
     updateSession(phone, { stage: "awaiting_description", data: { dateWanted: text } });
     return;
   }
@@ -169,7 +169,7 @@ async function handleMessage(phone: string, text: string) {
     ];
     await sendMessage(
       phone,
-      `Please confirm your request:\n${summaryLines.join("\n")}\n\nReply 'yes' to submit, or 'no' to start over.`
+      `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`
     );
     updateSession(phone, { stage: "awaiting_confirmation", data: { description: text } });
     return;
@@ -177,7 +177,7 @@ async function handleMessage(phone: string, text: string) {
 
   if (session.stage === "awaiting_confirmation") {
     if (!lower.includes("yes")) {
-      await sendMessage(phone, "No problem — let's start again. Reply 'schedule' or 'instant'.");
+      await sendMessage(phone, "No worries, let's start over. Reply 'schedule' or 'instant' whenever you're ready.");
       updateSession(phone, { stage: "greeting" });
       return;
     }
@@ -196,12 +196,12 @@ async function handleMessage(phone: string, text: string) {
 
     const turnaround =
       mode === "instant"
-        ? "A few minutes up to about an hour — we'll update you if it's taking longer."
-        : "We'll confirm your provider ahead of your requested date.";
+        ? "usually a few minutes up to about an hour — we'll keep you posted if it's taking a bit longer"
+        : "we'll get back to you well ahead of your requested date";
 
     await sendMessage(
       phone,
-      `Request submitted! Reference: ${result.requestId}\nOne of our agents will now find you a provider. ${turnaround}\n\nPayment happens once you're matched — your money is held in escrow until the job is done.`
+      `All set! Your reference number is ${result.requestId}. One of our agents will now get to work finding you a provider — ${turnaround}.\n\nJust a heads up: you'll only pay once you're matched, and that payment is held safely until the job's done.`
     );
 
     await notifyAgents(

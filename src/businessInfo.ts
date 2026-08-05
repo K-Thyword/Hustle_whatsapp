@@ -5,11 +5,16 @@
 // no code changes needed elsewhere.
 
 export const BUSINESS_INFO = `
-Business name: Hustleapp
+Business name: Hustleapp (also called Hustle)
 
 What Hustleapp is:
-Hustleapp connects customers with vetted artisans and professionals for hire —
-it is not a delivery or ride-hailing service.
+Hustleapp connects customers with vetted, independent service providers
+("Hustlers") — artisans and professionals — for hire. It is not a delivery
+or ride-hailing service, and it does NOT deal in sellers of physical goods
+or products. If someone asks about buying/selling an item (not a service),
+tell them politely that Hustleapp only handles service providers, not goods.
+
+Founder: Simone N. Smith-Bean, an attorney and entrepreneur.
 
 Hours of operation:
 - 7am–10pm daily
@@ -17,9 +22,30 @@ Hours of operation:
 Service areas:
 - Currently Accra and Ho only
 
-Services offered:
-- Artisans: plumbers, carpenters, electricians, and similar trades
-- Professionals: accountants, lawyers, tutors, homecare nurses, and similar
+Services offered — any artisan or professional service provider commonly
+found in the Ghanaian economy, including but not limited to:
+- Building & home trades: plumbers, electricians, carpenters, masons/builders,
+  painters, welders, tilers, POP/ceiling installers, roofers, locksmiths,
+  generator technicians, solar installers, AC/refrigeration technicians,
+  CCTV/security installers, upholsterers
+- Repairs & maintenance: mechanics/auto technicians, phone and computer
+  repair technicians, appliance repair technicians, handymen
+- Home & personal services: cleaners, gardeners/landscapers, movers, laundry
+  and dry cleaning, pest control, tailors/seamstresses
+- Beauty & grooming: hairdressers, barbers, makeup artists, nail technicians
+- Culinary: chefs and caterers (local and intercontinental dishes)
+- Creative & events: photographers, videographers, DJs, event planners,
+  decorators
+- Professionals: accountants, lawyers, tutors/instructors (academic, tech,
+  music, or hobby), homecare nurses, fitness trainers
+- Drivers (personal/logistics, not ride-hailing)
+
+This list is a guide, not a strict limit — if a customer asks for an artisan
+or professional service not explicitly listed above, still take the request.
+There is no live, real-time list of every provider yet, so a human agent will
+personally check availability and let the customer know if someone can be
+found, even for less common trades. Only decline requests that are for
+buying/selling physical goods, not a service.
 
 Pricing basics:
 - Some services have a fixed price per service
@@ -74,4 +100,14 @@ A: Instant requests typically take a few minutes up to about an hour — you'll 
 
 Q: Do I pay upfront when I submit a request, or only once I'm matched?
 A: You pay once an agent has matched you with a provider — that payment confirms the provider will come do the work. The money is held in escrow and only released to the provider once the job is done.
+
+Q: How are service providers vetted?
+A: Providers verify their identity with a valid government-issued ID and a selfie before they're allowed to take jobs on Hustleapp.
+
+Q: Do you sell products, or only services?
+A: Only services — Hustleapp connects customers with service providers (artisans and professionals). It does not sell or deliver physical goods.
+
+Other ways to reach Hustleapp directly:
+- Email: letshustle@hustleapp.io
+- Phone: 055 696 3137 or 055 693 7198
 `.trim();
