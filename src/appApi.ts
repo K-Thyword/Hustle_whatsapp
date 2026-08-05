@@ -31,6 +31,7 @@ export interface BookingRequestInput {
   dateWanted?: string; // only present for standard (scheduled) bookings
   description: string;
   channel: "whatsapp";
+  attachmentCount?: number; // photos/videos/documents the customer attached
 }
 
 export interface BookingRequestResult {

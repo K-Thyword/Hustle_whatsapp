@@ -54,6 +54,14 @@ app.get("/webhook", (req: Request, res: Response) => {
   }
 });
 
+// A photo, video, or document a customer attaches while describing their
+// job — forwarded to agents as-is (by media ID) alongside the booking
+// summary, so no separate file storage is needed for this interim setup.
+export interface MediaAttachment {
+  id: string;
+  type: "image" | "video" | "document";
+}
+
 // --- 2. Inbound message handler ---
 app.post("/webhook", async (req: Request, res: Response) => {
   // Always 200 quickly — WhatsApp retries aggressively on non-200s.
@@ -65,12 +73,25 @@ app.post("/webhook", async (req: Request, res: Response) => {
   if (!message) return; // status updates, etc. — ignore for now
 
   const from: string = message.from; // phone number, e.g. "233241234567"
-  const text: string = message.text?.body?.trim() ?? "";
 
-  console.log(`Inbound from ${from}: ${text}`);
+  let text: string = message.text?.body?.trim() ?? "";
+  let media: MediaAttachment | undefined;
+
+  if (message.type === "image" && message.image?.id) {
+    media = { id: message.image.id, type: "image" };
+    text = (message.image.caption ?? "").trim();
+  } else if (message.type === "video" && message.video?.id) {
+    media = { id: message.video.id, type: "video" };
+    text = (message.video.caption ?? "").trim();
+  } else if (message.type === "document" && message.document?.id) {
+    media = { id: message.document.id, type: "document" };
+    text = (message.document.caption ?? "").trim();
+  }
+
+  console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
 
   try {
-    await handleMessage(from, text);
+    await handleMessage(from, text, media);
   } catch (err) {
     console.error("Error handling message:", err);
   }
@@ -87,9 +108,26 @@ app.post("/webhook", async (req: Request, res: Response) => {
 //   - "instant": skips the date, submitted for agents to find someone ASAP
 //
 // Escalation to a human can happen from any stage — checked first, always.
-async function handleMessage(phone: string, text: string) {
+async function handleMessage(phone: string, text: string, media?: MediaAttachment) {
   const session = getSession(phone);
   const lower = text.toLowerCase();
+
+  // A customer can attach a photo/video/document at any point — save it
+  // against their session so it can be forwarded to agents with the rest
+  // of the booking. If it arrived with no caption text, acknowledge it and
+  // wait for their next message rather than advancing the flow with "".
+  if (media) {
+    const existing = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
+    updateSession(phone, { data: { attachments: [...existing, media] } });
+
+    if (!text) {
+      await sendMessage(
+        phone,
+        "Got it, thanks for the photo — I've attached it to your request. Go ahead and continue whenever you're ready."
+      );
+      return;
+    }
+  }
 
   // Lets a customer break out of "escalated" mode and start fresh, instead
   // of being stuck getting the same "someone will be with you" line forever
@@ -154,14 +192,14 @@ async function handleMessage(phone: string, text: string) {
       await sendMessage(phone, "And what date would you like this done?");
       updateSession(phone, { stage: "awaiting_date", data: { location: text } });
     } else {
-      await sendMessage(phone, "Thanks — now tell me a bit more about what you need done.");
+      await sendMessage(phone, "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.");
       updateSession(phone, { stage: "awaiting_description", data: { location: text } });
     }
     return;
   }
 
   if (session.stage === "awaiting_date") {
-    await sendMessage(phone, "Thanks — now tell me a bit more about what you need done.");
+    await sendMessage(phone, "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.");
     updateSession(phone, { stage: "awaiting_description", data: { dateWanted: text } });
     return;
   }
@@ -195,6 +233,7 @@ async function handleMessage(phone: string, text: string) {
 
     const user = await findOrCreateUserByPhone(phone);
     const mode = session.data.mode as BookingMode;
+    const attachments = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
     const result = await submitBookingRequest({
       userId: user.id,
       mode,
@@ -203,6 +242,7 @@ async function handleMessage(phone: string, text: string) {
       dateWanted: session.data.dateWanted as string | undefined,
       description: session.data.description as string,
       channel: "whatsapp",
+      attachmentCount: attachments.length,
     });
 
     const turnaround =
@@ -222,8 +262,17 @@ async function handleMessage(phone: string, text: string) {
         `Service: ${session.data.serviceType}\n` +
         `Location: ${session.data.location}\n` +
         (mode === "standard" ? `Date: ${session.data.dateWanted}\n` : "") +
-        `Details: ${session.data.description}`
+        `Details: ${session.data.description}` +
+        (attachments.length ? `\nAttachments: ${attachments.length} (forwarded below)` : "")
     );
+
+    // Forward each attached photo/video/document straight to the agents so
+    // they can see exactly what the customer sent, no separate storage needed.
+    for (const attachment of attachments) {
+      for (const number of AGENT_NOTIFY_NUMBERS) {
+        await sendMedia(number, attachment);
+      }
+    }
 
     updateSession(phone, { stage: "request_submitted" });
     return;
@@ -264,6 +313,39 @@ async function sendMessage(to: string, body: string) {
 
   if (!res.ok) {
     console.error("Failed to send message:", await res.text());
+  }
+}
+
+// Forwards a photo/video/document a customer already sent us, by its
+// WhatsApp media ID, straight to another number (an agent). No download or
+// re-upload needed — WhatsApp hosts the file, we just reference it again.
+async function sendMedia(to: string, media: MediaAttachment) {
+  const hasRealCredentials =
+    process.env.WHATSAPP_ACCESS_TOKEN &&
+    process.env.WHATSAPP_ACCESS_TOKEN !== "from-meta-business-manager";
+
+  if (!hasRealCredentials) {
+    console.log(`[DRY RUN — would forward ${media.type} (${media.id}) to ${to}]`);
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v20.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: media.type,
+      [media.type]: { id: media.id },
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("Failed to forward media:", await res.text());
   }
 }
 
