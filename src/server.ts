@@ -45,6 +45,8 @@ import {
   setActiveChatForAgent,
   getActiveChatForAgent,
   clearActiveChatForAgent,
+  appendLiveChatMessage,
+  LiveChat,
 } from "./liveChat";
 
 // --- Crash safety net ---
@@ -274,6 +276,78 @@ async function endLiveChatAsAgent(agentPhone: string, phone: string, chat: { cla
   return true;
 }
 
+// Resolves what an agent typed after "transfer" — either the target's
+// phone number directly, or their configured display name (case-
+// insensitive) — to an actual agent phone number. Returns undefined if it
+// doesn't match a real, currently-authorised agent, so a transfer can
+// never be pointed at an arbitrary number.
+function resolveAgentTarget(input: string): string | undefined {
+  const trimmed = input.trim();
+  if (/^\d{7,15}$/.test(trimmed)) {
+    return AGENT_NOTIFY_NUMBERS.includes(trimmed) ? trimmed : undefined;
+  }
+  const lower = trimmed.toLowerCase();
+  for (const number of AGENT_NOTIFY_NUMBERS) {
+    if (getAgentName(number).toLowerCase() === lower) return number;
+  }
+  return undefined;
+}
+
+// Hands a claimed conversation off to another agent WITH context, instead
+// of the receiving agent starting cold — the recent back-and-forth (both
+// sides) is summarized and sent along via notifyAgentSmart, which already
+// handles the case where the target hasn't texted the bot in the last 24h.
+async function transferLiveChat(agentPhone: string, phone: string, chat: LiveChat, targetInput: string): Promise<void> {
+  if (chat.claimedBy !== agentPhone) {
+    await sendMessage(
+      agentPhone,
+      chat.claimedBy
+        ? `You haven't claimed the conversation with ${phone}, so there's nothing for you to transfer — ${getAgentName(chat.claimedBy)} currently has it.`
+        : `You haven't claimed the conversation with ${phone} yet — claim it first with "${phone}: claim" before transferring it.`
+    );
+    return;
+  }
+
+  const target = resolveAgentTarget(targetInput);
+  if (!target) {
+    await sendMessage(
+      agentPhone,
+      `Couldn't find an agent matching "${targetInput}" — use their name (e.g. "transfer Julliana") or their phone number.`
+    );
+    return;
+  }
+  if (target === agentPhone) {
+    await sendMessage(agentPhone, "That's already you — nothing to transfer.");
+    return;
+  }
+
+  claimLiveChat(phone, target);
+  clearActiveChatForAgent(agentPhone);
+  setActiveChatForAgent(target, phone);
+
+  const recentLines = chat.transcript.slice(-10).map((entry) =>
+    entry.from === "customer" ? `Customer: ${entry.text}` : `${getAgentName(entry.agentPhone ?? agentPhone)}: ${entry.text}`
+  );
+  const historyBlock = recentLines.length > 0 ? `\n\nRecent messages:\n${recentLines.join("\n")}` : "";
+
+  await notifyAgentSmart(
+    target,
+    `${getAgentName(agentPhone)} transferred the conversation with ${phone} to you.${historyBlock}\n\nJust type your reply — no need to include their number. Say "end" when you're done.`,
+    "a transferred conversation"
+  );
+  await sendMessage(agentPhone, `Transferred ${phone} to ${getAgentName(target)}.`);
+  await sendMessage(phone, `You're now connected with *${getAgentName(target)}* from our team — go ahead and chat here.`);
+
+  for (const number of AGENT_NOTIFY_NUMBERS) {
+    if (number === agentPhone || number === target) continue;
+    await notifyAgentSmart(
+      number,
+      `The conversation with ${phone} was transferred from ${getAgentName(agentPhone)} to ${getAgentName(target)} — no action needed.`,
+      "a transfer update"
+    );
+  }
+}
+
 async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
   const chat = getLiveChat(phone);
   if (!chat) {
@@ -297,7 +371,7 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
     setActiveChatForAgent(agentPhone, phone);
     await sendMessage(
       agentPhone,
-      `You've claimed the conversation with ${phone} — it's now your active chat. Just type your reply and it'll go straight to them (no need to include their number again). Say "end" when you're done, or message another number to switch.`
+      `You've claimed the conversation with ${phone} — it's now your active chat. Just type your reply and it'll go straight to them (no need to include their number again). Say "end" when you're done, "transfer <name>" to hand it off, or message another number to switch.`
     );
     for (const number of AGENT_NOTIFY_NUMBERS) {
       if (number === agentPhone) continue;
@@ -331,10 +405,16 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
     return;
   }
 
+  const transferMatch = rest.trim().match(/^transfer\s+(.+)$/i);
+  if (transferMatch) {
+    await transferLiveChat(agentPhone, phone, chat, transferMatch[1].trim());
+    return;
+  }
+
   if (!rest.trim()) {
     await sendMessage(
       agentPhone,
-      `Nothing to send — use "${phone}: <message>" to chat, "${phone}: claim" to claim it, or "${phone}: end" to close it out.`
+      `Nothing to send — use "${phone}: <message>" to chat, "${phone}: claim" to claim it, "${phone}: transfer <name>" to hand it off, or "${phone}: end" to close it out.`
     );
     return;
   }
@@ -360,6 +440,7 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
   // one their plain (unprefixed) messages go to just by prefixing once.
   setActiveChatForAgent(agentPhone, phone);
   await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
+  appendLiveChatMessage(phone, "agent", rest.trim(), agentPhone);
 }
 
 // --- "my requests": an agent checking what they're currently handling ---
@@ -485,8 +566,14 @@ async function handleAgentMessage(agentPhone: string, text: string) {
           await endLiveChatAsAgent(agentPhone, activeCustomer, activeChat);
           return;
         }
+        const bareTransferMatch = text.trim().match(/^transfer\s+(.+)$/i);
+        if (bareTransferMatch) {
+          await transferLiveChat(agentPhone, activeCustomer, activeChat, bareTransferMatch[1].trim());
+          return;
+        }
         if (text.trim()) {
           await sendMessage(activeCustomer, `*${getAgentName(agentPhone)}*: ${text.trim()}`);
+          appendLiveChatMessage(activeCustomer, "agent", text.trim(), agentPhone);
         }
         return;
       }
@@ -498,7 +585,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     if (text.includes(":")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: end\n\nTo see what you're currently handling: my requests"
+        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: transfer <agent name> — hand it off with the recent history\n<customer phone>: end\n\nTo see what you're currently handling: my requests"
       );
     }
     return;
@@ -935,9 +1022,17 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     }
   }
 
-  // Keep a short rolling log of the customer's own messages, and clear any
-  // pending inactivity check-in flags — any reply means they're still here.
-  appendMessageLog(phone, text);
+  // Keep a short rolling log of the customer's own messages — but only
+  // ones actually sent to the bot, not ones sent to a live human agent
+  // mid-chat. Those often address the agent by name ("thanks Tee", "ok
+  // Tee"), and feeding that into the AI's "recent messages from this
+  // customer" context previously caused it to mistake the agent's name
+  // for the customer's own — visible as the bot greeting a customer as
+  // "Tee" right after their chat with an agent named Tee had ended.
+  const inClaimedLiveChat = session.stage === "escalated" && Boolean(getLiveChat(phone)?.claimedBy);
+  if (!inClaimedLiveChat) {
+    appendMessageLog(phone, text);
+  }
   if (session.data.checkedIn || session.data.finalNudgeSent) {
     updateSession(phone, { data: { checkedIn: false, finalNudgeSent: false } });
   }
@@ -970,6 +1065,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       }
       if (text) {
         await sendMessage(activeChat.claimedBy, `[${phone}]: ${text}`);
+        appendLiveChatMessage(phone, "customer", text);
       }
       return;
     }

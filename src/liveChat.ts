@@ -12,12 +12,27 @@
 // messages from a number that is both (a) an authorised agent number and
 // (b) the one that claimed this specific conversation.
 
+// One line of the conversation while it's human-handled — kept so that if
+// an agent transfers the chat to a colleague, the new agent isn't starting
+// cold. agentPhone is set on "agent" entries so a transcript that spans
+// more than one agent (multiple transfers) can still attribute each line
+// correctly instead of assuming they were all the same person.
+export interface LiveChatTranscriptEntry {
+  from: "customer" | "agent";
+  text: string;
+  at: number;
+  agentPhone?: string;
+}
+
+const TRANSCRIPT_LIMIT = 30;
+
 export interface LiveChat {
   phone: string;
   claimedBy?: string; // agent phone number
   claimedAt?: number;
   startedAt: number;
   unclaimedNudgeSent?: boolean;
+  transcript: LiveChatTranscriptEntry[];
 }
 
 const liveChats = new Map<string, LiveChat>();
@@ -29,7 +44,7 @@ const liveChats = new Map<string, LiveChat>();
 export function startLiveChat(phone: string): LiveChat {
   const existing = liveChats.get(phone);
   if (existing) return existing;
-  const chat: LiveChat = { phone, startedAt: Date.now() };
+  const chat: LiveChat = { phone, startedAt: Date.now(), transcript: [] };
   liveChats.set(phone, chat);
   return chat;
 }
@@ -56,6 +71,23 @@ export function unclaimLiveChat(phone: string): LiveChat | undefined {
 
 export function endLiveChat(phone: string): void {
   liveChats.delete(phone);
+}
+
+// Records one line of a claimed conversation. No-op if the chat doesn't
+// exist (e.g. race with it just having ended) — this is purely a
+// convenience log for transfers, never the source of truth for anything.
+export function appendLiveChatMessage(
+  phone: string,
+  from: "customer" | "agent",
+  text: string,
+  agentPhone?: string
+): void {
+  if (!text) return;
+  const chat = liveChats.get(phone);
+  if (!chat) return;
+  const entry: LiveChatTranscriptEntry = { from, text, at: Date.now(), agentPhone };
+  const updatedTranscript = [...chat.transcript, entry].slice(-TRANSCRIPT_LIMIT);
+  liveChats.set(phone, { ...chat, transcript: updatedTranscript });
 }
 
 export function getAllLiveChats(): LiveChat[] {
