@@ -291,9 +291,49 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       return;
     }
 
-    // Not a direct "schedule"/"instant" — see if it's actually a question
-    // first (e.g. "do you work weekends?"), answer it, then remind them
-    // of the pending choice so the conversation doesn't stall.
+    // People rarely answer literally — "tomorrow", "asap", "next Monday",
+    // "right away" all clearly mean one or the other even without saying
+    // the word. Catch urgency phrasing first...
+    const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediately", "urgent", "urgently"];
+    if (INSTANT_PHRASES.some((p) => lower.includes(p))) {
+      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
+      updateSession(phone, {
+        stage: "awaiting_service_type",
+        data: { mode: "instant" as BookingMode, lastPrompt: "What kind of service do you need?" },
+      });
+      return;
+    }
+
+    // ...then check whether they've actually just told us a date ("tomorrow",
+    // "next Monday", "15th August") — that unambiguously means "schedule",
+    // and we can remember the date now so we don't ask them to repeat it
+    // later when we'd normally ask for the date.
+    const dateAttempt = await interpretDate(text, new Date());
+    if (dateAttempt.status === "valid") {
+      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
+      updateSession(phone, {
+        stage: "awaiting_service_type",
+        data: {
+          mode: "standard" as BookingMode,
+          suggestedDateHuman: dateAttempt.humanReadable,
+          suggestedDateIso: dateAttempt.isoDate,
+          lastPrompt: "What kind of service do you need?",
+        },
+      });
+      return;
+    }
+    if (dateAttempt.status === "past") {
+      await sendMessage(
+        phone,
+        `${dateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward, or say 'instant' if you need it right away?`
+      );
+      return;
+    }
+
+    // Not a direct "schedule"/"instant", not urgency phrasing, not a date —
+    // see if it's actually a question first (e.g. "do you work weekends?"),
+    // answer it, then remind them of the pending choice so the
+    // conversation doesn't stall.
     const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
     const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
     const routed = await routeIntent(text, { pastBookings, recentMessages });
@@ -318,6 +358,25 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "awaiting_location") {
     const mode = session.data.mode as BookingMode;
     if (mode === "standard") {
+      // They may have already told us the date back when we asked
+      // schedule-vs-instant (e.g. replied "tomorrow") — if so, don't make
+      // them repeat it, just confirm what we already picked up.
+      const suggestedDateHuman = session.data.suggestedDateHuman as string | undefined;
+      if (suggestedDateHuman) {
+        const confirmPrompt = `Just to confirm — you'd like this done on ${suggestedDateHuman}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
+        await sendMessage(phone, confirmPrompt);
+        updateSession(phone, {
+          stage: "awaiting_date_confirmation",
+          data: {
+            location: text,
+            pendingDateHuman: suggestedDateHuman,
+            pendingDateIso: session.data.suggestedDateIso,
+            lastPrompt: confirmPrompt,
+          },
+        });
+        return;
+      }
+
       const prompt = "And what date would you like this done?";
       await sendMessage(phone, prompt);
       updateSession(phone, { stage: "awaiting_date", data: { location: text, lastPrompt: prompt } });
