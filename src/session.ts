@@ -11,6 +11,7 @@ export type ConversationStage =
   | "awaiting_location"
   | "awaiting_date"
   | "awaiting_date_confirmation"
+  | "awaiting_extraction_confirmation" // confirming service/location/date already given in the opening message
   | "awaiting_extra_details" // service-specific follow-ups, recurring, budget
   | "awaiting_description"
   | "awaiting_special_instructions"

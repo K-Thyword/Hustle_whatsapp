@@ -14,6 +14,7 @@ import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./ap
 import { routeIntent } from "./intentRouter";
 import { interpretDate } from "./dateInterpreter";
 import { matchServiceCategory } from "./serviceCategories";
+import { extractBookingDetails } from "./detailExtractor";
 import { logRequestEvent } from "./googleSheet";
 import {
   createQuoteRequest,
@@ -93,6 +94,12 @@ const CANCEL_TRIGGERS = [
   "cancel order",
   "cancel request",
 ];
+
+// People rarely answer "schedule"/"instant" literally — "asap", "right
+// away", "urgent" all clearly mean "instant" even without saying the word.
+// Checked both as a direct reply to the mode question, and against the
+// customer's very first message, so urgency stated up front isn't ignored.
+const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediately", "urgent", "urgently"];
 
 // Interim measure while there's no real backend to receive booking
 // requests: notify these agent numbers directly over WhatsApp whenever a
@@ -296,6 +303,19 @@ function isNegative(text: string): boolean {
 const BARE_GREETING_RE =
   /^(hi+|hello+|hey+|yo+|hiya|howdy|good\s?morning|good\s?afternoon|good\s?evening|morning|evening|maakye|maaha|maadwo|ete\s?s[eɛ]n|wo\s?ho\s?te\s?s[eɛ]n|chale|ojekoo|agoo)[\s!.,👋🙂😊]*$/i;
 
+// A reply like "I already mentioned that" or "as I said" is the customer
+// pointing back at something they said earlier — never treat that as the
+// literal answer to whatever we just asked (that's how a service type
+// ends up stored as the string "i already mentioned"). If we genuinely
+// can't find it in the conversation, say so honestly and ask them to
+// repeat it, rather than silently accepting the deflection as data.
+const NON_ANSWER_RE =
+  /\b(i\s+already\s+(mentioned|said|told|stated|gave|wrote)|already\s+(mentioned|said|told|stated)(\s+(that|this|it))?|as\s+(i\s+)?(mentioned|said|stated)|like\s+i\s+said|see\s+above|i\s+(said|told\s+you|mentioned)\s+(that|this|it)(\s+already)?|read\s+above|scroll\s+up)\b/i;
+
+function isNonAnswer(text: string): boolean {
+  return NON_ANSWER_RE.test(text.trim());
+}
+
 function isSameCalendarDay(a: Date, b: Date): boolean {
   return (
     a.getUTCFullYear() === b.getUTCFullYear() &&
@@ -416,6 +436,89 @@ async function beginJobDetails(phone: string) {
   const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
   await sendMessage(phone, prompt);
   updateSession(phone, { stage: "awaiting_description", data: { lastPrompt: prompt } });
+}
+
+// --- 3b. Shared "what's next" routing for mode/service/location ---
+// Several entry points can each independently already know the mode,
+// service type, and/or location before this point in the conversation —
+// a direct "schedule"/"instant" reply, a date mentioned early, or details
+// already extracted and confirmed from the customer's opening message.
+// These three functions form one linear chain that always asks for
+// whichever of those three is still missing, and skips straight past
+// anything already known — instead of every entry point independently
+// (and redundantly) asking for service type, then location, from scratch.
+async function askLocationQuestion(phone: string, ack: string) {
+  const session = getSession(phone);
+  const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+  const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
+  const prompt = lastLocation
+    ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or just tell me the new location.`
+    : `${ack} Which area or location is this for?`;
+  await sendMessage(phone, prompt);
+  updateSession(phone, {
+    stage: "awaiting_location",
+    data: { lastPrompt: prompt, suggestedLastLocation: lastLocation },
+  });
+}
+
+async function proceedAfterLocation(phone: string) {
+  const session = getSession(phone);
+  const mode = session.data.mode as BookingMode;
+
+  if (mode === "standard") {
+    // A date may already be locked in (confirmed as part of an earlier
+    // extraction-confirmation step) — if so, there's nothing left to ask.
+    const dateWanted = session.data.dateWanted as string | undefined;
+    if (dateWanted) {
+      await beginJobDetails(phone);
+      return;
+    }
+
+    const suggestedDateHuman = session.data.suggestedDateHuman as string | undefined;
+    if (suggestedDateHuman) {
+      const confirmPrompt = `Just to confirm — you'd like this done on ${suggestedDateHuman}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
+      await sendMessage(phone, confirmPrompt);
+      updateSession(phone, {
+        stage: "awaiting_date_confirmation",
+        data: { pendingDateHuman: suggestedDateHuman, pendingDateIso: session.data.suggestedDateIso, lastPrompt: confirmPrompt },
+      });
+      return;
+    }
+
+    const prompt = "And what date would you like this done?";
+    await sendMessage(phone, prompt);
+    updateSession(phone, { stage: "awaiting_date", data: { lastPrompt: prompt } });
+    return;
+  }
+
+  await beginJobDetails(phone);
+}
+
+async function proceedAfterServiceType(phone: string, ack: string) {
+  const session = getSession(phone);
+  if (session.data.location) {
+    await proceedAfterLocation(phone);
+    return;
+  }
+  await askLocationQuestion(phone, ack);
+}
+
+async function proceedAfterMode(
+  phone: string,
+  mode: BookingMode,
+  suggestedDateHuman?: string,
+  suggestedDateIso?: string
+) {
+  updateSession(phone, { data: { mode, suggestedDateHuman, suggestedDateIso } });
+  const session = getSession(phone);
+
+  if (session.data.serviceType) {
+    await proceedAfterServiceType(phone, "Got it.");
+    return;
+  }
+
+  await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
+  updateSession(phone, { stage: "awaiting_service_type", data: { lastPrompt: "What kind of service do you need?" } });
 }
 
 // --- 4. Conversation logic ---
@@ -603,6 +706,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // restart the flow either — just acknowledge it and pick up right where
   // we left off, the way a person would.
   const MID_FLOW_GUARD_STAGES: ConversationStage[] = [
+    "awaiting_extraction_confirmation",
     "awaiting_service_type",
     "awaiting_location",
     "awaiting_date",
@@ -633,6 +737,49 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     }
 
     if (routed.intent === "booking_intent") {
+      // Don't just acknowledge and ask everything from scratch — the
+      // opening message often already states the service and/or location
+      // (sometimes even a date), e.g. "I need a painter, I'm in Ho". Pull
+      // those out and confirm them explicitly before moving on, so the
+      // bot never re-asks for something already said, and never silently
+      // assumes it understood something it didn't.
+      const [extracted, dateAttempt] = await Promise.all([
+        extractBookingDetails(text),
+        interpretDate(text, new Date()),
+      ]);
+      const extractedDateHuman = dateAttempt.status === "valid" ? dateAttempt.humanReadable : undefined;
+      const extractedDateIso = dateAttempt.status === "valid" ? dateAttempt.isoDate : undefined;
+      const extractedMode: BookingMode | undefined = extractedDateHuman
+        ? "standard"
+        : INSTANT_PHRASES.some((p) => lower.includes(p))
+        ? "instant"
+        : undefined;
+
+      if (extracted.serviceType || extracted.location) {
+        let confirmPrompt: string;
+        if (extracted.serviceType && extracted.location) {
+          confirmPrompt = `Just to confirm — you're after a ${extracted.serviceType}, in ${extracted.location}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
+        } else if (extracted.serviceType) {
+          confirmPrompt = `Just to confirm — you're after a ${extracted.serviceType}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
+        } else {
+          confirmPrompt = `Just to confirm — this is for ${extracted.location}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
+        }
+        const ack = routed.reply ? `${routed.reply}\n\n` : "";
+        await sendMessage(phone, `${ack}${confirmPrompt}`);
+        updateSession(phone, {
+          stage: "awaiting_extraction_confirmation",
+          data: {
+            candidateServiceType: extracted.serviceType,
+            candidateLocation: extracted.location,
+            candidateDateHuman: extractedDateHuman,
+            candidateDateIso: extractedDateIso,
+            candidateMode: extractedMode,
+            lastPrompt: confirmPrompt,
+          },
+        });
+        return;
+      }
+
       const ack = routed.reply ? `${routed.reply}\n\n` : "";
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `${ack}${prompt}`);
@@ -646,35 +793,90 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     return;
   }
 
+  if (session.stage === "awaiting_extraction_confirmation") {
+    if (isAffirmative(text) && !isNegative(text)) {
+      const candidateServiceType = session.data.candidateServiceType as string | undefined;
+      const candidateLocation = session.data.candidateLocation as string | undefined;
+      const candidateDateHuman = session.data.candidateDateHuman as string | undefined;
+      const candidateDateIso = session.data.candidateDateIso as string | undefined;
+      const candidateMode = session.data.candidateMode as BookingMode | undefined;
+
+      updateSession(phone, {
+        data: {
+          serviceType: candidateServiceType,
+          location: candidateLocation,
+          dateWanted: candidateDateHuman,
+        },
+      });
+
+      if (candidateMode) {
+        await proceedAfterMode(phone, candidateMode, candidateDateHuman, candidateDateIso);
+        return;
+      }
+
+      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      await sendMessage(phone, prompt);
+      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      return;
+    }
+
+    // Not a clear "yes" — but they may have jumped straight to giving a
+    // date instead of confirming first (e.g. replying "friday"). Read
+    // that as implicit confirmation of the service/location plus the
+    // date, rather than discarding everything and starting over. The
+    // date itself still goes through its own explicit confirm step below,
+    // consistent with how dates are always double-checked elsewhere.
+    const correctionDateAttempt = await interpretDate(text, new Date());
+    if (correctionDateAttempt.status === "valid") {
+      const candidateServiceType = session.data.candidateServiceType as string | undefined;
+      const candidateLocation = session.data.candidateLocation as string | undefined;
+      updateSession(phone, { data: { serviceType: candidateServiceType, location: candidateLocation } });
+      await proceedAfterMode(phone, "standard", correctionDateAttempt.humanReadable, correctionDateAttempt.isoDate);
+      return;
+    }
+    if (correctionDateAttempt.status === "past") {
+      await sendMessage(
+        phone,
+        `${correctionDateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward? Or reply 'yes' if I got the service/location right and you'll give the date next.`
+      );
+      return;
+    }
+
+    // Genuinely not a yes and not a date — don't compound one uncertain
+    // guess with another; drop back to asking the most fundamental
+    // question plainly.
+    const prompt = "No problem — what kind of service do you need?";
+    await sendMessage(phone, prompt);
+    updateSession(phone, {
+      stage: "awaiting_service_type",
+      data: {
+        candidateServiceType: undefined,
+        candidateLocation: undefined,
+        candidateDateHuman: undefined,
+        candidateDateIso: undefined,
+        candidateMode: undefined,
+        lastPrompt: prompt,
+      },
+    });
+    return;
+  }
+
   if (session.stage === "awaiting_mode") {
     if (lower.includes("instant")) {
-      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-      updateSession(phone, {
-        stage: "awaiting_service_type",
-        data: { mode: "instant" as BookingMode, lastPrompt: "What kind of service do you need?" },
-      });
+      await proceedAfterMode(phone, "instant");
       return;
     }
 
     if (lower.includes("schedule")) {
-      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-      updateSession(phone, {
-        stage: "awaiting_service_type",
-        data: { mode: "standard" as BookingMode, lastPrompt: "What kind of service do you need?" },
-      });
+      await proceedAfterMode(phone, "standard");
       return;
     }
 
     // People rarely answer literally — "tomorrow", "asap", "next Monday",
     // "right away" all clearly mean one or the other even without saying
     // the word. Catch urgency phrasing first...
-    const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediately", "urgent", "urgently"];
     if (INSTANT_PHRASES.some((p) => lower.includes(p))) {
-      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-      updateSession(phone, {
-        stage: "awaiting_service_type",
-        data: { mode: "instant" as BookingMode, lastPrompt: "What kind of service do you need?" },
-      });
+      await proceedAfterMode(phone, "instant");
       return;
     }
 
@@ -684,16 +886,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // later when we'd normally ask for the date.
     const dateAttempt = await interpretDate(text, new Date());
     if (dateAttempt.status === "valid") {
-      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-      updateSession(phone, {
-        stage: "awaiting_service_type",
-        data: {
-          mode: "standard" as BookingMode,
-          suggestedDateHuman: dateAttempt.humanReadable,
-          suggestedDateIso: dateAttempt.isoDate,
-          lastPrompt: "What kind of service do you need?",
-        },
-      });
+      await proceedAfterMode(phone, "standard", dateAttempt.humanReadable, dateAttempt.isoDate);
       return;
     }
     if (dateAttempt.status === "past") {
@@ -723,22 +916,27 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_service_type") {
-    // Returning customers get offered their last location instead of being
-    // asked cold every time — booking history already persists, so use it.
-    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-    const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
-    const prompt = lastLocation
-      ? `Got it. Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or just tell me the new location.`
-      : "Got it. Which area or location is this for?";
-    await sendMessage(phone, prompt);
-    updateSession(phone, {
-      stage: "awaiting_location",
-      data: { serviceType: text, lastPrompt: prompt, suggestedLastLocation: lastLocation },
-    });
+    if (isNonAnswer(text)) {
+      await sendMessage(
+        phone,
+        "Sorry, I don't have that noted from earlier in our chat — could you tell me again what kind of service you need?"
+      );
+      return;
+    }
+    updateSession(phone, { data: { serviceType: text } });
+    await proceedAfterServiceType(phone, "Got it.");
     return;
   }
 
   if (session.stage === "awaiting_location") {
+    if (isNonAnswer(text)) {
+      await sendMessage(
+        phone,
+        "Sorry, I don't have a location noted from earlier in our chat — could you tell me again which area this is for?"
+      );
+      return;
+    }
+
     // Only treat this as "reuse my last location" on a clearly closed-ended
     // reply — not on isAffirmative()'s broad substring match, since a real
     // location name could easily contain "ok"/"sure"/etc as a substring
@@ -754,35 +952,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         AFFIRMATIVE_EMOJI.some((e) => text.includes(e)));
     const location = wantsSameLocation ? (suggestedLastLocation as string) : text;
 
-    const mode = session.data.mode as BookingMode;
-    if (mode === "standard") {
-      // They may have already told us the date back when we asked
-      // schedule-vs-instant (e.g. replied "tomorrow") — if so, don't make
-      // them repeat it, just confirm what we already picked up.
-      const suggestedDateHuman = session.data.suggestedDateHuman as string | undefined;
-      if (suggestedDateHuman) {
-        const confirmPrompt = `Just to confirm — you'd like this done on ${suggestedDateHuman}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
-        await sendMessage(phone, confirmPrompt);
-        updateSession(phone, {
-          stage: "awaiting_date_confirmation",
-          data: {
-            location,
-            pendingDateHuman: suggestedDateHuman,
-            pendingDateIso: session.data.suggestedDateIso,
-            lastPrompt: confirmPrompt,
-          },
-        });
-        return;
-      }
-
-      const prompt = "And what date would you like this done?";
-      await sendMessage(phone, prompt);
-      updateSession(phone, { stage: "awaiting_date", data: { location, lastPrompt: prompt } });
-      return;
-    }
-
     updateSession(phone, { data: { location } });
-    await beginJobDetails(phone);
+    await proceedAfterLocation(phone);
     return;
   }
 
@@ -854,6 +1025,12 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_extra_details") {
+    if (isNonAnswer(text)) {
+      const askedQuestion = (session.data.lastPrompt as string | undefined) ?? "that";
+      await sendMessage(phone, `Sorry, I don't have an answer noted for that yet — could you tell me again: ${askedQuestion}`);
+      return;
+    }
+
     const askedQuestion = (session.data.lastPrompt as string) ?? "";
     const askedKey = (session.data.currentExtraKey as ExtraQuestionKey | undefined) ?? "followup";
     const existingAnswers =
@@ -902,6 +1079,13 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_description") {
+    if (isNonAnswer(text)) {
+      await sendMessage(
+        phone,
+        "Sorry, I don't have that noted from earlier in our chat — could you describe again what you need done?"
+      );
+      return;
+    }
     const prompt =
       "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
     await sendMessage(phone, prompt);
@@ -1062,6 +1246,7 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 // hear back from them — not on the greeting screen, not already handed to
 // a human agent, and not just after finishing a booking.
 const ACTIVE_STAGES: ConversationStage[] = [
+  "awaiting_extraction_confirmation",
   "awaiting_mode",
   "awaiting_service_type",
   "awaiting_location",
