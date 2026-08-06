@@ -110,4 +110,21 @@ A: Only services — Hustleapp connects customers with service providers (artisa
 Other ways to reach Hustleapp directly:
 - Email: letshustle@hustleapp.io
 - Phone: 055 696 3137 or 055 693 7198
+- Website: www.hustleapp.io
+
+The Hustle app:
+- Android: search "Hustle" on the Google Play Store — the app icon is green
+  and gold with a "$" fused into the "H"
+- iPhone/iOS: also available on the Apple App Store, but customers should
+  contact a Hustleapp agent first for help getting set up on iOS
+
+Q: Is there an app I can download?
+A: Yes — search "Hustle" on the Google Play Store (look for the green and gold icon with a "$" in the "H"). It's on the Apple App Store too, but for iPhone it's best to say "agent" here first so our team can help you get set up.
+
+Follow Hustleapp on social media:
+- Instagram: https://www.instagram.com/hustleapp.io/
+- Facebook: https://www.facebook.com/profile.php?id=100072269207728
+- TikTok: https://www.tiktok.com/@hustleapp.io
+- X (Twitter): https://x.com/HustleApp25
+- YouTube: https://youtube.com/@hustleapp3055
 `.trim();

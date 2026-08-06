@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
-import { getSession, updateSession } from "./session";
+import * as chrono from "chrono-node";
+import { getSession, updateSession, clearSession } from "./session";
 import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
 import { routeIntent } from "./intentRouter";
 
@@ -147,6 +148,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "escalated") {
     if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
       await sendMessage(phone, "No problem, let's get you sorted. Would you like this done on a specific date, or right away?\n\nJust reply 'schedule' or 'instant'.");
+      clearSession(phone);
       updateSession(phone, { stage: "awaiting_mode" });
       return;
     }
@@ -155,8 +157,13 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   // General questions about the business get answered directly, without
-  // derailing the booking intake, at the two earliest stages.
-  if (session.stage === "greeting" || session.stage === "awaiting_mode") {
+  // derailing the booking intake, at the two earliest stages. Skipped when
+  // the reply is obviously just answering our own "schedule or instant"
+  // prompt — otherwise the AI occasionally misreads a one-word answer like
+  // "schedule" as a question about scheduling, which makes the bot feel
+  // like it lost track of the conversation.
+  const isDirectModeReply = lower.includes("schedule") || lower.includes("instant");
+  if ((session.stage === "greeting" || session.stage === "awaiting_mode") && !isDirectModeReply) {
     const routed = await routeIntent(text);
     if (routed.intent === "question" && routed.reply) {
       await sendMessage(phone, routed.reply);
@@ -199,6 +206,25 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_date") {
+    // Understand relative/natural dates ("tomorrow", "4th August") and
+    // reject anything that's clearly already passed, so we don't book a
+    // job for a date that can't happen.
+    const parsedDate = chrono.parseDate(text, new Date());
+    if (parsedDate) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const parsedDay = new Date(parsedDate);
+      parsedDay.setHours(0, 0, 0, 0);
+
+      if (parsedDay.getTime() < today.getTime()) {
+        await sendMessage(
+          phone,
+          `That date's already passed — could you give me a date from today onward?`
+        );
+        return;
+      }
+    }
+
     await sendMessage(phone, "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.");
     updateSession(phone, { stage: "awaiting_description", data: { dateWanted: text } });
     return;
@@ -227,7 +253,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "awaiting_confirmation") {
     if (!lower.includes("yes")) {
       await sendMessage(phone, "No worries, let's start over. Reply 'schedule' or 'instant' whenever you're ready.");
-      updateSession(phone, { stage: "greeting" });
+      clearSession(phone);
+      updateSession(phone, { stage: "awaiting_mode" });
       return;
     }
 
@@ -274,12 +301,15 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       }
     }
 
-    updateSession(phone, { stage: "request_submitted" });
+    // Clear everything (attachments, service type, etc.) rather than just
+    // changing stage — otherwise leftover data from this booking (like a
+    // photo attachment) would silently reappear in the customer's next one.
+    clearSession(phone);
     return;
   }
 
   // request_submitted or unrecognized — reset for simplicity in this skeleton
-  updateSession(phone, { stage: "greeting" });
+  clearSession(phone);
 }
 
 // --- 4. Outbound sender ---
