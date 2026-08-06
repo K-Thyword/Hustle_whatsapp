@@ -15,6 +15,7 @@ import { routeIntent } from "./intentRouter";
 import { interpretDate } from "./dateInterpreter";
 import { matchServiceCategory } from "./serviceCategories";
 import { extractBookingDetails } from "./detailExtractor";
+import { transcribeVoiceNote } from "./voiceTranscriber";
 import { logRequestEvent } from "./googleSheet";
 import {
   createQuoteRequest,
@@ -696,12 +697,14 @@ app.get("/webhook", (req: Request, res: Response) => {
   }
 });
 
-// A photo, video, or document a customer attaches while describing their
-// job — forwarded to agents as-is (by media ID) alongside the booking
-// summary, so no separate file storage is needed for this interim setup.
+// A photo, video, document, or voice note a customer attaches while
+// describing their job — forwarded to agents as-is (by media ID) alongside
+// the booking summary, so no separate file storage is needed for this
+// interim setup. Voice notes additionally get transcribed (see below) so
+// the bot itself can act on what was said, not just relay the file.
 export interface MediaAttachment {
   id: string;
-  type: "image" | "video" | "document";
+  type: "image" | "video" | "document" | "audio";
 }
 
 // --- 2. Inbound message handler ---
@@ -728,6 +731,24 @@ app.post("/webhook", async (req: Request, res: Response) => {
   } else if (message.type === "document" && message.document?.id) {
     media = { id: message.document.id, type: "document" };
     text = (message.document.caption ?? "").trim();
+  } else if (message.type === "audio" && message.audio?.id) {
+    // Voice note — transcribe it and treat the transcript exactly like a
+    // typed message from here on (extraction, stage logic, agent commands,
+    // live-chat relay all work on it unchanged). The raw audio is still
+    // kept as the media attachment so it can be forwarded as-is too — e.g.
+    // an agent in a claimed live chat gets both the transcript AND the
+    // original file, in case they'd rather listen than read.
+    const transcript = await transcribeVoiceNote(message.audio.id);
+    if (!transcript) {
+      await sendMessage(
+        from,
+        "Sorry, I couldn't quite catch that voice note — could you try sending it again, or type it out instead?"
+      );
+      return;
+    }
+    media = { id: message.audio.id, type: "audio" };
+    text = transcript;
+    await sendMessage(from, `🎙️ _I heard:_ "${transcript}"`);
   }
 
   console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
