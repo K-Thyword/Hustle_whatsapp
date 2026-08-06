@@ -13,6 +13,7 @@ import {
 import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
 import { routeIntent } from "./intentRouter";
 import { interpretDate } from "./dateInterpreter";
+import { createQuoteRequest, getQuoteRequest, updateQuoteRequest, getPendingCustomerAction } from "./quotes";
 
 const app = express();
 app.use(express.json());
@@ -48,6 +49,61 @@ async function notifyAgents(message: string) {
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await sendMessage(number, message);
   }
+}
+
+// --- Agent commands: relaying artisan questions/quotes to the customer ---
+// For jobs that need a price quote rather than a fixed price, an agent
+// takes the job details to the artisan, then relays whatever comes back
+// through the bot using a simple format:
+//   req_123: quote 250 cedis
+//   req_123: needs to know if it's gas or electric
+// The bot delivers that to the right customer and tracks the request's
+// status so the customer's next reply gets routed back correctly instead
+// of starting a fresh conversation.
+const AGENT_COMMAND_RE = /^(req_\S+?)\s*:\s*(quote|needs|ask|info)\s+([\s\S]+)$/i;
+
+async function handleAgentMessage(agentPhone: string, text: string) {
+  const match = text.trim().match(AGENT_COMMAND_RE);
+
+  if (!match) {
+    // Only nudge with the format reminder if it looks like they were
+    // trying to reference a request — otherwise stay quiet on casual
+    // chatter like "ok" or "thanks" between agents.
+    if (text.toLowerCase().includes("req_")) {
+      await sendMessage(
+        agentPhone,
+        "Didn't catch that as a command. Use:\n<reference>: quote <amount/details>\nor\n<reference>: needs <question for the customer>"
+      );
+    }
+    return;
+  }
+
+  const [, requestId, actionRaw, content] = match;
+  const request = getQuoteRequest(requestId);
+  if (!request) {
+    await sendMessage(agentPhone, `Couldn't find a request with reference ${requestId} — double check the number.`);
+    return;
+  }
+
+  const action = actionRaw.toLowerCase();
+
+  if (action === "quote") {
+    updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content.trim() });
+    await sendMessage(
+      request.phone,
+      `Good news — we've got a price for your ${request.serviceType} request: ${content.trim()}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`
+    );
+    await sendMessage(agentPhone, `Quote sent to the customer for ${requestId}.`);
+    return;
+  }
+
+  // "needs" / "ask" / "info" — the artisan needs more detail before pricing
+  updateQuoteRequest(requestId, { status: "awaiting_customer_info" });
+  await sendMessage(
+    request.phone,
+    `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content.trim()}`
+  );
+  await sendMessage(agentPhone, `Question sent to the customer for ${requestId}.`);
 }
 
 // --- Recognizing yes/no, including common emoji ---
@@ -132,7 +188,13 @@ app.post("/webhook", async (req: Request, res: Response) => {
   console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
 
   try {
-    await handleMessage(from, text, media);
+    // Messages from an agent number are commands about a request (a
+    // quote, a question for the customer), not a customer conversation.
+    if (AGENT_NOTIFY_NUMBERS.includes(from)) {
+      await handleAgentMessage(from, text);
+    } else {
+      await handleMessage(from, text, media);
+    }
   } catch (err) {
     console.error("Error handling message:", err);
   }
@@ -223,6 +285,43 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     }
     await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly. (Say 'new request' if you'd like to start something new while you wait.)");
     return;
+  }
+
+  // If this customer has a request sitting in "awaiting_customer_info" or
+  // "quoted" — i.e. our team is specifically waiting to hear back from
+  // THEM about a price quote — treat their next message as that reply,
+  // rather than the start of a new conversation. Only applies once
+  // they're back at "greeting" (nothing else in progress), so it can't
+  // hijack a brand-new booking they're partway through building.
+  if (session.stage === "greeting") {
+    const pending = getPendingCustomerAction(phone);
+    if (pending) {
+      if (pending.status === "awaiting_customer_info") {
+        await notifyAgents(`Customer's answer for ${pending.requestId}: "${text}"`);
+        updateQuoteRequest(pending.requestId, { status: "awaiting_quote" });
+        await sendMessage(phone, "Thanks — I've passed that along. We'll get back to you with a price soon.");
+        return;
+      }
+
+      if (pending.status === "quoted") {
+        if (isAffirmative(text) && !isNegative(text)) {
+          updateQuoteRequest(pending.requestId, { status: "confirmed" });
+          await sendMessage(
+            phone,
+            `You're confirmed! One of our agents will be in touch to arrange your provider and payment for ${pending.requestId}.`
+          );
+          await notifyAgents(
+            `Customer accepted the quote for ${pending.requestId} (${pending.quoteAmount}). Please proceed with arranging the provider and payment.`
+          );
+          return;
+        }
+        // Not a clear accept — forward it rather than guessing whether
+        // that's a decline or just a follow-up question.
+        await notifyAgents(`Customer replied about the quote for ${pending.requestId} (${pending.quoteAmount}): "${text}"`);
+        await sendMessage(phone, "Got it — I've passed your message along to the agent handling this.");
+        return;
+      }
+    }
   }
 
   // Once a booking is underway, a stray "hi" or "hello" shouldn't be
@@ -535,7 +634,9 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         (mode === "standard" ? `Date: ${session.data.dateWanted}\n` : "") +
         `Details: ${session.data.description}` +
         (specialInstructions ? `\nSpecial instructions: ${specialInstructions}` : "") +
-        (attachments.length ? `\nAttachments: ${attachments.length} (forwarded below)` : "")
+        (attachments.length ? `\nAttachments: ${attachments.length} (forwarded below)` : "") +
+        `\n\nIf this needs a quote from the artisan, reply here with:\n` +
+        `${result.requestId}: quote <amount>\nor\n${result.requestId}: needs <question for the customer>`
     );
 
     // Forward each attached photo/video/document straight to the agents so
@@ -557,6 +658,12 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       submittedAt: Date.now(),
     };
     addPastBooking(phone, booking);
+    createQuoteRequest({
+      requestId: result.requestId,
+      phone,
+      serviceType: session.data.serviceType as string,
+      location: session.data.location as string,
+    });
 
     // Reset the in-progress booking fields (attachments, service type,
     // etc.) so they don't leak into the next booking — but this keeps
