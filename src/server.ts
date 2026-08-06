@@ -45,6 +45,24 @@ import {
   clearActiveChatForAgent,
 } from "./liveChat";
 
+// --- Crash safety net ---
+// The background sweeps below (inactivity check-ins, unclaimed-request
+// nudges, unclaimed-chat nudges) fire async sends inside setInterval
+// without an enclosing request/response cycle to catch failures. A
+// genuine network error there (fetch() itself throwing — a DNS blip, a
+// timeout — not just a non-200 response, which is already handled) would
+// otherwise be an unhandled promise rejection, and Node's default
+// behavior since v15 is to crash the entire process on one of those —
+// taking down all webhook handling silently, with nothing in the logs to
+// explain why. These two handlers are the backstop: log it and keep
+// going, never let one failed background send take the whole bot offline.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection (server staying up):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (server staying up):", err);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -1578,13 +1596,13 @@ function startInactivitySweep() {
         sendMessage(
           session.phone,
           "Hey, just checking in — still there? Whenever you're ready, we can carry on from where we left off."
-        );
+        ).catch((err) => console.error("Inactivity check-in send failed:", err));
         updateSession(session.phone, { data: { checkedIn: true } });
       } else if (checkedIn && !finalNudgeSent && elapsed > FINAL_NUDGE_AFTER_MS) {
         sendMessage(
           session.phone,
           "No worries if now isn't a good time — I'm here whenever you're ready to continue, just message me anytime."
-        );
+        ).catch((err) => console.error("Final nudge send failed:", err));
         updateSession(session.phone, { data: { finalNudgeSent: true } });
       }
     }
@@ -1615,9 +1633,13 @@ function startUnclaimedRequestSweep() {
         `⚠️ Unclaimed: ${request.requestId} (${request.serviceType}, ${request.location}, ${request.mode}) has been sitting for over ${minutes} minutes with no one claiming it. Please pick it up or check with the team.\n` +
         `Reply "${request.requestId}: claim" to take it.`;
 
-      notifyAgents(message, "an unclaimed request reminder");
+      notifyAgents(message, "an unclaimed request reminder").catch((err) =>
+        console.error("Unclaimed-request nudge send failed:", err)
+      );
       if (BACKUP_AGENT_NUMBER) {
-        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed request reminder");
+        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed request reminder").catch((err) =>
+          console.error("Unclaimed-request backup nudge send failed:", err)
+        );
       }
       updateQuoteRequest(request.requestId, { unclaimedNudgeSent: true });
     }
@@ -1644,9 +1666,13 @@ function startUnclaimedLiveChatSweep() {
         `⚠️ Unclaimed conversation: ${chat.phone} has been waiting over ${minutes} minutes with no one picking it up. Please check in.\n` +
         `Reply "${chat.phone}: claim" to take it.`;
 
-      notifyAgents(message, "an unclaimed conversation reminder");
+      notifyAgents(message, "an unclaimed conversation reminder").catch((err) =>
+        console.error("Unclaimed-chat nudge send failed:", err)
+      );
       if (BACKUP_AGENT_NUMBER) {
-        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed conversation reminder");
+        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed conversation reminder").catch((err) =>
+          console.error("Unclaimed-chat backup nudge send failed:", err)
+        );
       }
       markLiveChatNudgeSent(chat.phone);
     }
