@@ -25,6 +25,12 @@ import {
   getAllQuoteRequests,
   OPEN_STATUSES,
 } from "./quotes";
+import {
+  recordAgentInbound,
+  isAgentWindowOpen,
+  queuePendingAgentMessage,
+  drainPendingAgentMessages,
+} from "./agentMessaging";
 
 const app = express();
 app.use(express.json());
@@ -117,9 +123,33 @@ const AGENT_NOTIFY_NUMBERS = (process.env.AGENT_NOTIFY_NUMBERS || "")
 // supervisor/on-call number rather than another frontline agent.
 const BACKUP_AGENT_NUMBER = process.env.BACKUP_AGENT_NUMBER?.trim();
 
-async function notifyAgents(message: string) {
+// Name of the pre-approved WhatsApp message template used to reach an
+// agent outside the 24h window (see sendTemplateMessage / notifyAgentSmart
+// below). Must match a template you've created and gotten approved in
+// Meta Business Manager (WhatsApp Manager > Message Templates) — see the
+// comment on sendTemplateMessage for the exact template to create.
+const AGENT_NOTIFICATION_TEMPLATE_NAME = process.env.AGENT_NOTIFICATION_TEMPLATE_NAME || "hustle_agent_notification";
+
+// Sends a notification to one agent, working around WhatsApp's 24h
+// window: if we've heard from them recently, send the real message
+// straight away as normal; if not, queue the real content and send a
+// short pre-approved template instead, so they at least get pinged that
+// something's waiting. The moment they reply to that (or to anything),
+// handleAgentMessage() below reopens the window and flushes the queue —
+// so the full detail still reaches them, just one round-trip later
+// instead of silently never arriving.
+async function notifyAgentSmart(agentPhone: string, message: string, summaryLabel: string) {
+  if (isAgentWindowOpen(agentPhone)) {
+    await sendMessage(agentPhone, message);
+    return;
+  }
+  queuePendingAgentMessage(agentPhone, message);
+  await sendTemplateMessage(agentPhone, AGENT_NOTIFICATION_TEMPLATE_NAME, summaryLabel);
+}
+
+async function notifyAgents(message: string, summaryLabel: string = "an update") {
   for (const number of AGENT_NOTIFY_NUMBERS) {
-    await sendMessage(number, message);
+    await notifyAgentSmart(number, message, summaryLabel);
   }
 }
 
@@ -139,6 +169,15 @@ const AGENT_COMMAND_RE =
   /^(req_\S+?)\s*:\s*(quote|needs|ask|info|matched|done|complete|completed|claim)(?:\s+([\s\S]+))?$/i;
 
 async function handleAgentMessage(agentPhone: string, text: string) {
+  // Any inbound message from an agent reopens their 24h window — record it
+  // first, then flush anything that was queued while it was closed, so the
+  // full-detail notifications they missed actually arrive now.
+  recordAgentInbound(agentPhone);
+  const queued = drainPendingAgentMessages(agentPhone);
+  for (const message of queued) {
+    await sendMessage(agentPhone, message);
+  }
+
   const match = text.trim().match(AGENT_COMMAND_RE);
 
   if (!match) {
@@ -185,7 +224,11 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     await sendMessage(agentPhone, `You've claimed ${requestId} (${request.serviceType}, ${request.location}).`);
     for (const number of AGENT_NOTIFY_NUMBERS) {
       if (number === agentPhone) continue;
-      await sendMessage(number, `${requestId} has been claimed by ${agentPhone} — no action needed unless they ask for help.`);
+      await notifyAgentSmart(
+        number,
+        `${requestId} has been claimed by ${agentPhone} — no action needed unless they ask for help.`,
+        "a claim update"
+      );
     }
     await logRequestEvent({
       requestId,
@@ -598,7 +641,10 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       phone,
       `Done — I've cancelled request ${active.requestId} (${active.serviceType} in ${active.location}). Let me know if you'd like to book something else.`
     );
-    await notifyAgents(`Customer ${phone} cancelled ${active.requestId} (${active.serviceType}, ${active.location}) via the bot.`);
+    await notifyAgents(
+      `Customer ${phone} cancelled ${active.requestId} (${active.serviceType}, ${active.location}) via the bot.`,
+      "a cancelled request"
+    );
     await logRequestEvent({
       requestId: active.requestId,
       event: "cancelled",
@@ -624,7 +670,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const notifyBody = isComplaintSignal
       ? `🚨 POSSIBLE COMPLAINT/DISPUTE — please prioritize 🚨\nCustomer ${phone} flagged automatically — message may indicate a complaint.\nTheir message: "${text}"`
       : `Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"`;
-    await notifyAgents(notifyBody);
+    await notifyAgents(notifyBody, isComplaintSignal ? "a possible complaint" : "a customer request for an agent");
     updateSession(phone, { stage: "escalated" });
     return;
   }
@@ -651,7 +697,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const pending = getPendingCustomerAction(phone);
     if (pending) {
       if (pending.status === "awaiting_customer_info") {
-        await notifyAgents(`Customer's answer for ${pending.requestId}: "${text}"`);
+        await notifyAgents(`Customer's answer for ${pending.requestId}: "${text}"`, "a customer's answer");
         updateQuoteRequest(pending.requestId, { status: "awaiting_quote" });
         await sendMessage(phone, "Thanks — I've passed that along. We'll get back to you with a price soon.");
         return;
@@ -665,7 +711,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
             `You're confirmed! One of our agents will be in touch to arrange your provider and payment for ${pending.requestId}.`
           );
           await notifyAgents(
-            `Customer accepted the quote for ${pending.requestId} (${pending.quoteAmount}). Please proceed with arranging the provider and payment.`
+            `Customer accepted the quote for ${pending.requestId} (${pending.quoteAmount}). Please proceed with arranging the provider and payment.`,
+            "a confirmed booking"
           );
           await logRequestEvent({
             requestId: pending.requestId,
@@ -679,7 +726,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         }
         // Not a clear accept — forward it rather than guessing whether
         // that's a decline or just a follow-up question.
-        await notifyAgents(`Customer replied about the quote for ${pending.requestId} (${pending.quoteAmount}): "${text}"`);
+        await notifyAgents(`Customer replied about the quote for ${pending.requestId} (${pending.quoteAmount}): "${text}"`, "a customer reply");
         await sendMessage(phone, "Got it — I've passed your message along to the agent handling this.");
         return;
       }
@@ -687,7 +734,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       if (pending.status === "completed") {
         updateQuoteRequest(pending.requestId, { status: "reviewed" });
         await sendMessage(phone, "Thank you for the feedback — really appreciate it! Let us know anytime you need something else.");
-        await notifyAgents(`Customer's review for ${pending.requestId} (${pending.serviceType}): "${text}"`);
+        await notifyAgents(`Customer's review for ${pending.requestId} (${pending.serviceType}): "${text}"`, "a customer review");
         await logRequestEvent({
           requestId: pending.requestId,
           event: "reviewed",
@@ -1180,11 +1227,20 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         `${result.requestId}: quote <amount>\n` +
         `${result.requestId}: needs <question for the customer>\n` +
         `${result.requestId}: matched <provider name>\n` +
-        `${result.requestId}: done`
+        `${result.requestId}: done`,
+      "a new booking request"
     );
 
     // Forward each attached photo/video/document straight to the agents so
     // they can see exactly what the customer sent, no separate storage needed.
+    // NOTE: unlike the text notification above, this is still a plain
+    // free-form media message — it isn't covered by the 24h-window
+    // workaround (WhatsApp media template messages need their own setup)
+    // and will silently fail to an agent outside their window. Low
+    // priority today since the accompanying text notification above will
+    // still reach them and prompt a reply, which reopens the window for
+    // everything that follows — but worth a proper fix if attachments
+    // start getting missed.
     for (const attachment of attachments) {
       for (const number of AGENT_NOTIFY_NUMBERS) {
         await sendMedia(number, attachment);
@@ -1312,9 +1368,9 @@ function startUnclaimedRequestSweep() {
         `⚠️ Unclaimed: ${request.requestId} (${request.serviceType}, ${request.location}, ${request.mode}) has been sitting for over ${minutes} minutes with no one claiming it. Please pick it up or check with the team.\n` +
         `Reply "${request.requestId}: claim" to take it.`;
 
-      notifyAgents(message);
+      notifyAgents(message, "an unclaimed request reminder");
       if (BACKUP_AGENT_NUMBER) {
-        sendMessage(BACKUP_AGENT_NUMBER, message);
+        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed request reminder");
       }
       updateQuoteRequest(request.requestId, { unclaimedNudgeSent: true });
     }
@@ -1352,6 +1408,56 @@ async function sendMessage(to: string, body: string) {
 
   if (!res.ok) {
     console.error("Failed to send message:", await res.text());
+  }
+}
+
+// Sends a pre-approved WhatsApp message template — the only kind of
+// business-initiated message WhatsApp allows outside a recipient's 24h
+// window. Used by notifyAgentSmart() to reach an agent who hasn't texted
+// the bot recently; the actual detailed content is queued and delivered
+// as a normal free-form message once they reply (see agentMessaging.ts).
+//
+// One-time setup required in Meta Business Manager before this works
+// (WhatsApp Manager > Account tools > Message Templates > Create Template):
+//   Name:      hustle_agent_notification  (or set AGENT_NOTIFICATION_TEMPLATE_NAME to match whatever you name it)
+//   Category:  Utility
+//   Language:  English (US)
+//   Body:      "Hustleapp: you have {{1}} waiting for you. Reply to this message to see the full details."
+// Submit for review — Meta typically approves utility templates within
+// minutes to a few hours. Until it's approved, calls to this function will
+// fail and log an error (same graceful-failure pattern as sendMessage) —
+// nothing else in the app depends on it succeeding.
+async function sendTemplateMessage(to: string, templateName: string, bodyParam: string) {
+  const hasRealCredentials =
+    process.env.WHATSAPP_ACCESS_TOKEN &&
+    process.env.WHATSAPP_ACCESS_TOKEN !== "from-meta-business-manager";
+
+  if (!hasRealCredentials) {
+    console.log(`[DRY RUN — would send template "${templateName}" to ${to} with param "${bodyParam}"]`);
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v20.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "template",
+      template: {
+        name: templateName,
+        language: { code: "en_US" },
+        components: [{ type: "body", parameters: [{ type: "text", text: bodyParam }] }],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("Failed to send template message:", await res.text());
   }
 }
 
