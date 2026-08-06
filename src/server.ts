@@ -32,6 +32,15 @@ import {
   queuePendingAgentMedia,
   drainPendingAgentItems,
 } from "./agentMessaging";
+import {
+  startLiveChat,
+  getLiveChat,
+  claimLiveChat,
+  unclaimLiveChat,
+  endLiveChat,
+  getAllLiveChats,
+  markLiveChatNudgeSent,
+} from "./liveChat";
 
 const app = express();
 app.use(express.json());
@@ -108,6 +117,12 @@ const CANCEL_TRIGGERS = [
 // customer's very first message, so urgency stated up front isn't ignored.
 const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediately", "urgent", "urgently"];
 
+// Lets a customer break out of "escalated" mode and start fresh — either
+// while waiting for an agent to claim their conversation, or mid-way
+// through an active claimed live chat (see the live-chat relay block in
+// handleMessage). Module-level since both places need it.
+const RESTART_TRIGGERS = ["new request", "start over", "restart", "book again", "new booking"];
+
 // Interim measure while there's no real backend to receive booking
 // requests: notify these agent numbers directly over WhatsApp whenever a
 // request is submitted, so a human actually sees it. Comma-separated in
@@ -130,6 +145,27 @@ const BACKUP_AGENT_NUMBER = process.env.BACKUP_AGENT_NUMBER?.trim();
 // Meta Business Manager (WhatsApp Manager > Message Templates) — see the
 // comment on sendTemplateMessage for the exact template to create.
 const AGENT_NOTIFICATION_TEMPLATE_NAME = process.env.AGENT_NOTIFICATION_TEMPLATE_NAME || "hustle_agent_notification";
+
+// Maps an agent's phone number to a display name, so a customer connected
+// to a live chat sees "you're now chatting with Ama" instead of a bare
+// phone number — that's what actually makes it read as a real person
+// rather than another bot message. Configure in .env as
+// "233556963137:Ama,233556937198:Kwame" (phone:Name pairs, comma-separated).
+// An agent number with no configured name falls back to a generic label.
+const AGENT_NAMES = new Map<string, string>(
+  (process.env.AGENT_NAMES || "")
+    .split(",")
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const [phonePart, ...nameParts] = pair.split(":");
+      return [phonePart.trim(), nameParts.join(":").trim()] as [string, string];
+    })
+);
+
+function getAgentName(agentPhone: string): string {
+  return AGENT_NAMES.get(agentPhone) || `our agent (${agentPhone.slice(-4)})`;
+}
 
 // Sends a notification to one agent, working around WhatsApp's 24h
 // window: if we've heard from them recently, send the real message
@@ -169,6 +205,112 @@ async function notifyAgents(message: string, summaryLabel: string = "an update")
 const AGENT_COMMAND_RE =
   /^(req_\S+?)\s*:\s*(quote|needs|ask|info|matched|done|complete|completed|claim)(?:\s+([\s\S]+))?$/i;
 
+// --- Live chat: an agent talking directly to a customer through the bot ---
+// When a customer asks for a human (or a complaint is auto-detected), the
+// bot notifies all agents and opens a "live chat" for that phone number.
+// The first agent to claim it becomes the only one whose messages get
+// relayed to the customer — same reference-first colon format as the
+// req_ commands above, just keyed by the customer's phone number instead:
+//   233241234567: claim                 (take the conversation)
+//   233241234567: Hi, this is Ama...    (chat directly — relayed with your name)
+//   233241234567: unclaim               (release it back to the team)
+//   233241234567: end                   (close it out, hand back to the bot)
+const LIVE_CHAT_COMMAND_RE = /^(\d{7,15})\s*:\s*([\s\S]*)$/;
+
+async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
+  const chat = getLiveChat(phone);
+  if (!chat) {
+    await sendMessage(agentPhone, `No active conversation found for ${phone} — they may not have an open escalation right now.`);
+    return;
+  }
+
+  const action = rest.trim().toLowerCase();
+
+  if (action === "claim") {
+    if (chat.claimedBy && chat.claimedBy !== agentPhone) {
+      await sendMessage(agentPhone, `Already claimed — the conversation with ${phone} is being handled by ${getAgentName(chat.claimedBy)}.`);
+      return;
+    }
+    if (chat.claimedBy === agentPhone) {
+      await sendMessage(agentPhone, `You've already claimed the conversation with ${phone}.`);
+      return;
+    }
+    claimLiveChat(phone, agentPhone);
+    await sendMessage(
+      agentPhone,
+      `You've claimed the conversation with ${phone}. Reply "${phone}: <message>" to chat with them directly, or "${phone}: end" when you're done.`
+    );
+    for (const number of AGENT_NOTIFY_NUMBERS) {
+      if (number === agentPhone) continue;
+      await notifyAgentSmart(
+        number,
+        `The conversation with ${phone} has been claimed by ${getAgentName(agentPhone)} — no action needed unless they ask for help.`,
+        "a claim update"
+      );
+    }
+    await sendMessage(phone, `You're now connected with *${getAgentName(agentPhone)}* from our team — go ahead and chat here.`);
+    return;
+  }
+
+  if (action === "unclaim" || action === "release") {
+    if (chat.claimedBy !== agentPhone) {
+      await sendMessage(agentPhone, `You haven't claimed the conversation with ${phone}, so there's nothing to release.`);
+      return;
+    }
+    unclaimLiveChat(phone);
+    await sendMessage(agentPhone, `Released the conversation with ${phone} back to the team.`);
+    await notifyAgents(
+      `The conversation with ${phone} is back in the pool — ${getAgentName(agentPhone)} released it. Reply "${phone}: claim" to pick it up.`,
+      "an unclaimed conversation"
+    );
+    return;
+  }
+
+  if (action === "end" || action === "close" || action === "resolved" || action === "done") {
+    if (chat.claimedBy && chat.claimedBy !== agentPhone) {
+      await sendMessage(
+        agentPhone,
+        `This conversation is claimed by ${getAgentName(chat.claimedBy)}, not you — ask them to close it out, or "${phone}: claim" it yourself if they've stepped away.`
+      );
+      return;
+    }
+    endLiveChat(phone);
+    updateSession(phone, { stage: "greeting" });
+    await sendMessage(agentPhone, `Marked the conversation with ${phone} as ended.`);
+    await sendMessage(
+      phone,
+      `Your conversation with *${getAgentName(agentPhone)}* has ended — I'm the Hustleapp assistant again if you need anything else, just let me know!`
+    );
+    return;
+  }
+
+  if (!rest.trim()) {
+    await sendMessage(
+      agentPhone,
+      `Nothing to send — use "${phone}: <message>" to chat, "${phone}: claim" to claim it, or "${phone}: end" to close it out.`
+    );
+    return;
+  }
+
+  // A plain chat message — only relay it if THIS agent is the one who
+  // claimed the conversation. This is what makes "only authorised agents
+  // chat with a customer" actually hold: the phone-number authorization
+  // boundary (only AGENT_NOTIFY_NUMBERS are treated as agents at all) plus
+  // this claim check (only the claiming agent's messages get relayed)
+  // together mean a customer only ever hears from the one specific,
+  // authorised person they were connected to.
+  if (!chat.claimedBy) {
+    await sendMessage(agentPhone, `Claim this conversation first — reply "${phone}: claim" — before chatting with ${phone}.`);
+    return;
+  }
+  if (chat.claimedBy !== agentPhone) {
+    await sendMessage(agentPhone, `This conversation is claimed by ${getAgentName(chat.claimedBy)}, not you — they're the one chatting with ${phone} right now.`);
+    return;
+  }
+
+  await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
+}
+
 async function handleAgentMessage(agentPhone: string, text: string) {
   // Any inbound message from an agent reopens their 24h window — record it
   // first, then flush anything that was queued while it was closed, so the
@@ -186,13 +328,22 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   const match = text.trim().match(AGENT_COMMAND_RE);
 
   if (!match) {
+    // Not a req_ command — try it as a live-chat command instead
+    // (customer-phone-referenced: claim / a chat message / unclaim / end).
+    const liveChatMatch = text.trim().match(LIVE_CHAT_COMMAND_RE);
+    if (liveChatMatch) {
+      const [, phone, rest] = liveChatMatch;
+      await handleLiveChatCommand(agentPhone, phone, rest);
+      return;
+    }
+
     // Only nudge with the format reminder if it looks like they were
-    // trying to reference a request — otherwise stay quiet on casual
+    // trying to reference something — otherwise stay quiet on casual
     // chatter like "ok" or "thanks" between agents.
-    if (text.toLowerCase().includes("req_")) {
+    if (text.includes(":")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. Use:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done"
+        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim\n<customer phone>: <your message>\n<customer phone>: end"
       );
     }
     return;
@@ -599,6 +750,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const hoursSinceLast = (now - previousLastCustomerMessageAt) / 3_600_000;
     const isNewDay = !isSameCalendarDay(new Date(previousLastCustomerMessageAt), new Date(now));
     if (hoursSinceLast >= 24 || (isNewDay && isBareGreetingMsg)) {
+      if (session.stage === "escalated") endLiveChat(phone);
       session = resetForNewRequest(phone);
     }
   }
@@ -611,6 +763,36 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
   updateSession(phone, { data: { lastCustomerMessageAt: now } });
   session = getSession(phone);
+
+  // If this customer is in an active, agent-claimed live chat, everything
+  // they send — text and any attached media — goes straight to that agent
+  // instead of through the bot's own logic. They're talking to a person
+  // now, not the bot, so there's no bot-side acknowledgment for each
+  // message either (a human handling it is enough). The one thing that
+  // still short-circuits back to the bot is an explicit "start over" —
+  // customers shouldn't be stuck in a live chat if they want to bail.
+  if (session.stage === "escalated") {
+    const activeChat = getLiveChat(phone);
+    if (activeChat?.claimedBy) {
+      if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
+        await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
+        endLiveChat(phone);
+        const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+        await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
+        resetForNewRequest(phone);
+        updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+        return;
+      }
+
+      if (media) {
+        await sendMedia(activeChat.claimedBy, media);
+      }
+      if (text) {
+        await sendMessage(activeChat.claimedBy, `[${phone}]: ${text}`);
+      }
+      return;
+    }
+  }
 
   // A customer can attach a photo/video/document at any point — save it
   // against their session so it can be forwarded to agents with the rest
@@ -660,11 +842,6 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     return;
   }
 
-  // Lets a customer break out of "escalated" mode and start fresh, instead
-  // of being stuck getting the same "someone will be with you" line forever
-  // if an agent hasn't replied yet.
-  const RESTART_TRIGGERS = ["new request", "start over", "restart", "book again", "new booking"];
-
   const isComplaintSignal = COMPLAINT_SIGNAL_WORDS.some((w) => lower.includes(w));
 
   if (session.stage !== "escalated" && (ESCALATION_TRIGGERS.some((t) => lower.includes(t)) || isComplaintSignal)) {
@@ -672,9 +849,10 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       phone,
       "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly. (If you'd like to start a new request in the meantime, just say 'new request'.)"
     );
+    startLiveChat(phone);
     const notifyBody = isComplaintSignal
-      ? `🚨 POSSIBLE COMPLAINT/DISPUTE — please prioritize 🚨\nCustomer ${phone} flagged automatically — message may indicate a complaint.\nTheir message: "${text}"`
-      : `Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"`;
+      ? `🚨 POSSIBLE COMPLAINT/DISPUTE — please prioritize 🚨\nCustomer ${phone} flagged automatically — message may indicate a complaint.\nTheir message: "${text}"\n\nReply "${phone}: claim" to pick up this conversation, then "${phone}: <message>" to chat with them directly.`
+      : `Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"\n\nReply "${phone}: claim" to pick up this conversation, then "${phone}: <message>" to chat with them directly.`;
     await notifyAgents(notifyBody, isComplaintSignal ? "a possible complaint" : "a customer request for an agent");
     updateSession(phone, { stage: "escalated" });
     return;
@@ -682,6 +860,11 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
 
   if (session.stage === "escalated") {
     if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
+      const activeChat = getLiveChat(phone);
+      if (activeChat?.claimedBy) {
+        await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
+      }
+      endLiveChat(phone);
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
       resetForNewRequest(phone);
@@ -1382,6 +1565,35 @@ function startUnclaimedRequestSweep() {
   }, SWEEP_INTERVAL_MS);
 }
 
+// --- 4d. Unclaimed live-chat nudge ---
+// A customer asking for a human is more time-sensitive than a routine
+// booking request — if nobody's claimed their conversation within 10
+// minutes, ping the team again (and the backup contact, if configured) so
+// it doesn't sit forgotten. Fires once per live chat.
+const LIVE_CHAT_UNCLAIMED_THRESHOLD_MS = 10 * 60 * 1000;
+
+function startUnclaimedLiveChatSweep() {
+  setInterval(() => {
+    const now = Date.now();
+    for (const chat of getAllLiveChats()) {
+      if (chat.claimedBy) continue;
+      if (chat.unclaimedNudgeSent) continue;
+      if (now - chat.startedAt < LIVE_CHAT_UNCLAIMED_THRESHOLD_MS) continue;
+
+      const minutes = Math.round(LIVE_CHAT_UNCLAIMED_THRESHOLD_MS / 60000);
+      const message =
+        `⚠️ Unclaimed conversation: ${chat.phone} has been waiting over ${minutes} minutes with no one picking it up. Please check in.\n` +
+        `Reply "${chat.phone}: claim" to take it.`;
+
+      notifyAgents(message, "an unclaimed conversation reminder");
+      if (BACKUP_AGENT_NUMBER) {
+        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed conversation reminder");
+      }
+      markLiveChatNudgeSent(chat.phone);
+    }
+  }, SWEEP_INTERVAL_MS);
+}
+
 // --- 5. Outbound sender ---
 // If real WhatsApp credentials aren't set yet (local testing before Meta
 // access is sorted out), just log what would have been sent instead of
@@ -1503,4 +1715,5 @@ app.listen(PORT, () => {
   console.log(`WhatsApp service listening on port ${PORT}`);
   startInactivitySweep();
   startUnclaimedRequestSweep();
+  startUnclaimedLiveChatSweep();
 });
