@@ -146,6 +146,15 @@ const BACKUP_AGENT_NUMBER = process.env.BACKUP_AGENT_NUMBER?.trim();
 // comment on sendTemplateMessage for the exact template to create.
 const AGENT_NOTIFICATION_TEMPLATE_NAME = process.env.AGENT_NOTIFICATION_TEMPLATE_NAME || "hustle_agent_notification";
 
+// Meta templates are versioned per language, and "English" vs "English
+// (US)" are different template language codes ("en" vs "en_US") — sending
+// with the wrong one fails with error 132001 ("template name does not
+// exist in <language>") even though the template itself exists and is
+// approved. Configurable so a mismatch can be fixed with an env var
+// instead of a code change — check WhatsApp Manager > Message templates >
+// hustle_agent_notification for the exact language it was created with.
+const AGENT_NOTIFICATION_TEMPLATE_LANGUAGE = process.env.AGENT_NOTIFICATION_TEMPLATE_LANGUAGE || "en_US";
+
 // Maps an agent's phone number to a display name, so a customer connected
 // to a live chat sees "you're now chatting with Ama" instead of a bare
 // phone number — that's what actually makes it read as a real person
@@ -181,7 +190,7 @@ async function notifyAgentSmart(agentPhone: string, message: string, summaryLabe
     return;
   }
   queuePendingAgentMessage(agentPhone, message);
-  await sendTemplateMessage(agentPhone, AGENT_NOTIFICATION_TEMPLATE_NAME, summaryLabel);
+  await sendTemplateMessage(agentPhone, AGENT_NOTIFICATION_TEMPLATE_NAME, AGENT_NOTIFICATION_TEMPLATE_LANGUAGE, summaryLabel);
 }
 
 async function notifyAgents(message: string, summaryLabel: string = "an update") {
@@ -1638,19 +1647,23 @@ async function sendMessage(to: string, body: string) {
 // (WhatsApp Manager > Account tools > Message Templates > Create Template):
 //   Name:      hustle_agent_notification  (or set AGENT_NOTIFICATION_TEMPLATE_NAME to match whatever you name it)
 //   Category:  Utility
-//   Language:  English (US)
+//   Language:  must match AGENT_NOTIFICATION_TEMPLATE_LANGUAGE above (default "en_US" — pick
+//              "English (US)" specifically in the template creator, not just "English", which
+//              is a different language code ("en") and will fail with error 132001 otherwise)
 //   Body:      "Hustleapp: you have {{1}} waiting for you. Reply to this message to see the full details."
 // Submit for review — Meta typically approves utility templates within
-// minutes to a few hours. Until it's approved, calls to this function will
-// fail and log an error (same graceful-failure pattern as sendMessage) —
-// nothing else in the app depends on it succeeding.
-async function sendTemplateMessage(to: string, templateName: string, bodyParam: string) {
+// minutes to a few hours. Until it's approved (or if the language code
+// doesn't match), calls to this function will fail and log an error (same
+// graceful-failure pattern as sendMessage) — nothing else in the app
+// depends on it succeeding, though the queued notification behind it won't
+// reach the agent until they message the bot some other way.
+async function sendTemplateMessage(to: string, templateName: string, languageCode: string, bodyParam: string) {
   const hasRealCredentials =
     process.env.WHATSAPP_ACCESS_TOKEN &&
     process.env.WHATSAPP_ACCESS_TOKEN !== "from-meta-business-manager";
 
   if (!hasRealCredentials) {
-    console.log(`[DRY RUN — would send template "${templateName}" to ${to} with param "${bodyParam}"]`);
+    console.log(`[DRY RUN — would send template "${templateName}" (${languageCode}) to ${to} with param "${bodyParam}"]`);
     return;
   }
 
@@ -1667,7 +1680,7 @@ async function sendTemplateMessage(to: string, templateName: string, bodyParam: 
       type: "template",
       template: {
         name: templateName,
-        language: { code: "en_US" },
+        language: { code: languageCode },
         components: [{ type: "body", parameters: [{ type: "text", text: bodyParam }] }],
       },
     }),
