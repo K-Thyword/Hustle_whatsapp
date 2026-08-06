@@ -12,6 +12,7 @@ export type ConversationStage =
   | "awaiting_date"
   | "awaiting_date_confirmation"
   | "awaiting_description"
+  | "awaiting_special_instructions"
   | "awaiting_confirmation"
   | "request_submitted"
   | "escalated";
@@ -34,6 +35,7 @@ export interface PastBooking {
   location: string;
   dateWanted?: string;
   description: string;
+  specialInstructions?: string;
   submittedAt: number;
 }
 

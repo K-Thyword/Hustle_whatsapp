@@ -50,6 +50,37 @@ async function notifyAgents(message: string) {
   }
 }
 
+// --- Recognizing yes/no, including common emoji ---
+// WhatsApp conversations lean on emoji a lot for quick replies — a
+// thumbs-up or high-five is exactly as much a "yes" as typing the word.
+const AFFIRMATIVE_WORDS = ["yes", "yeah", "yep", "yup", "sure", "correct", "right", "confirm", "ok", "okay", "affirmative", "alright"];
+const AFFIRMATIVE_EMOJI = ["👍", "🙌", "✅", "✔️", "👌", "💯", "🤝", "😊"];
+const NEGATIVE_WORDS = ["no", "nope", "nah", "incorrect", "wrong"];
+const NEGATIVE_EMOJI = ["👎"];
+
+function isAffirmative(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (AFFIRMATIVE_WORDS.some((w) => t.includes(w))) return true;
+  return AFFIRMATIVE_EMOJI.some((e) => text.includes(e));
+}
+
+function isNegative(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (NEGATIVE_WORDS.some((w) => t.includes(w))) return true;
+  return NEGATIVE_EMOJI.some((e) => text.includes(e));
+}
+
+// --- Recognizing a bare "hi"/"hello" with nothing else in it ---
+const BARE_GREETING_RE = /^(hi+|hello+|hey+|yo+|hiya|howdy|good\s?morning|good\s?afternoon|good\s?evening|morning|evening)[\s!.,👋🙂😊]*$/i;
+
+function isSameCalendarDay(a: Date, b: Date): boolean {
+  return (
+    a.getUTCFullYear() === b.getUTCFullYear() &&
+    a.getUTCMonth() === b.getUTCMonth() &&
+    a.getUTCDate() === b.getUTCDate()
+  );
+}
+
 // --- 1. Webhook verification (Meta calls this once, on setup) ---
 app.get("/webhook", (req: Request, res: Response) => {
   const mode = req.query["hub.mode"];
@@ -119,8 +150,27 @@ app.post("/webhook", async (req: Request, res: Response) => {
 //
 // Escalation to a human can happen from any stage — checked first, always.
 async function handleMessage(phone: string, text: string, media?: MediaAttachment) {
-  const session = getSession(phone);
+  let session = getSession(phone);
   const lower = text.toLowerCase();
+  const now = Date.now();
+
+  const previousLastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
+  const isBareGreetingMsg = BARE_GREETING_RE.test(text.trim());
+
+  // --- Conversation boundary: is this a continuation, or a fresh start? ---
+  // Coming back after 24h of silence, or opening with a bare "hi" on a new
+  // calendar day, both read as the start of a new conversation — reset to
+  // greeting so the customer isn't dropped back into a stale, half-done
+  // booking from a day (or days) ago. Anything else — including a stray
+  // "hi" said mid-booking on the SAME day — keeps the existing flow going;
+  // that's handled separately below rather than treated as a reset.
+  if (session.stage !== "greeting" && previousLastCustomerMessageAt) {
+    const hoursSinceLast = (now - previousLastCustomerMessageAt) / 3_600_000;
+    const isNewDay = !isSameCalendarDay(new Date(previousLastCustomerMessageAt), new Date(now));
+    if (hoursSinceLast >= 24 || (isNewDay && isBareGreetingMsg)) {
+      session = resetForNewRequest(phone);
+    }
+  }
 
   // Keep a short rolling log of the customer's own messages, and clear any
   // pending inactivity check-in flags — any reply means they're still here.
@@ -128,7 +178,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.data.checkedIn || session.data.finalNudgeSent) {
     updateSession(phone, { data: { checkedIn: false, finalNudgeSent: false } });
   }
-  updateSession(phone, { data: { lastCustomerMessageAt: Date.now() } });
+  updateSession(phone, { data: { lastCustomerMessageAt: now } });
+  session = getSession(phone);
 
   // A customer can attach a photo/video/document at any point — save it
   // against their session so it can be forwarded to agents with the rest
@@ -164,62 +215,116 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
 
   if (session.stage === "escalated") {
     if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
-      await sendMessage(phone, "No problem, let's get you sorted. Would you like this done on a specific date, or right away?\n\nJust reply 'schedule' or 'instant'.");
+      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
       resetForNewRequest(phone);
-      updateSession(phone, { stage: "awaiting_mode" });
+      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
     await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly. (Say 'new request' if you'd like to start something new while you wait.)");
     return;
   }
 
-  // General questions about the business get answered directly, without
-  // derailing the booking intake, at the two earliest stages. Skipped when
-  // the reply is obviously just answering our own "schedule or instant"
-  // prompt — otherwise the AI occasionally misreads a one-word answer like
-  // "schedule" as a question about scheduling, which makes the bot feel
-  // like it lost track of the conversation.
-  const isDirectModeReply = lower.includes("schedule") || lower.includes("instant");
-  if ((session.stage === "greeting" || session.stage === "awaiting_mode") && !isDirectModeReply) {
+  // Once a booking is underway, a stray "hi" or "hello" shouldn't be
+  // treated as their answer to whatever we just asked, and it shouldn't
+  // restart the flow either — just acknowledge it and pick up right where
+  // we left off, the way a person would.
+  const MID_FLOW_GUARD_STAGES: ConversationStage[] = [
+    "awaiting_service_type",
+    "awaiting_location",
+    "awaiting_date",
+    "awaiting_date_confirmation",
+    "awaiting_description",
+    "awaiting_special_instructions",
+    "awaiting_confirmation",
+  ];
+  if (MID_FLOW_GUARD_STAGES.includes(session.stage) && isBareGreetingMsg) {
+    const lastPrompt = (session.data.lastPrompt as string | undefined) ?? "Let's continue with your request — where were we?";
+    await sendMessage(phone, `Hey! Good to hear from you — picking up right where we left off.\n\n${lastPrompt}`);
+    return;
+  }
+
+  // The very first message of a conversation (or the first after a reset)
+  // gets a real, contextual reply instead of an unconditional script —
+  // answering a question if one was asked, acknowledging a booking intent,
+  // or just welcoming them if it was a bare "hi".
+  if (session.stage === "greeting") {
     const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
     const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
     const routed = await routeIntent(text, { pastBookings, recentMessages });
+
     if (routed.intent === "question" && routed.reply) {
       await sendMessage(phone, routed.reply);
+      return; // stay in "greeting" — they may ask more, or state what they need next
+    }
+
+    if (routed.intent === "booking_intent") {
+      const ack = routed.reply ? `${routed.reply}\n\n` : "";
+      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      await sendMessage(phone, `${ack}${prompt}`);
+      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
-  }
 
-  if (session.stage === "greeting") {
-    await sendMessage(
-      phone,
-      "Hi there, thanks for reaching out to Hustleapp! Would you like this done on a specific date, or do you need it handled right away?\n\nJust reply 'schedule' or 'instant' and we'll take it from there."
-    );
-    updateSession(phone, { stage: "awaiting_mode" });
+    // "greeting" or "other" — AI already crafted a warm, open reply. Fall
+    // back to a simple one if there's no key configured or it failed.
+    await sendMessage(phone, routed.reply ?? "Hi there! Welcome to Hustleapp. What can I help you with today?");
     return;
   }
 
   if (session.stage === "awaiting_mode") {
-    const mode: BookingMode = lower.includes("instant") ? "instant" : "standard";
-    await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-    updateSession(phone, { stage: "awaiting_service_type", data: { mode } });
+    if (lower.includes("instant")) {
+      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
+      updateSession(phone, {
+        stage: "awaiting_service_type",
+        data: { mode: "instant" as BookingMode, lastPrompt: "What kind of service do you need?" },
+      });
+      return;
+    }
+
+    if (lower.includes("schedule")) {
+      await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
+      updateSession(phone, {
+        stage: "awaiting_service_type",
+        data: { mode: "standard" as BookingMode, lastPrompt: "What kind of service do you need?" },
+      });
+      return;
+    }
+
+    // Not a direct "schedule"/"instant" — see if it's actually a question
+    // first (e.g. "do you work weekends?"), answer it, then remind them
+    // of the pending choice so the conversation doesn't stall.
+    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+    const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
+    const routed = await routeIntent(text, { pastBookings, recentMessages });
+    const reminder = "Would you like this done on a specific date, or right away? Reply 'schedule' or 'instant'.";
+
+    if (routed.intent === "question" && routed.reply) {
+      await sendMessage(phone, `${routed.reply}\n\nAnd just to continue — ${reminder}`);
+      return;
+    }
+
+    await sendMessage(phone, `Sorry, just to make sure I've got this right — ${reminder}`);
     return;
   }
 
   if (session.stage === "awaiting_service_type") {
-    await sendMessage(phone, "Got it. Which area or location is this for?");
-    updateSession(phone, { stage: "awaiting_location", data: { serviceType: text } });
+    const prompt = "Which area or location is this for?";
+    await sendMessage(phone, `Got it. ${prompt}`);
+    updateSession(phone, { stage: "awaiting_location", data: { serviceType: text, lastPrompt: prompt } });
     return;
   }
 
   if (session.stage === "awaiting_location") {
     const mode = session.data.mode as BookingMode;
     if (mode === "standard") {
-      await sendMessage(phone, "And what date would you like this done?");
-      updateSession(phone, { stage: "awaiting_date", data: { location: text } });
+      const prompt = "And what date would you like this done?";
+      await sendMessage(phone, prompt);
+      updateSession(phone, { stage: "awaiting_date", data: { location: text, lastPrompt: prompt } });
     } else {
-      await sendMessage(phone, "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.");
-      updateSession(phone, { stage: "awaiting_description", data: { location: text } });
+      const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
+      await sendMessage(phone, prompt);
+      updateSession(phone, { stage: "awaiting_description", data: { location: text, lastPrompt: prompt } });
     }
     return;
   }
@@ -246,25 +351,21 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // We're reasonably confident, but always read it back and get an
     // explicit yes before locking it in — cheap insurance against a
     // misread date turning into a booking for the wrong day.
-    await sendMessage(
-      phone,
-      `Just to confirm — you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`
-    );
+    const confirmPrompt = `Just to confirm — you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
+    await sendMessage(phone, confirmPrompt);
     updateSession(phone, {
       stage: "awaiting_date_confirmation",
-      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate },
+      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
     });
     return;
   }
 
   if (session.stage === "awaiting_date_confirmation") {
-    if (lower.includes("yes") || lower.includes("correct") || lower.includes("right") || lower.includes("confirm")) {
+    if (isAffirmative(text)) {
       const confirmedDate = (session.data.pendingDateHuman as string | undefined) ?? text;
-      await sendMessage(
-        phone,
-        "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it."
-      );
-      updateSession(phone, { stage: "awaiting_description", data: { dateWanted: confirmedDate } });
+      const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
+      await sendMessage(phone, prompt);
+      updateSession(phone, { stage: "awaiting_description", data: { dateWanted: confirmedDate, lastPrompt: prompt } });
       return;
     }
 
@@ -288,47 +389,62 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       return;
     }
 
-    await sendMessage(
-      phone,
-      `Got it — just to confirm, you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`
-    );
+    const confirmPrompt = `Got it — just to confirm, you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
+    await sendMessage(phone, confirmPrompt);
     updateSession(phone, {
-      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate },
+      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
     });
     return;
   }
 
   if (session.stage === "awaiting_description") {
+    const prompt =
+      "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
+    await sendMessage(phone, prompt);
+    updateSession(phone, { stage: "awaiting_special_instructions", data: { description: text, lastPrompt: prompt } });
+    return;
+  }
+
+  if (session.stage === "awaiting_special_instructions") {
+    const SKIP_WORDS = ["no", "none", "nothing", "n/a", "nope", "not really"];
+    const skip = SKIP_WORDS.some((w) => lower === w || lower.startsWith(`${w} `) || lower.includes(w));
+    const specialInstructions = skip ? undefined : text;
+
     const mode = session.data.mode as BookingMode;
     const serviceType = session.data.serviceType as string;
     const location = session.data.location as string;
     const dateWanted = session.data.dateWanted as string | undefined;
+    const description = session.data.description as string;
 
     const summaryLines = [
       `Service: ${serviceType}`,
       `Location: ${location}`,
       ...(mode === "standard" ? [`Date: ${dateWanted}`] : []),
-      `Details: ${text}`,
+      `Details: ${description}`,
+      ...(specialInstructions ? [`Special instructions: ${specialInstructions}`] : []),
     ];
-    await sendMessage(
-      phone,
-      `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`
-    );
-    updateSession(phone, { stage: "awaiting_confirmation", data: { description: text } });
+    const confirmPrompt = `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
+    await sendMessage(phone, confirmPrompt);
+    updateSession(phone, {
+      stage: "awaiting_confirmation",
+      data: { specialInstructions, lastPrompt: confirmPrompt },
+    });
     return;
   }
 
   if (session.stage === "awaiting_confirmation") {
-    if (!lower.includes("yes")) {
-      await sendMessage(phone, "No worries, let's start over. Reply 'schedule' or 'instant' whenever you're ready.");
+    if (!isAffirmative(text) || isNegative(text)) {
+      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      await sendMessage(phone, `No worries, let's start over. ${prompt}`);
       resetForNewRequest(phone);
-      updateSession(phone, { stage: "awaiting_mode" });
+      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
 
     const user = await findOrCreateUserByPhone(phone);
     const mode = session.data.mode as BookingMode;
     const attachments = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
+    const specialInstructions = session.data.specialInstructions as string | undefined;
     const result = await submitBookingRequest({
       userId: user.id,
       mode,
@@ -336,6 +452,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       location: session.data.location as string,
       dateWanted: session.data.dateWanted as string | undefined,
       description: session.data.description as string,
+      specialInstructions,
       channel: "whatsapp",
       attachmentCount: attachments.length,
     });
@@ -358,6 +475,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         `Location: ${session.data.location}\n` +
         (mode === "standard" ? `Date: ${session.data.dateWanted}\n` : "") +
         `Details: ${session.data.description}` +
+        (specialInstructions ? `\nSpecial instructions: ${specialInstructions}` : "") +
         (attachments.length ? `\nAttachments: ${attachments.length} (forwarded below)` : "")
     );
 
@@ -376,6 +494,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       location: session.data.location as string,
       dateWanted: session.data.dateWanted as string | undefined,
       description: session.data.description as string,
+      specialInstructions,
       submittedAt: Date.now(),
     };
     addPastBooking(phone, booking);
@@ -412,6 +531,7 @@ const ACTIVE_STAGES: ConversationStage[] = [
   "awaiting_date",
   "awaiting_date_confirmation",
   "awaiting_description",
+  "awaiting_special_instructions",
   "awaiting_confirmation",
 ];
 

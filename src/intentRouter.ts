@@ -1,14 +1,24 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { BUSINESS_INFO } from "./businessInfo";
 
-// Decides whether an inbound message is an order request or a general
-// question about the business, and answers the question directly if so.
+// Decides how to respond to a message that isn't yet mid-way through a
+// structured booking step (i.e. the customer's opener, or an interruption
+// while we're waiting on their booking mode). This is what lets the first
+// message of a conversation feel like a person replying to what was
+// actually said, instead of an unconditional scripted opener.
+//
 // This is intentionally decoupled from appApi.ts / the order flow — it
 // only ever reads BUSINESS_INFO, never live provider/order data, so it
 // works today even before the real backend endpoints exist.
 
 export interface RoutedIntent {
-  intent: "order" | "question" | "other";
+  // "question": asking something about the business (possibly alongside a
+  //   greeting, e.g. "Hi, are you guys open?") — reply answers it directly.
+  // "booking_intent": clearly wants to book/request a service — reply is
+  //   just a short acknowledgment; the app asks schedule/instant itself.
+  // "greeting": a bare opener with no other content (hi, hello, morning...).
+  // "other": anything else unclear.
+  intent: "question" | "booking_intent" | "greeting" | "other";
   reply?: string;
 }
 
@@ -56,35 +66,39 @@ We don't have live status tracking yet, so if they ask for a status update on a 
 
   return `You are the WhatsApp assistant for Hustleapp, a marketplace connecting customers with artisans and professional service providers (not sellers of physical goods) — things like plumbers, electricians, carpenters, mechanics, hairdressers, chefs, accountants, lawyers, tutors, homecare nurses, and similar trades common in Ghana.
 
-Decide whether the customer's message is:
-- "order": they want to book/request a service, or are continuing a booking already in progress
-- "question": they're asking something about the business (hours, pricing, policies, service areas, how something works, what services are offered, etc.) or about their own past bookings
-- "other": a greeting, small talk, or anything unclear
+Classify the customer's message into exactly one of these:
+- "question": they're asking something specific — about the business (hours, pricing, policies, service areas, whether this is really Hustleapp, how something works, etc.) or about their own past bookings. This includes messages that open with a greeting but then ask something, e.g. "Hi, are you guys open?" or "hello, is this Hustleapp?" — those are "question", not "greeting".
+- "booking_intent": they've clearly stated or strongly implied they want to book/request a service, e.g. "I need a plumber", "can I book a hairdresser", "I want to get something fixed".
+- "greeting": a bare opener with nothing else to respond to — "hi", "hello", "good morning", "hey there", etc.
+- "other": anything else unclear, small talk, or that doesn't fit above.
 
-If the intent is "question", answer it directly and helpfully using ONLY the business info and customer history below.
-If the info below doesn't cover it, say you're not sure and suggest they ask a human — never invent details.
+Then write a natural "reply" as a friendly, switched-on human support agent chatting on WhatsApp — never a corporate script, never a stale fixed line. Ground rules for the reply, depending on intent:
 
-How to write the "reply" (this matters a lot):
-- Write like a friendly, switched-on human support agent chatting on WhatsApp — not a corporate script.
-- Use simple, everyday English. Short sentences. Correct grammar and spelling.
-- Vary your wording naturally — don't reuse the exact same stock phrases every time.
-- Be warm and conversational, but stay concise — a couple of sentences is usually enough.
-- It's fine to sound a little casual (contractions like "you'll", "it's" are good), while staying clear and professional.
+- "question": answer it directly and helpfully using ONLY the business info below (if it's a greeting+question combo like "Hi, are you open?", acknowledge the greeting warmly in the same breath as answering). If the info below doesn't cover it, say you're not sure and suggest they ask a human — never invent details. Do NOT ask whether they want this scheduled or done right away — that's handled separately.
+- "booking_intent": reply should be ONLY a short, warm acknowledgment of what they need (e.g. "Sure, happy to help you find a plumber!") — do NOT ask about date/timing yourself, and do NOT ask them to reply 'schedule' or 'instant' — the app adds that question separately right after your reply.
+- "greeting": a warm welcome plus an open question inviting them to say what they need help with today. Don't assume they want to book yet.
+- "other": a brief, friendly line inviting them to clarify what they need help with.
+
+Other style rules:
+- Simple, everyday English. Short sentences. Correct grammar and spelling.
+- Vary your wording naturally — don't reuse the exact same stock phrases every reply.
+- Concise — a sentence or two is usually enough.
+- Contractions are fine ("you'll", "it's") — sound like a person, not a policy document.
 
 Business info:
 ${BUSINESS_INFO}
 ${historySection}
 
 Respond with strict JSON only, nothing else, no markdown formatting:
-{"intent": "order" | "question" | "other", "reply": "string, or null if intent is not question"}`;
+{"intent": "question" | "booking_intent" | "greeting" | "other", "reply": "string"}`;
 }
 
 export async function routeIntent(message: string, context?: ConversationContext): Promise<RoutedIntent> {
-  // No API key configured yet — fall back to treating everything as an
-  // order so the rest of the bot keeps working. Question-answering just
-  // isn't smart until ANTHROPIC_API_KEY is set in .env.
+  // No API key configured yet — fall back to treating everything as
+  // booking intent so the rest of the bot keeps working, just without the
+  // natural greeting/FAQ handling until ANTHROPIC_API_KEY is set in .env.
   if (!anthropic) {
-    return { intent: "order" };
+    return { intent: "booking_intent" };
   }
 
   try {
@@ -109,12 +123,17 @@ export async function routeIntent(message: string, context?: ConversationContext
       .trim();
 
     const parsed = JSON.parse(cleaned);
-    if (parsed.intent === "order" || parsed.intent === "question" || parsed.intent === "other") {
+    if (
+      parsed.intent === "question" ||
+      parsed.intent === "booking_intent" ||
+      parsed.intent === "greeting" ||
+      parsed.intent === "other"
+    ) {
       return { intent: parsed.intent, reply: parsed.reply ?? undefined };
     }
     return { intent: "other" };
   } catch (err) {
-    console.error("Intent routing failed, falling back to order flow:", err);
-    return { intent: "order" };
+    console.error("Intent routing failed, falling back to booking intent:", err);
+    return { intent: "booking_intent" };
   }
 }

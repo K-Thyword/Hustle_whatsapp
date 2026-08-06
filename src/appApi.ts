@@ -30,6 +30,7 @@ export interface BookingRequestInput {
   location: string;
   dateWanted?: string; // only present for standard (scheduled) bookings
   description: string;
+  specialInstructions?: string; // anything the customer wants the artisan to note
   channel: "whatsapp";
   attachmentCount?: number; // photos/videos/documents the customer attached
 }
