@@ -10,6 +10,7 @@ export type ConversationStage =
   | "awaiting_service_type"
   | "awaiting_location"
   | "awaiting_date"
+  | "awaiting_date_confirmation"
   | "awaiting_description"
   | "awaiting_confirmation"
   | "request_submitted"
@@ -21,6 +22,28 @@ export interface ConversationSession {
   data: Record<string, unknown>;
   updatedAt: number;
 }
+
+// A short record of a booking this customer already submitted — kept
+// around across resets (unlike the rest of session.data) so the bot can
+// stay aware of it if the customer references "my last booking" later,
+// and so agent-facing context has some history to draw on.
+export interface PastBooking {
+  requestId: string;
+  mode: string;
+  serviceType: string;
+  location: string;
+  dateWanted?: string;
+  description: string;
+  submittedAt: number;
+}
+
+// Fields in session.data that survive a reset (starting a new booking,
+// restarting after "no", etc.) — everything else in .data is wiped so a
+// new booking never inherits stale fields (attachments, service type...)
+// from a previous one, while still remembering who this customer is.
+const PERSISTENT_DATA_KEYS = ["pastBookings", "messageLog"] as const;
+
+const MESSAGE_LOG_LIMIT = 20;
 
 const sessions = new Map<string, ConversationSession>();
 
@@ -53,6 +76,53 @@ export function updateSession(
   return updated;
 }
 
+// Full wipe — only use this if you genuinely want to forget this customer
+// entirely. For "start a new booking" flows, use resetForNewRequest()
+// instead so booking history and recent conversation context survive.
 export function clearSession(phone: string): void {
   sessions.delete(phone);
+}
+
+// Resets a session back to "greeting" for a fresh booking, but keeps the
+// persistent fields (past booking history, recent message log) so the bot
+// doesn't lose all memory of this customer every time a booking wraps up.
+export function resetForNewRequest(phone: string): ConversationSession {
+  const session = getSession(phone);
+  const persisted: Record<string, unknown> = {};
+  for (const key of PERSISTENT_DATA_KEYS) {
+    if (key in session.data) persisted[key] = session.data[key];
+  }
+  const fresh: ConversationSession = {
+    phone,
+    stage: "greeting",
+    data: persisted,
+    updatedAt: Date.now(),
+  };
+  sessions.set(phone, fresh);
+  return fresh;
+}
+
+// Adds a completed booking to this customer's history (survives resets).
+export function addPastBooking(phone: string, booking: PastBooking): void {
+  const session = getSession(phone);
+  const existing = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+  updateSession(phone, { data: { pastBookings: [...existing, booking] } });
+}
+
+// All active sessions — used by the inactivity check-in sweep to find
+// customers who've gone quiet mid-booking. Returns live references, not
+// copies, so callers can updateSession() as normal.
+export function getAllSessions(): ConversationSession[] {
+  return Array.from(sessions.values());
+}
+
+// Appends one line to a short rolling transcript of this customer's own
+// messages (not the bot's replies) — enough for the FAQ AI to have some
+// awareness of what's been discussed, without keeping unbounded history.
+export function appendMessageLog(phone: string, text: string): void {
+  if (!text) return;
+  const session = getSession(phone);
+  const existing = (session.data.messageLog as string[] | undefined) ?? [];
+  const updatedLog = [...existing, text].slice(-MESSAGE_LOG_LIMIT);
+  updateSession(phone, { data: { messageLog: updatedLog } });
 }

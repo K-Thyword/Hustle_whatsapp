@@ -12,19 +12,56 @@ export interface RoutedIntent {
   reply?: string;
 }
 
+// A light memory of this specific customer — past bookings they've
+// submitted and a handful of their recent messages — so the AI doesn't
+// treat every question as coming from a stranger with no history. Kept
+// intentionally small; this is conversational context, not a database.
+export interface ConversationContext {
+  pastBookings: {
+    requestId: string;
+    mode: string;
+    serviceType: string;
+    location: string;
+    dateWanted?: string;
+    submittedAt: number;
+  }[];
+  recentMessages: string[];
+}
+
 const hasRealKey =
   process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== "from-console.anthropic.com";
 
 const anthropic = hasRealKey ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
-const SYSTEM_PROMPT = `You are the WhatsApp assistant for Hustleapp, a marketplace connecting customers with artisans and professional service providers (not sellers of physical goods) — things like plumbers, electricians, carpenters, mechanics, hairdressers, chefs, accountants, lawyers, tutors, homecare nurses, and similar trades common in Ghana.
+function buildSystemPrompt(context?: ConversationContext): string {
+  let historySection = "";
+  if (context && (context.pastBookings.length > 0 || context.recentMessages.length > 0)) {
+    const bookingLines = context.pastBookings
+      .map(
+        (b) =>
+          `- ${b.mode} booking, ${b.serviceType} in ${b.location}` +
+          (b.dateWanted ? `, requested for ${b.dateWanted}` : "") +
+          ` (reference ${b.requestId})`
+      )
+      .join("\n");
+    const messageLines = context.recentMessages.slice(-10).join("\n");
+    historySection = `
+
+What you know about this specific customer (use this to avoid sounding like you've never spoken to them before — e.g. if they ask about "my last booking", refer to it by name/reference rather than asking "which booking?"):
+${context.pastBookings.length > 0 ? `Past bookings:\n${bookingLines}` : "No past bookings yet."}
+${context.recentMessages.length > 0 ? `\nRecent messages from them:\n${messageLines}` : ""}
+
+We don't have live status tracking yet, so if they ask for a status update on a specific booking, acknowledge the booking by its details/reference and suggest saying "agent" so a human can check on it — don't invent a status.`;
+  }
+
+  return `You are the WhatsApp assistant for Hustleapp, a marketplace connecting customers with artisans and professional service providers (not sellers of physical goods) — things like plumbers, electricians, carpenters, mechanics, hairdressers, chefs, accountants, lawyers, tutors, homecare nurses, and similar trades common in Ghana.
 
 Decide whether the customer's message is:
 - "order": they want to book/request a service, or are continuing a booking already in progress
-- "question": they're asking something about the business (hours, pricing, policies, service areas, how something works, what services are offered, etc.)
+- "question": they're asking something about the business (hours, pricing, policies, service areas, how something works, what services are offered, etc.) or about their own past bookings
 - "other": a greeting, small talk, or anything unclear
 
-If the intent is "question", answer it directly and helpfully using ONLY the business info below.
+If the intent is "question", answer it directly and helpfully using ONLY the business info and customer history below.
 If the info below doesn't cover it, say you're not sure and suggest they ask a human — never invent details.
 
 How to write the "reply" (this matters a lot):
@@ -36,11 +73,13 @@ How to write the "reply" (this matters a lot):
 
 Business info:
 ${BUSINESS_INFO}
+${historySection}
 
 Respond with strict JSON only, nothing else, no markdown formatting:
 {"intent": "order" | "question" | "other", "reply": "string, or null if intent is not question"}`;
+}
 
-export async function routeIntent(message: string): Promise<RoutedIntent> {
+export async function routeIntent(message: string, context?: ConversationContext): Promise<RoutedIntent> {
   // No API key configured yet — fall back to treating everything as an
   // order so the rest of the bot keeps working. Question-answering just
   // isn't smart until ANTHROPIC_API_KEY is set in .env.
@@ -52,7 +91,7 @@ export async function routeIntent(message: string): Promise<RoutedIntent> {
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 400,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(context),
       messages: [{ role: "user", content: message }],
     });
 

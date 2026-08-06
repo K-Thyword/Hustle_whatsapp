@@ -1,9 +1,18 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
-import * as chrono from "chrono-node";
-import { getSession, updateSession, clearSession } from "./session";
+import {
+  getSession,
+  updateSession,
+  resetForNewRequest,
+  addPastBooking,
+  appendMessageLog,
+  getAllSessions,
+  ConversationStage,
+  PastBooking,
+} from "./session";
 import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
 import { routeIntent } from "./intentRouter";
+import { interpretDate } from "./dateInterpreter";
 
 const app = express();
 app.use(express.json());
@@ -113,6 +122,14 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   const session = getSession(phone);
   const lower = text.toLowerCase();
 
+  // Keep a short rolling log of the customer's own messages, and clear any
+  // pending inactivity check-in flags — any reply means they're still here.
+  appendMessageLog(phone, text);
+  if (session.data.checkedIn || session.data.finalNudgeSent) {
+    updateSession(phone, { data: { checkedIn: false, finalNudgeSent: false } });
+  }
+  updateSession(phone, { data: { lastCustomerMessageAt: Date.now() } });
+
   // A customer can attach a photo/video/document at any point — save it
   // against their session so it can be forwarded to agents with the rest
   // of the booking. If it arrived with no caption text, acknowledge it and
@@ -148,7 +165,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "escalated") {
     if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
       await sendMessage(phone, "No problem, let's get you sorted. Would you like this done on a specific date, or right away?\n\nJust reply 'schedule' or 'instant'.");
-      clearSession(phone);
+      resetForNewRequest(phone);
       updateSession(phone, { stage: "awaiting_mode" });
       return;
     }
@@ -164,7 +181,9 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // like it lost track of the conversation.
   const isDirectModeReply = lower.includes("schedule") || lower.includes("instant");
   if ((session.stage === "greeting" || session.stage === "awaiting_mode") && !isDirectModeReply) {
-    const routed = await routeIntent(text);
+    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+    const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
+    const routed = await routeIntent(text, { pastBookings, recentMessages });
     if (routed.intent === "question" && routed.reply) {
       await sendMessage(phone, routed.reply);
       return;
@@ -206,27 +225,76 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_date") {
-    // Understand relative/natural dates ("tomorrow", "4th August") and
-    // reject anything that's clearly already passed, so we don't book a
-    // job for a date that can't happen.
-    const parsedDate = chrono.parseDate(text, new Date());
-    if (parsedDate) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const parsedDay = new Date(parsedDate);
-      parsedDay.setHours(0, 0, 0, 0);
+    const interpretation = await interpretDate(text, new Date());
 
-      if (parsedDay.getTime() < today.getTime()) {
-        await sendMessage(
-          phone,
-          `That date's already passed — could you give me a date from today onward?`
-        );
-        return;
-      }
+    if (interpretation.status === "past") {
+      await sendMessage(
+        phone,
+        `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
+      );
+      return;
     }
 
-    await sendMessage(phone, "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.");
-    updateSession(phone, { stage: "awaiting_description", data: { dateWanted: text } });
+    if (interpretation.status === "unclear") {
+      await sendMessage(
+        phone,
+        "Sorry, I didn't quite catch that date — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
+      );
+      return;
+    }
+
+    // We're reasonably confident, but always read it back and get an
+    // explicit yes before locking it in — cheap insurance against a
+    // misread date turning into a booking for the wrong day.
+    await sendMessage(
+      phone,
+      `Just to confirm — you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`
+    );
+    updateSession(phone, {
+      stage: "awaiting_date_confirmation",
+      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate },
+    });
+    return;
+  }
+
+  if (session.stage === "awaiting_date_confirmation") {
+    if (lower.includes("yes") || lower.includes("correct") || lower.includes("right") || lower.includes("confirm")) {
+      const confirmedDate = (session.data.pendingDateHuman as string | undefined) ?? text;
+      await sendMessage(
+        phone,
+        "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it."
+      );
+      updateSession(phone, { stage: "awaiting_description", data: { dateWanted: confirmedDate } });
+      return;
+    }
+
+    // Not a clear "yes" — treat their reply as a fresh date attempt rather
+    // than assuming they meant "no", since they may have just retyped it.
+    const interpretation = await interpretDate(text, new Date());
+
+    if (interpretation.status === "past") {
+      await sendMessage(
+        phone,
+        `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
+      );
+      return;
+    }
+
+    if (interpretation.status === "unclear") {
+      await sendMessage(
+        phone,
+        "Sorry, I still didn't catch that clearly — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
+      );
+      return;
+    }
+
+    await sendMessage(
+      phone,
+      `Got it — just to confirm, you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`
+    );
+    updateSession(phone, {
+      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate },
+    });
     return;
   }
 
@@ -253,7 +321,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "awaiting_confirmation") {
     if (!lower.includes("yes")) {
       await sendMessage(phone, "No worries, let's start over. Reply 'schedule' or 'instant' whenever you're ready.");
-      clearSession(phone);
+      resetForNewRequest(phone);
       updateSession(phone, { stage: "awaiting_mode" });
       return;
     }
@@ -301,15 +369,80 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       }
     }
 
-    // Clear everything (attachments, service type, etc.) rather than just
-    // changing stage — otherwise leftover data from this booking (like a
-    // photo attachment) would silently reappear in the customer's next one.
-    clearSession(phone);
+    const booking: PastBooking = {
+      requestId: result.requestId,
+      mode,
+      serviceType: session.data.serviceType as string,
+      location: session.data.location as string,
+      dateWanted: session.data.dateWanted as string | undefined,
+      description: session.data.description as string,
+      submittedAt: Date.now(),
+    };
+    addPastBooking(phone, booking);
+
+    // Reset the in-progress booking fields (attachments, service type,
+    // etc.) so they don't leak into the next booking — but this keeps
+    // booking history and recent messages, unlike a full clearSession.
+    resetForNewRequest(phone);
     return;
   }
 
   // request_submitted or unrecognized — reset for simplicity in this skeleton
-  clearSession(phone);
+  resetForNewRequest(phone);
+}
+
+// --- 3b. Inactivity check-ins ---
+// If a customer goes quiet partway through a booking, nudge them once
+// after CHECK_IN_AFTER_MS of silence, then send one final "I'm here
+// whenever you need me" after FINAL_NUDGE_AFTER_MS more — and then stop,
+// so we're not pestering them. Any new message from them resets this
+// (handled at the top of handleMessage). Adjust the timings below to
+// taste — they're a starting point, not a fixed business rule.
+const CHECK_IN_AFTER_MS = 10 * 60 * 1000; // 10 minutes of silence
+const FINAL_NUDGE_AFTER_MS = 30 * 60 * 1000; // 30 minutes of silence total
+const SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
+
+// Only nudge customers who are genuinely mid-booking and waiting on us to
+// hear back from them — not on the greeting screen, not already handed to
+// a human agent, and not just after finishing a booking.
+const ACTIVE_STAGES: ConversationStage[] = [
+  "awaiting_mode",
+  "awaiting_service_type",
+  "awaiting_location",
+  "awaiting_date",
+  "awaiting_date_confirmation",
+  "awaiting_description",
+  "awaiting_confirmation",
+];
+
+function startInactivitySweep() {
+  setInterval(() => {
+    const now = Date.now();
+    for (const session of getAllSessions()) {
+      if (!ACTIVE_STAGES.includes(session.stage)) continue;
+
+      const lastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
+      if (!lastCustomerMessageAt) continue;
+
+      const elapsed = now - lastCustomerMessageAt;
+      const checkedIn = Boolean(session.data.checkedIn);
+      const finalNudgeSent = Boolean(session.data.finalNudgeSent);
+
+      if (!checkedIn && elapsed > CHECK_IN_AFTER_MS) {
+        sendMessage(
+          session.phone,
+          "Hey, just checking in — still there? Whenever you're ready, we can carry on from where we left off."
+        );
+        updateSession(session.phone, { data: { checkedIn: true } });
+      } else if (checkedIn && !finalNudgeSent && elapsed > FINAL_NUDGE_AFTER_MS) {
+        sendMessage(
+          session.phone,
+          "No worries if now isn't a good time — I'm here whenever you're ready to continue, just message me anytime."
+        );
+        updateSession(session.phone, { data: { finalNudgeSent: true } });
+      }
+    }
+  }, SWEEP_INTERVAL_MS);
 }
 
 // --- 4. Outbound sender ---
@@ -381,4 +514,5 @@ async function sendMedia(to: string, media: MediaAttachment) {
 
 app.listen(PORT, () => {
   console.log(`WhatsApp service listening on port ${PORT}`);
+  startInactivitySweep();
 });
