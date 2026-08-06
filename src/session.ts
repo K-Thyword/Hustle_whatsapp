@@ -11,6 +11,7 @@ export type ConversationStage =
   | "awaiting_location"
   | "awaiting_date"
   | "awaiting_date_confirmation"
+  | "awaiting_extra_details" // service-specific follow-ups, recurring, budget
   | "awaiting_description"
   | "awaiting_special_instructions"
   | "awaiting_confirmation"
@@ -36,6 +37,8 @@ export interface PastBooking {
   dateWanted?: string;
   description: string;
   specialInstructions?: string;
+  recurring?: string; // e.g. "one-time" or "regular" — only asked for some trades
+  budget?: string; // rough budget the customer gave, for quote-type jobs
   submittedAt: number;
 }
 

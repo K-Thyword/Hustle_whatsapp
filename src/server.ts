@@ -13,7 +13,17 @@ import {
 import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
 import { routeIntent } from "./intentRouter";
 import { interpretDate } from "./dateInterpreter";
-import { createQuoteRequest, getQuoteRequest, updateQuoteRequest, getPendingCustomerAction } from "./quotes";
+import { matchServiceCategory } from "./serviceCategories";
+import { logRequestEvent } from "./googleSheet";
+import {
+  createQuoteRequest,
+  getQuoteRequest,
+  updateQuoteRequest,
+  getPendingCustomerAction,
+  getLatestActiveRequestForPhone,
+  getAllQuoteRequests,
+  OPEN_STATUSES,
+} from "./quotes";
 
 const app = express();
 app.use(express.json());
@@ -34,6 +44,56 @@ const ESCALATION_TRIGGERS = [
   "customer service",
 ];
 
+// Words/phrases that suggest a complaint or dispute rather than a routine
+// "let me talk to someone" request — these get a distinct, higher-visibility
+// notification format so they don't get buried among ordinary booking
+// traffic, and they trigger escalation on their own even without the
+// customer explicitly asking for an agent.
+const COMPLAINT_SIGNAL_WORDS = [
+  "refund",
+  "complaint",
+  "complain",
+  "unacceptable",
+  "terrible",
+  "worst",
+  "scam",
+  "fraud",
+  "rip off",
+  "ripoff",
+  "never showed",
+  "didn't show",
+  "did not show",
+  "not happy",
+  "unhappy",
+  "disappointed",
+  "ruined",
+  "damaged my",
+  "broke my",
+  "poor service",
+  "bad service",
+  "not what i asked",
+  "overcharged",
+];
+
+// A customer asking to cancel an already-submitted request — handled
+// directly by the bot rather than requiring them to message an agent for
+// something this simple. Checked early, before escalation handling, so it
+// works even if the customer is currently in "escalated" state waiting on
+// a human.
+const CANCEL_TRIGGERS = [
+  "cancel my last request",
+  "cancel my request",
+  "cancel my booking",
+  "cancel my order",
+  "cancel the request",
+  "cancel the booking",
+  "cancel this request",
+  "cancel this booking",
+  "cancel booking",
+  "cancel order",
+  "cancel request",
+];
+
 // Interim measure while there's no real backend to receive booking
 // requests: notify these agent numbers directly over WhatsApp whenever a
 // request is submitted, so a human actually sees it. Comma-separated in
@@ -45,6 +105,11 @@ const AGENT_NOTIFY_NUMBERS = (process.env.AGENT_NOTIFY_NUMBERS || "")
   .map((n) => n.trim())
   .filter(Boolean);
 
+// Optional: a backup contact who also gets pinged if a request sits
+// unclaimed too long — separate from the main agent list so it can be a
+// supervisor/on-call number rather than another frontline agent.
+const BACKUP_AGENT_NUMBER = process.env.BACKUP_AGENT_NUMBER?.trim();
+
 async function notifyAgents(message: string) {
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await sendMessage(number, message);
@@ -54,13 +119,17 @@ async function notifyAgents(message: string) {
 // --- Agent commands: relaying artisan questions/quotes to the customer ---
 // For jobs that need a price quote rather than a fixed price, an agent
 // takes the job details to the artisan, then relays whatever comes back
-// through the bot using a simple format:
+// through the bot using a simple format — one line, reference first:
 //   req_123: quote 250 cedis
 //   req_123: needs to know if it's gas or electric
-// The bot delivers that to the right customer and tracks the request's
-// status so the customer's next reply gets routed back correctly instead
-// of starting a fresh conversation.
-const AGENT_COMMAND_RE = /^(req_\S+?)\s*:\s*(quote|needs|ask|info)\s+([\s\S]+)$/i;
+//   req_123: matched Kwame the plumber
+//   req_123: claim
+//   req_123: done
+// The bot delivers updates to the right customer, keeps a single source of
+// truth for what's been said, and tracks the request's status so the
+// customer's next reply gets routed back correctly.
+const AGENT_COMMAND_RE =
+  /^(req_\S+?)\s*:\s*(quote|needs|ask|info|matched|done|complete|completed|claim)(?:\s+([\s\S]+))?$/i;
 
 async function handleAgentMessage(agentPhone: string, text: string) {
   const match = text.trim().match(AGENT_COMMAND_RE);
@@ -72,13 +141,14 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     if (text.toLowerCase().includes("req_")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. Use:\n<reference>: quote <amount/details>\nor\n<reference>: needs <question for the customer>"
+        "Didn't catch that as a command. Use:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done"
       );
     }
     return;
   }
 
-  const [, requestId, actionRaw, content] = match;
+  const [, requestId, actionRaw, contentRaw] = match;
+  const content = (contentRaw ?? "").trim();
   const request = getQuoteRequest(requestId);
   if (!request) {
     await sendMessage(agentPhone, `Couldn't find a request with reference ${requestId} — double check the number.`);
@@ -87,13 +157,90 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   const action = actionRaw.toLowerCase();
 
-  if (action === "quote") {
-    updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content.trim() });
+  if ((action === "quote" || action === "needs" || action === "ask" || action === "info") && !content) {
+    await sendMessage(
+      agentPhone,
+      `Missing details — use:\n${requestId}: quote <amount>\nor\n${requestId}: needs <question for the customer>`
+    );
+    return;
+  }
+
+  if (action === "claim") {
+    if (request.claimedBy && request.claimedBy !== agentPhone) {
+      await sendMessage(agentPhone, `Already claimed — ${requestId} is being handled by ${request.claimedBy}.`);
+      return;
+    }
+    if (request.claimedBy === agentPhone) {
+      await sendMessage(agentPhone, `You've already claimed ${requestId}.`);
+      return;
+    }
+    updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
+    await sendMessage(agentPhone, `You've claimed ${requestId} (${request.serviceType}, ${request.location}).`);
+    for (const number of AGENT_NOTIFY_NUMBERS) {
+      if (number === agentPhone) continue;
+      await sendMessage(number, `${requestId} has been claimed by ${agentPhone} — no action needed unless they ask for help.`);
+    }
+    await logRequestEvent({
+      requestId,
+      event: "claimed",
+      phone: request.phone,
+      serviceType: request.serviceType,
+      location: request.location,
+      detail: agentPhone,
+    });
+    return;
+  }
+
+  if (action === "matched") {
+    updateQuoteRequest(requestId, { matchedProvider: content || undefined });
     await sendMessage(
       request.phone,
-      `Good news — we've got a price for your ${request.serviceType} request: ${content.trim()}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`
+      `Good news — we've matched you with ${content || "a provider"} for your ${request.serviceType} request. They'll be in touch, or one of our agents will confirm details with you shortly.`
+    );
+    await sendMessage(agentPhone, `Match noted for ${requestId}, and the customer's been told.`);
+    await logRequestEvent({
+      requestId,
+      event: "matched",
+      phone: request.phone,
+      serviceType: request.serviceType,
+      location: request.location,
+      detail: content,
+    });
+    return;
+  }
+
+  if (action === "done" || action === "complete" || action === "completed") {
+    updateQuoteRequest(requestId, { status: "completed" });
+    await sendMessage(
+      request.phone,
+      `Just checking in — your ${request.serviceType} job (${requestId}) has been marked as done! How did everything go? Reply with a quick rating from 1-5, or tell us how it went — it helps us keep quality high.`
+    );
+    await sendMessage(agentPhone, `Marked ${requestId} as completed, and asked the customer for a review.`);
+    await logRequestEvent({
+      requestId,
+      event: "completed",
+      phone: request.phone,
+      serviceType: request.serviceType,
+      location: request.location,
+    });
+    return;
+  }
+
+  if (action === "quote") {
+    updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content });
+    await sendMessage(
+      request.phone,
+      `Good news — we've got a price for your ${request.serviceType} request: ${content}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`
     );
     await sendMessage(agentPhone, `Quote sent to the customer for ${requestId}.`);
+    await logRequestEvent({
+      requestId,
+      event: "quoted",
+      phone: request.phone,
+      serviceType: request.serviceType,
+      location: request.location,
+      detail: content,
+    });
     return;
   }
 
@@ -101,17 +248,33 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   updateQuoteRequest(requestId, { status: "awaiting_customer_info" });
   await sendMessage(
     request.phone,
-    `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content.trim()}`
+    `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content}`
   );
   await sendMessage(agentPhone, `Question sent to the customer for ${requestId}.`);
 }
 
-// --- Recognizing yes/no, including common emoji ---
+// --- Recognizing yes/no, including common emoji and a little local flavor ---
 // WhatsApp conversations lean on emoji a lot for quick replies — a
 // thumbs-up or high-five is exactly as much a "yes" as typing the word.
-const AFFIRMATIVE_WORDS = ["yes", "yeah", "yep", "yup", "sure", "correct", "right", "confirm", "ok", "okay", "affirmative", "alright"];
+// A couple of common Twi/Ga acknowledgment words are included too.
+const AFFIRMATIVE_WORDS = [
+  "yes",
+  "yeah",
+  "yep",
+  "yup",
+  "sure",
+  "correct",
+  "right",
+  "confirm",
+  "ok",
+  "okay",
+  "affirmative",
+  "alright",
+  "aane", // Twi: yes
+  "yoo", // common Ghanaian acknowledgment, used affirmatively
+];
 const AFFIRMATIVE_EMOJI = ["👍", "🙌", "✅", "✔️", "👌", "💯", "🤝", "😊"];
-const NEGATIVE_WORDS = ["no", "nope", "nah", "incorrect", "wrong"];
+const NEGATIVE_WORDS = ["no", "nope", "nah", "incorrect", "wrong", "daabi"]; // "daabi" = Twi for no
 const NEGATIVE_EMOJI = ["👎"];
 
 function isAffirmative(text: string): boolean {
@@ -127,7 +290,11 @@ function isNegative(text: string): boolean {
 }
 
 // --- Recognizing a bare "hi"/"hello" with nothing else in it ---
-const BARE_GREETING_RE = /^(hi+|hello+|hey+|yo+|hiya|howdy|good\s?morning|good\s?afternoon|good\s?evening|morning|evening)[\s!.,👋🙂😊]*$/i;
+// Includes a handful of common Twi/Ga greetings so customers who open in
+// their own language get the same warm, natural handling as "hi"/"hello" —
+// not a full bilingual bot, just recognizing the common openers.
+const BARE_GREETING_RE =
+  /^(hi+|hello+|hey+|yo+|hiya|howdy|good\s?morning|good\s?afternoon|good\s?evening|morning|evening|maakye|maaha|maadwo|ete\s?s[eɛ]n|wo\s?ho\s?te\s?s[eɛ]n|chale|ojekoo|agoo)[\s!.,👋🙂😊]*$/i;
 
 function isSameCalendarDay(a: Date, b: Date): boolean {
   return (
@@ -200,7 +367,58 @@ app.post("/webhook", async (req: Request, res: Response) => {
   }
 });
 
-// --- 3. Conversation logic ---
+// --- 3. Extra job-detail questions, tailored per service category ---
+// Instead of one generic "describe the job" prompt for everything, some
+// trades get a short, specific queue of questions first (headcount for
+// catering, home size for cleaning, pickup/drop-off for moving...), plus a
+// "one-time or regular?" question for trades where that's common, and a
+// rough budget question for jobs that are normally priced with a quote.
+// Unmatched service types fall straight through to the generic prompt,
+// unchanged from before.
+type ExtraQuestionKey = "recurring" | "followup" | "budget";
+interface ExtraQuestion {
+  key: ExtraQuestionKey;
+  question: string;
+}
+
+async function beginJobDetails(phone: string) {
+  const session = getSession(phone);
+  const serviceType = (session.data.serviceType as string) ?? "";
+  const category = matchServiceCategory(serviceType);
+
+  const queue: ExtraQuestion[] = [];
+  if (category?.asksRecurring) {
+    queue.push({
+      key: "recurring",
+      question: "Is this a one-time thing, or something you'll need regularly (like weekly or monthly)?",
+    });
+  }
+  for (const q of category?.followUpQuestions ?? []) {
+    queue.push({ key: "followup", question: q });
+  }
+  if (category?.likelyNeedsQuote) {
+    queue.push({
+      key: "budget",
+      question: "Do you have a rough budget in mind for this? Reply with an amount, or say 'not sure' if you don't have one yet.",
+    });
+  }
+
+  if (queue.length > 0) {
+    const [first, ...rest] = queue;
+    await sendMessage(phone, first.question);
+    updateSession(phone, {
+      stage: "awaiting_extra_details",
+      data: { extraQueue: rest, extraAnswers: [], currentExtraKey: first.key, lastPrompt: first.question },
+    });
+    return;
+  }
+
+  const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
+  await sendMessage(phone, prompt);
+  updateSession(phone, { stage: "awaiting_description", data: { lastPrompt: prompt } });
+}
+
+// --- 4. Conversation logic ---
 // Hustleapp connects customers with artisans/professionals — there is no
 // live/real-time list of available providers. So this flow collects the
 // customer's request details and submits them as a booking request that a
@@ -260,17 +478,50 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     }
   }
 
+  // A customer wanting to cancel an already-submitted request — handled
+  // directly, without needing to message an agent. Checked early so it
+  // works from any stage, including "escalated".
+  if (CANCEL_TRIGGERS.some((t) => lower.includes(t))) {
+    const active = getLatestActiveRequestForPhone(phone);
+    if (!active) {
+      await sendMessage(
+        phone,
+        "I don't see an open request to cancel right now. If that doesn't sound right, just say 'agent' and I'll get someone to check."
+      );
+      return;
+    }
+    updateQuoteRequest(active.requestId, { status: "cancelled" });
+    await sendMessage(
+      phone,
+      `Done — I've cancelled request ${active.requestId} (${active.serviceType} in ${active.location}). Let me know if you'd like to book something else.`
+    );
+    await notifyAgents(`Customer ${phone} cancelled ${active.requestId} (${active.serviceType}, ${active.location}) via the bot.`);
+    await logRequestEvent({
+      requestId: active.requestId,
+      event: "cancelled",
+      phone,
+      serviceType: active.serviceType,
+      location: active.location,
+    });
+    return;
+  }
+
   // Lets a customer break out of "escalated" mode and start fresh, instead
   // of being stuck getting the same "someone will be with you" line forever
   // if an agent hasn't replied yet.
   const RESTART_TRIGGERS = ["new request", "start over", "restart", "book again", "new booking"];
 
-  if (session.stage !== "escalated" && ESCALATION_TRIGGERS.some((t) => lower.includes(t))) {
+  const isComplaintSignal = COMPLAINT_SIGNAL_WORDS.some((w) => lower.includes(w));
+
+  if (session.stage !== "escalated" && (ESCALATION_TRIGGERS.some((t) => lower.includes(t)) || isComplaintSignal)) {
     await sendMessage(
       phone,
       "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly. (If you'd like to start a new request in the meantime, just say 'new request'.)"
     );
-    await notifyAgents(`Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"`);
+    const notifyBody = isComplaintSignal
+      ? `🚨 POSSIBLE COMPLAINT/DISPUTE — please prioritize 🚨\nCustomer ${phone} flagged automatically — message may indicate a complaint.\nTheir message: "${text}"`
+      : `Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"`;
+    await notifyAgents(notifyBody);
     updateSession(phone, { stage: "escalated" });
     return;
   }
@@ -287,12 +538,12 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     return;
   }
 
-  // If this customer has a request sitting in "awaiting_customer_info" or
-  // "quoted" — i.e. our team is specifically waiting to hear back from
-  // THEM about a price quote — treat their next message as that reply,
-  // rather than the start of a new conversation. Only applies once
-  // they're back at "greeting" (nothing else in progress), so it can't
-  // hijack a brand-new booking they're partway through building.
+  // If this customer has a request sitting in "awaiting_customer_info",
+  // "quoted", or "completed" (awaiting their review) — i.e. our team is
+  // specifically waiting to hear back from THEM — treat their next message
+  // as that reply, rather than the start of a new conversation. Only
+  // applies once they're back at "greeting" (nothing else in progress), so
+  // it can't hijack a brand-new booking they're partway through building.
   if (session.stage === "greeting") {
     const pending = getPendingCustomerAction(phone);
     if (pending) {
@@ -313,12 +564,35 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
           await notifyAgents(
             `Customer accepted the quote for ${pending.requestId} (${pending.quoteAmount}). Please proceed with arranging the provider and payment.`
           );
+          await logRequestEvent({
+            requestId: pending.requestId,
+            event: "confirmed",
+            phone,
+            serviceType: pending.serviceType,
+            location: pending.location,
+            detail: pending.quoteAmount,
+          });
           return;
         }
         // Not a clear accept — forward it rather than guessing whether
         // that's a decline or just a follow-up question.
         await notifyAgents(`Customer replied about the quote for ${pending.requestId} (${pending.quoteAmount}): "${text}"`);
         await sendMessage(phone, "Got it — I've passed your message along to the agent handling this.");
+        return;
+      }
+
+      if (pending.status === "completed") {
+        updateQuoteRequest(pending.requestId, { status: "reviewed" });
+        await sendMessage(phone, "Thank you for the feedback — really appreciate it! Let us know anytime you need something else.");
+        await notifyAgents(`Customer's review for ${pending.requestId} (${pending.serviceType}): "${text}"`);
+        await logRequestEvent({
+          requestId: pending.requestId,
+          event: "reviewed",
+          phone,
+          serviceType: pending.serviceType,
+          location: pending.location,
+          detail: text,
+        });
         return;
       }
     }
@@ -333,6 +607,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     "awaiting_location",
     "awaiting_date",
     "awaiting_date_confirmation",
+    "awaiting_extra_details",
     "awaiting_description",
     "awaiting_special_instructions",
     "awaiting_confirmation",
@@ -448,13 +723,37 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_service_type") {
-    const prompt = "Which area or location is this for?";
-    await sendMessage(phone, `Got it. ${prompt}`);
-    updateSession(phone, { stage: "awaiting_location", data: { serviceType: text, lastPrompt: prompt } });
+    // Returning customers get offered their last location instead of being
+    // asked cold every time — booking history already persists, so use it.
+    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+    const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
+    const prompt = lastLocation
+      ? `Got it. Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or just tell me the new location.`
+      : "Got it. Which area or location is this for?";
+    await sendMessage(phone, prompt);
+    updateSession(phone, {
+      stage: "awaiting_location",
+      data: { serviceType: text, lastPrompt: prompt, suggestedLastLocation: lastLocation },
+    });
     return;
   }
 
   if (session.stage === "awaiting_location") {
+    // Only treat this as "reuse my last location" on a clearly closed-ended
+    // reply — not on isAffirmative()'s broad substring match, since a real
+    // location name could easily contain "ok"/"sure"/etc as a substring
+    // (e.g. "Okaishie").
+    const suggestedLastLocation = session.data.suggestedLastLocation as string | undefined;
+    const trimmedLower = lower.trim();
+    const wantsSameLocation =
+      Boolean(suggestedLastLocation) &&
+      (["same", "same place", "same location", "same as before", "same as last time"].some(
+        (w) => trimmedLower === w || trimmedLower.startsWith(w)
+      ) ||
+        ["yes", "yeah", "yep"].includes(trimmedLower) ||
+        AFFIRMATIVE_EMOJI.some((e) => text.includes(e)));
+    const location = wantsSameLocation ? (suggestedLastLocation as string) : text;
+
     const mode = session.data.mode as BookingMode;
     if (mode === "standard") {
       // They may have already told us the date back when we asked
@@ -467,7 +766,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         updateSession(phone, {
           stage: "awaiting_date_confirmation",
           data: {
-            location: text,
+            location,
             pendingDateHuman: suggestedDateHuman,
             pendingDateIso: session.data.suggestedDateIso,
             lastPrompt: confirmPrompt,
@@ -478,12 +777,12 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
 
       const prompt = "And what date would you like this done?";
       await sendMessage(phone, prompt);
-      updateSession(phone, { stage: "awaiting_date", data: { location: text, lastPrompt: prompt } });
-    } else {
-      const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
-      await sendMessage(phone, prompt);
-      updateSession(phone, { stage: "awaiting_description", data: { location: text, lastPrompt: prompt } });
+      updateSession(phone, { stage: "awaiting_date", data: { location, lastPrompt: prompt } });
+      return;
     }
+
+    updateSession(phone, { data: { location } });
+    await beginJobDetails(phone);
     return;
   }
 
@@ -521,9 +820,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "awaiting_date_confirmation") {
     if (isAffirmative(text)) {
       const confirmedDate = (session.data.pendingDateHuman as string | undefined) ?? text;
-      const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
-      await sendMessage(phone, prompt);
-      updateSession(phone, { stage: "awaiting_description", data: { dateWanted: confirmedDate, lastPrompt: prompt } });
+      updateSession(phone, { data: { dateWanted: confirmedDate } });
+      await beginJobDetails(phone);
       return;
     }
 
@@ -555,6 +853,54 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     return;
   }
 
+  if (session.stage === "awaiting_extra_details") {
+    const askedQuestion = (session.data.lastPrompt as string) ?? "";
+    const askedKey = (session.data.currentExtraKey as ExtraQuestionKey | undefined) ?? "followup";
+    const existingAnswers =
+      (session.data.extraAnswers as { key: ExtraQuestionKey; question: string; answer: string }[] | undefined) ?? [];
+    const updatedAnswers = [...existingAnswers, { key: askedKey, question: askedQuestion, answer: text }];
+
+    const queue = (session.data.extraQueue as ExtraQuestion[] | undefined) ?? [];
+
+    if (queue.length > 0) {
+      const [next, ...rest] = queue;
+      await sendMessage(phone, next.question);
+      updateSession(phone, {
+        data: { extraAnswers: updatedAnswers, extraQueue: rest, currentExtraKey: next.key, lastPrompt: next.question },
+      });
+      return;
+    }
+
+    const recurring = updatedAnswers.find((a) => a.key === "recurring")?.answer;
+    const rawBudget = updatedAnswers.find((a) => a.key === "budget")?.answer;
+    const BUDGET_SKIP_WORDS = ["no", "not sure", "none", "n/a", "dont know", "don't know", "idk"];
+    const budget =
+      rawBudget && !BUDGET_SKIP_WORDS.some((w) => rawBudget.toLowerCase().includes(w)) ? rawBudget : undefined;
+    const followupPairs = updatedAnswers.filter((a) => a.key === "followup");
+
+    if (followupPairs.length > 0) {
+      // Specifics already collected via follow-up questions — skip the
+      // generic "describe the job" prompt and build the description from
+      // what we already have.
+      const description = followupPairs.map((a) => `${a.question} ${a.answer}`).join(" | ");
+      const prompt =
+        "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
+      await sendMessage(phone, prompt);
+      updateSession(phone, {
+        stage: "awaiting_special_instructions",
+        data: { description, recurring, budget, lastPrompt: prompt },
+      });
+      return;
+    }
+
+    // No follow-up questions for this category (e.g. we only asked
+    // recurring and/or budget) — still need the actual job description.
+    const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
+    await sendMessage(phone, prompt);
+    updateSession(phone, { stage: "awaiting_description", data: { recurring, budget, lastPrompt: prompt } });
+    return;
+  }
+
   if (session.stage === "awaiting_description") {
     const prompt =
       "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
@@ -573,12 +919,16 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const location = session.data.location as string;
     const dateWanted = session.data.dateWanted as string | undefined;
     const description = session.data.description as string;
+    const recurring = session.data.recurring as string | undefined;
+    const budget = session.data.budget as string | undefined;
 
     const summaryLines = [
       `Service: ${serviceType}`,
       `Location: ${location}`,
       ...(mode === "standard" ? [`Date: ${dateWanted}`] : []),
       `Details: ${description}`,
+      ...(recurring ? [`Frequency: ${recurring}`] : []),
+      ...(budget ? [`Budget: ${budget}`] : []),
       ...(specialInstructions ? [`Special instructions: ${specialInstructions}`] : []),
     ];
     const confirmPrompt = `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
@@ -603,6 +953,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const mode = session.data.mode as BookingMode;
     const attachments = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
     const specialInstructions = session.data.specialInstructions as string | undefined;
+    const recurring = session.data.recurring as string | undefined;
+    const budget = session.data.budget as string | undefined;
     const result = await submitBookingRequest({
       userId: user.id,
       mode,
@@ -611,6 +963,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       dateWanted: session.data.dateWanted as string | undefined,
       description: session.data.description as string,
       specialInstructions,
+      recurring,
+      budget,
       channel: "whatsapp",
       attachmentCount: attachments.length,
     });
@@ -633,10 +987,16 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         `Location: ${session.data.location}\n` +
         (mode === "standard" ? `Date: ${session.data.dateWanted}\n` : "") +
         `Details: ${session.data.description}` +
+        (recurring ? `\nFrequency: ${recurring}` : "") +
+        (budget ? `\nBudget: ${budget}` : "") +
         (specialInstructions ? `\nSpecial instructions: ${specialInstructions}` : "") +
         (attachments.length ? `\nAttachments: ${attachments.length} (forwarded below)` : "") +
-        `\n\nIf this needs a quote from the artisan, reply here with:\n` +
-        `${result.requestId}: quote <amount>\nor\n${result.requestId}: needs <question for the customer>`
+        `\n\nCommands for this request:\n` +
+        `${result.requestId}: claim\n` +
+        `${result.requestId}: quote <amount>\n` +
+        `${result.requestId}: needs <question for the customer>\n` +
+        `${result.requestId}: matched <provider name>\n` +
+        `${result.requestId}: done`
     );
 
     // Forward each attached photo/video/document straight to the agents so
@@ -655,6 +1015,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       dateWanted: session.data.dateWanted as string | undefined,
       description: session.data.description as string,
       specialInstructions,
+      recurring,
+      budget,
       submittedAt: Date.now(),
     };
     addPastBooking(phone, booking);
@@ -663,6 +1025,15 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       phone,
       serviceType: session.data.serviceType as string,
       location: session.data.location as string,
+      mode,
+    });
+    await logRequestEvent({
+      requestId: result.requestId,
+      event: "submitted",
+      phone,
+      serviceType: session.data.serviceType as string,
+      location: session.data.location as string,
+      detail: mode,
     });
 
     // Reset the in-progress booking fields (attachments, service type,
@@ -676,7 +1047,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   resetForNewRequest(phone);
 }
 
-// --- 3b. Inactivity check-ins ---
+// --- 4b. Inactivity check-ins ---
 // If a customer goes quiet partway through a booking, nudge them once
 // after CHECK_IN_AFTER_MS of silence, then send one final "I'm here
 // whenever you need me" after FINAL_NUDGE_AFTER_MS more — and then stop,
@@ -696,6 +1067,7 @@ const ACTIVE_STAGES: ConversationStage[] = [
   "awaiting_location",
   "awaiting_date",
   "awaiting_date_confirmation",
+  "awaiting_extra_details",
   "awaiting_description",
   "awaiting_special_instructions",
   "awaiting_confirmation",
@@ -731,7 +1103,40 @@ function startInactivitySweep() {
   }, SWEEP_INTERVAL_MS);
 }
 
-// --- 4. Outbound sender ---
+// --- 4c. Unclaimed-request nudge ---
+// If a submitted request sits unclaimed by any agent past a threshold —
+// 15 minutes for an instant request, an hour for a scheduled one — ping
+// the agent group again (and a backup contact, if one's configured) so
+// nothing quietly falls through the cracks. Fires once per request.
+const INSTANT_UNCLAIMED_THRESHOLD_MS = 15 * 60 * 1000;
+const STANDARD_UNCLAIMED_THRESHOLD_MS = 60 * 60 * 1000;
+
+function startUnclaimedRequestSweep() {
+  setInterval(() => {
+    const now = Date.now();
+    for (const request of getAllQuoteRequests()) {
+      if (request.claimedBy) continue;
+      if (!OPEN_STATUSES.includes(request.status)) continue;
+      if (request.unclaimedNudgeSent) continue;
+
+      const threshold = request.mode === "instant" ? INSTANT_UNCLAIMED_THRESHOLD_MS : STANDARD_UNCLAIMED_THRESHOLD_MS;
+      if (now - request.createdAt < threshold) continue;
+
+      const minutes = Math.round(threshold / 60000);
+      const message =
+        `⚠️ Unclaimed: ${request.requestId} (${request.serviceType}, ${request.location}, ${request.mode}) has been sitting for over ${minutes} minutes with no one claiming it. Please pick it up or check with the team.\n` +
+        `Reply "${request.requestId}: claim" to take it.`;
+
+      notifyAgents(message);
+      if (BACKUP_AGENT_NUMBER) {
+        sendMessage(BACKUP_AGENT_NUMBER, message);
+      }
+      updateQuoteRequest(request.requestId, { unclaimedNudgeSent: true });
+    }
+  }, SWEEP_INTERVAL_MS);
+}
+
+// --- 5. Outbound sender ---
 // If real WhatsApp credentials aren't set yet (local testing before Meta
 // access is sorted out), just log what would have been sent instead of
 // calling the real API and failing. Lets you test the full conversation
@@ -801,4 +1206,5 @@ async function sendMedia(to: string, media: MediaAttachment) {
 app.listen(PORT, () => {
   console.log(`WhatsApp service listening on port ${PORT}`);
   startInactivitySweep();
+  startUnclaimedRequestSweep();
 });

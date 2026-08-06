@@ -31,6 +31,8 @@ export interface BookingRequestInput {
   dateWanted?: string; // only present for standard (scheduled) bookings
   description: string;
   specialInstructions?: string; // anything the customer wants the artisan to note
+  recurring?: string; // "one-time" or "regular", only asked for some trades
+  budget?: string; // rough budget the customer gave, for quote-type jobs
   channel: "whatsapp";
   attachmentCount?: number; // photos/videos/documents the customer attached
 }
