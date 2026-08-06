@@ -29,7 +29,8 @@ import {
   recordAgentInbound,
   isAgentWindowOpen,
   queuePendingAgentMessage,
-  drainPendingAgentMessages,
+  queuePendingAgentMedia,
+  drainPendingAgentItems,
 } from "./agentMessaging";
 
 const app = express();
@@ -173,9 +174,13 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   // first, then flush anything that was queued while it was closed, so the
   // full-detail notifications they missed actually arrive now.
   recordAgentInbound(agentPhone);
-  const queued = drainPendingAgentMessages(agentPhone);
-  for (const message of queued) {
-    await sendMessage(agentPhone, message);
+  const queued = drainPendingAgentItems(agentPhone);
+  for (const item of queued) {
+    if (item.type === "text") {
+      await sendMessage(agentPhone, item.message);
+    } else {
+      await sendMedia(agentPhone, item.attachment);
+    }
   }
 
   const match = text.trim().match(AGENT_COMMAND_RE);
@@ -1232,18 +1237,18 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     );
 
     // Forward each attached photo/video/document straight to the agents so
-    // they can see exactly what the customer sent, no separate storage needed.
-    // NOTE: unlike the text notification above, this is still a plain
-    // free-form media message — it isn't covered by the 24h-window
-    // workaround (WhatsApp media template messages need their own setup)
-    // and will silently fail to an agent outside their window. Low
-    // priority today since the accompanying text notification above will
-    // still reach them and prompt a reply, which reopens the window for
-    // everything that follows — but worth a proper fix if attachments
-    // start getting missed.
+    // they can see exactly what the customer sent, no separate storage
+    // needed. Same 24h-window handling as the text notification above: if
+    // an agent's window is open, send it now; if not, queue it and it'll
+    // go out the moment they reply (the text notification just above
+    // already prompted that reply via template if needed).
     for (const attachment of attachments) {
       for (const number of AGENT_NOTIFY_NUMBERS) {
-        await sendMedia(number, attachment);
+        if (isAgentWindowOpen(number)) {
+          await sendMedia(number, attachment);
+        } else {
+          queuePendingAgentMedia(number, attachment);
+        }
       }
     }
 
