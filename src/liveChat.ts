@@ -67,3 +67,26 @@ export function markLiveChatNudgeSent(phone: string): void {
   if (!chat) return;
   liveChats.set(phone, { ...chat, unclaimedNudgeSent: true });
 }
+
+// --- Per-agent "active conversation" pointer ---
+// An agent still needs the customer's number the first time (to claim a
+// specific conversation), but after that, plain messages with no
+// phone-number prefix are understood to mean "keep talking to whoever I
+// just claimed/messaged" — this is what that pointer tracks. Claiming a
+// conversation, or explicitly messaging one by number, both set it;
+// ending a conversation clears it. An agent juggling more than one
+// claimed conversation can always switch which one is "active" by using
+// the explicit "<phone>: <message>" form.
+const activeChatByAgent = new Map<string, string>();
+
+export function setActiveChatForAgent(agentPhone: string, customerPhone: string): void {
+  activeChatByAgent.set(agentPhone, customerPhone);
+}
+
+export function getActiveChatForAgent(agentPhone: string): string | undefined {
+  return activeChatByAgent.get(agentPhone);
+}
+
+export function clearActiveChatForAgent(agentPhone: string): void {
+  activeChatByAgent.delete(agentPhone);
+}

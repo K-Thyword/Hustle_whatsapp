@@ -40,6 +40,9 @@ import {
   endLiveChat,
   getAllLiveChats,
   markLiveChatNudgeSent,
+  setActiveChatForAgent,
+  getActiveChatForAgent,
+  clearActiveChatForAgent,
 } from "./liveChat";
 
 const app = express();
@@ -226,6 +229,31 @@ const AGENT_COMMAND_RE =
 //   233241234567: end                   (close it out, hand back to the bot)
 const LIVE_CHAT_COMMAND_RE = /^(\d{7,15})\s*:\s*([\s\S]*)$/;
 
+const LIVE_CHAT_END_WORDS = ["end", "close", "resolved", "done"];
+
+// Shared by both the explicit "<phone>: end" form and the bare "end" form
+// (used once a conversation is an agent's active one — see
+// getActiveChatForAgent). Returns false (and tells the agent why) if they
+// don't have permission to end it.
+async function endLiveChatAsAgent(agentPhone: string, phone: string, chat: { claimedBy?: string }): Promise<boolean> {
+  if (chat.claimedBy && chat.claimedBy !== agentPhone) {
+    await sendMessage(
+      agentPhone,
+      `This conversation is claimed by ${getAgentName(chat.claimedBy)}, not you — ask them to close it out, or "${phone}: claim" it yourself if they've stepped away.`
+    );
+    return false;
+  }
+  endLiveChat(phone);
+  clearActiveChatForAgent(agentPhone);
+  updateSession(phone, { stage: "greeting" });
+  await sendMessage(agentPhone, `Marked the conversation with ${phone} as ended.`);
+  await sendMessage(
+    phone,
+    `Your conversation with *${getAgentName(agentPhone)}* has ended — I'm the Hustleapp assistant again if you need anything else, just let me know!`
+  );
+  return true;
+}
+
 async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
   const chat = getLiveChat(phone);
   if (!chat) {
@@ -241,13 +269,15 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
       return;
     }
     if (chat.claimedBy === agentPhone) {
-      await sendMessage(agentPhone, `You've already claimed the conversation with ${phone}.`);
+      setActiveChatForAgent(agentPhone, phone);
+      await sendMessage(agentPhone, `You've already claimed the conversation with ${phone} — it's your active chat, just type your reply.`);
       return;
     }
     claimLiveChat(phone, agentPhone);
+    setActiveChatForAgent(agentPhone, phone);
     await sendMessage(
       agentPhone,
-      `You've claimed the conversation with ${phone}. Reply "${phone}: <message>" to chat with them directly, or "${phone}: end" when you're done.`
+      `You've claimed the conversation with ${phone} — it's now your active chat. Just type your reply and it'll go straight to them (no need to include their number again). Say "end" when you're done, or message another number to switch.`
     );
     for (const number of AGENT_NOTIFY_NUMBERS) {
       if (number === agentPhone) continue;
@@ -267,6 +297,7 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
       return;
     }
     unclaimLiveChat(phone);
+    if (getActiveChatForAgent(agentPhone) === phone) clearActiveChatForAgent(agentPhone);
     await sendMessage(agentPhone, `Released the conversation with ${phone} back to the team.`);
     await notifyAgents(
       `The conversation with ${phone} is back in the pool — ${getAgentName(agentPhone)} released it. Reply "${phone}: claim" to pick it up.`,
@@ -275,21 +306,8 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
     return;
   }
 
-  if (action === "end" || action === "close" || action === "resolved" || action === "done") {
-    if (chat.claimedBy && chat.claimedBy !== agentPhone) {
-      await sendMessage(
-        agentPhone,
-        `This conversation is claimed by ${getAgentName(chat.claimedBy)}, not you — ask them to close it out, or "${phone}: claim" it yourself if they've stepped away.`
-      );
-      return;
-    }
-    endLiveChat(phone);
-    updateSession(phone, { stage: "greeting" });
-    await sendMessage(agentPhone, `Marked the conversation with ${phone} as ended.`);
-    await sendMessage(
-      phone,
-      `Your conversation with *${getAgentName(agentPhone)}* has ended — I'm the Hustleapp assistant again if you need anything else, just let me know!`
-    );
+  if (LIVE_CHAT_END_WORDS.includes(action)) {
+    await endLiveChatAsAgent(agentPhone, phone, chat);
     return;
   }
 
@@ -317,6 +335,10 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
     return;
   }
 
+  // Explicitly naming a number also makes it the agent's active chat, so
+  // an agent juggling more than one claimed conversation can switch which
+  // one their plain (unprefixed) messages go to just by prefixing once.
+  setActiveChatForAgent(agentPhone, phone);
   await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
 }
 
@@ -346,13 +368,39 @@ async function handleAgentMessage(agentPhone: string, text: string) {
       return;
     }
 
+    // No phone number, no reference — but if this agent already has an
+    // active claimed conversation, treat the whole message as a reply to
+    // that customer, so they don't have to re-type the number on every
+    // single message. This is the "session" the claim opened; it stays
+    // active until "end" (from either side) or a real reference switches it.
+    const activeCustomer = getActiveChatForAgent(agentPhone);
+    if (activeCustomer) {
+      const activeChat = getLiveChat(activeCustomer);
+      if (!activeChat || activeChat.claimedBy !== agentPhone) {
+        // Stale pointer — the conversation ended some other way (customer
+        // restarted, another agent took over, etc). Clear it and fall
+        // through to the normal unrecognized-message handling below.
+        clearActiveChatForAgent(agentPhone);
+      } else {
+        const bareAction = text.trim().toLowerCase();
+        if (LIVE_CHAT_END_WORDS.includes(bareAction)) {
+          await endLiveChatAsAgent(agentPhone, activeCustomer, activeChat);
+          return;
+        }
+        if (text.trim()) {
+          await sendMessage(activeCustomer, `*${getAgentName(agentPhone)}*: ${text.trim()}`);
+        }
+        return;
+      }
+    }
+
     // Only nudge with the format reminder if it looks like they were
     // trying to reference something — otherwise stay quiet on casual
     // chatter like "ok" or "thanks" between agents.
     if (text.includes(":")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim\n<customer phone>: <your message>\n<customer phone>: end"
+        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: end"
       );
     }
     return;
@@ -786,6 +834,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
         await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
         endLiveChat(phone);
+        clearActiveChatForAgent(activeChat.claimedBy);
         const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
         await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
         resetForNewRequest(phone);
@@ -872,6 +921,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       const activeChat = getLiveChat(phone);
       if (activeChat?.claimedBy) {
         await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
+        clearActiveChatForAgent(activeChat.claimedBy);
       }
       endLiveChat(phone);
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
