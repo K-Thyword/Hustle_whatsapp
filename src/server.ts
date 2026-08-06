@@ -24,6 +24,7 @@ import {
   getLatestActiveRequestForPhone,
   getAllQuoteRequests,
   OPEN_STATUSES,
+  QuoteRequest,
 } from "./quotes";
 import {
   recordAgentInbound,
@@ -360,6 +361,76 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
   await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
 }
 
+// --- "my requests": an agent checking what they're currently handling ---
+// No reference number needed — just a plain phrase, since it's asking
+// about the agent's own claims across both booking requests and live
+// chats, not acting on a specific one.
+const MY_REQUESTS_TRIGGERS = ["my requests", "myrequests", "my jobs", "my claims", "my status"];
+
+async function handleMyRequestsQuery(agentPhone: string): Promise<void> {
+  const myRequests = getAllQuoteRequests().filter(
+    (r) => r.claimedBy === agentPhone && OPEN_STATUSES.includes(r.status)
+  );
+  const myChats = getAllLiveChats().filter((c) => c.claimedBy === agentPhone);
+
+  if (myRequests.length === 0 && myChats.length === 0) {
+    await sendMessage(agentPhone, "You don't have any claimed requests or conversations right now.");
+    return;
+  }
+
+  const lines: string[] = [];
+  if (myRequests.length > 0) {
+    lines.push("*Your claimed requests:*");
+    for (const r of myRequests) {
+      lines.push(`${r.requestId} — ${r.serviceType}, ${r.location} (${r.status})`);
+    }
+  }
+  if (myChats.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push("*Your active conversations:*");
+    for (const c of myChats) {
+      lines.push(c.phone);
+    }
+  }
+  await sendMessage(agentPhone, lines.join("\n"));
+}
+
+async function notifyOtherAgentsOfClaim(requestId: string, agentPhone: string): Promise<void> {
+  for (const number of AGENT_NOTIFY_NUMBERS) {
+    if (number === agentPhone) continue;
+    await notifyAgentSmart(
+      number,
+      `${requestId} has been claimed by ${getAgentName(agentPhone)} — no action needed unless they ask for help.`,
+      "a claim update"
+    );
+  }
+}
+
+// Enforces the same "one agent at a time" exclusivity that the live-chat
+// claim already has, but for booking-request actions (quote/needs/matched/
+// done). Returns true if the caller may proceed — either they already own
+// the request, or it was unclaimed and just got auto-claimed for them.
+// Returns false (after telling the agent why) if someone else has it.
+async function ensureRequestOwnership(
+  agentPhone: string,
+  requestId: string,
+  request: QuoteRequest
+): Promise<boolean> {
+  if (request.claimedBy && request.claimedBy !== agentPhone) {
+    await sendMessage(
+      agentPhone,
+      `${requestId} is claimed by ${getAgentName(request.claimedBy)} — ask them to hand it off, or "${requestId}: claim" it yourself if they've stepped away.`
+    );
+    return false;
+  }
+  if (!request.claimedBy) {
+    updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
+    await sendMessage(agentPhone, `(Auto-claimed ${requestId} for you since no one else had.)`);
+    await notifyOtherAgentsOfClaim(requestId, agentPhone);
+  }
+  return true;
+}
+
 async function handleAgentMessage(agentPhone: string, text: string) {
   // Any inbound message from an agent reopens their 24h window — record it
   // first, then flush anything that was queued while it was closed, so the
@@ -372,6 +443,14 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     } else {
       await sendMedia(agentPhone, item.attachment);
     }
+  }
+
+  // A global status query, not a reference-prefixed command — checked
+  // before anything else (including the active-live-chat relay below) so
+  // it's never accidentally forwarded to a customer as a literal message.
+  if (MY_REQUESTS_TRIGGERS.includes(text.trim().toLowerCase())) {
+    await handleMyRequestsQuery(agentPhone);
+    return;
   }
 
   const match = text.trim().match(AGENT_COMMAND_RE);
@@ -418,7 +497,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     if (text.includes(":")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: end"
+        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: end\n\nTo see what you're currently handling: my requests"
       );
     }
     return;
@@ -444,7 +523,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   if (action === "claim") {
     if (request.claimedBy && request.claimedBy !== agentPhone) {
-      await sendMessage(agentPhone, `Already claimed — ${requestId} is being handled by ${request.claimedBy}.`);
+      await sendMessage(agentPhone, `Already claimed — ${requestId} is being handled by ${getAgentName(request.claimedBy)}.`);
       return;
     }
     if (request.claimedBy === agentPhone) {
@@ -453,14 +532,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     }
     updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
     await sendMessage(agentPhone, `You've claimed ${requestId} (${request.serviceType}, ${request.location}).`);
-    for (const number of AGENT_NOTIFY_NUMBERS) {
-      if (number === agentPhone) continue;
-      await notifyAgentSmart(
-        number,
-        `${requestId} has been claimed by ${agentPhone} — no action needed unless they ask for help.`,
-        "a claim update"
-      );
-    }
+    await notifyOtherAgentsOfClaim(requestId, agentPhone);
     await logRequestEvent({
       requestId,
       event: "claimed",
@@ -469,6 +541,18 @@ async function handleAgentMessage(agentPhone: string, text: string) {
       location: request.location,
       detail: agentPhone,
     });
+    return;
+  }
+
+  // Every action below this point changes something about a specific job —
+  // quoting it, closing it out, telling the customer who it's matched to,
+  // or asking them a question. Without an ownership check here, two agents
+  // working the same request at once could send the customer conflicting
+  // quotes or duplicate "done" messages. If nobody's claimed it yet, taking
+  // any of these actions claims it for the acting agent automatically (so
+  // agents who skip typing "claim" explicitly still get the protection);
+  // if someone else already has it, the action is blocked instead.
+  if (!(await ensureRequestOwnership(agentPhone, requestId, request))) {
     return;
   }
 
