@@ -127,24 +127,20 @@ const COMPLAINT_SIGNAL_WORDS = [
   "overcharged",
 ];
 
-// A customer asking to cancel an already-submitted request — handled
-// directly by the bot rather than requiring them to message an agent for
-// something this simple. Checked early, before escalation handling, so it
-// works even if the customer is currently in "escalated" state waiting on
-// a human.
-const CANCEL_TRIGGERS = [
-  "cancel my last request",
-  "cancel my request",
-  "cancel my booking",
-  "cancel my order",
-  "cancel the request",
-  "cancel the booking",
-  "cancel this request",
-  "cancel this booking",
-  "cancel booking",
-  "cancel order",
-  "cancel request",
-];
+// A customer asking to cancel — either an already-submitted request, or a
+// booking they're still in the middle of filling out. Handled directly by
+// the bot rather than requiring them to message an agent for something
+// this simple. Checked early, before escalation handling, so it works even
+// if the customer is currently in "escalated" state waiting on a human.
+//
+// A plain \bcancel\b match (rather than a fixed list of exact phrases like
+// "cancel my order") is deliberate — the old fixed-phrase list missed
+// completely ordinary phrasing like "cancel the order" (no exact phrase in
+// the list contained "the"), so a customer trying to cancel mid-booking
+// had their message swallowed as if it were an answer to whatever question
+// was being asked instead. A bare "cancel" is an unambiguous enough signal
+// in a booking bot that the false-positive risk here is low.
+const CANCEL_RE = /\bcancel\b/i;
 
 // People rarely answer "schedule"/"instant" literally — "asap", "right
 // away", "urgent" all clearly mean "instant" even without saying the word.
@@ -1101,9 +1097,22 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // A customer wanting to cancel an already-submitted request — handled
   // directly, without needing to message an agent. Checked early so it
   // works from any stage, including "escalated".
-  if (CANCEL_TRIGGERS.some((t) => lower.includes(t))) {
+  if (CANCEL_RE.test(text)) {
     const active = await getLatestActiveRequestForPhone(phone);
     if (!active) {
+      // No submitted request to cancel — but if they're still mid-way
+      // through filling one out (never actually sent yet), that draft is
+      // what they mean. Drop it and confirm, rather than the confusing
+      // "I don't see an open request" reply, which is technically true of
+      // submitted requests but not what a customer mid-booking is asking.
+      if (ACTIVE_STAGES.includes(session.stage)) {
+        await resetForNewRequest(phone);
+        await sendMessage(
+          phone,
+          "No problem, I've dropped that — let me know whenever you'd like to start a new request."
+        );
+        return;
+      }
       await sendMessage(
         phone,
         "I don't see an open request to cancel right now. If that doesn't sound right, just say 'agent' and I'll get someone to check."
