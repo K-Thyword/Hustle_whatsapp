@@ -16,6 +16,9 @@ import { interpretDate } from "./dateInterpreter";
 import { matchServiceCategory } from "./serviceCategories";
 import { extractBookingDetails } from "./detailExtractor";
 import { transcribeVoiceNote } from "./voiceTranscriber";
+import { setMarketingOptIn, isOptedIn, getOptedInPhones } from "./marketing";
+import { createReminder, getAllReminders, markReminderFired } from "./reminders";
+import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
 import { logRequestEvent } from "./googleSheet";
 import {
@@ -142,6 +145,11 @@ const COMPLAINT_SIGNAL_WORDS = [
 // in a booking bot that the false-positive risk here is low.
 const CANCEL_RE = /\bcancel\b/i;
 
+// Cheap pre-filter so the reminder-extraction AI call only ever fires for
+// messages that plausibly mention a reminder at all — the vast majority of
+// ordinary messages never reach it.
+const REMINDER_KEYWORD_RE = /\bremind(er|ers)?\b/i;
+
 // People rarely answer "schedule"/"instant" literally — "asap", "right
 // away", "urgent" all clearly mean "instant" even without saying the word.
 // Checked both as a direct reply to the mode question, and against the
@@ -186,6 +194,22 @@ const AGENT_NOTIFICATION_TEMPLATE_NAME = process.env.AGENT_NOTIFICATION_TEMPLATE
 // hustle_agent_notification for the exact language it was created with.
 const AGENT_NOTIFICATION_TEMPLATE_LANGUAGE = process.env.AGENT_NOTIFICATION_TEMPLATE_LANGUAGE || "en_US";
 
+// Separate template for customer-facing marketing content (campaign
+// broadcasts, the 30-day win-back check-in) — kept distinct from the
+// agent-notification template above because WhatsApp requires marketing
+// sends to use a template approved under the Marketing category
+// specifically, not Utility, regardless of whether the 24h window happens
+// to be open. See sendMarketingMessage below for the template to create.
+const MARKETING_TEMPLATE_NAME = process.env.MARKETING_TEMPLATE_NAME || "hustle_marketing_update";
+const MARKETING_TEMPLATE_LANGUAGE = process.env.MARKETING_TEMPLATE_LANGUAGE || "en_US";
+
+// Separate again from both templates above: firing a customer's own
+// reminder is a Utility send (they explicitly asked for this specific
+// message), not Marketing — so it needs its own template and does NOT
+// require marketing opt-in, unlike the two above.
+const REMINDER_TEMPLATE_NAME = process.env.REMINDER_TEMPLATE_NAME || "hustle_reminder";
+const REMINDER_TEMPLATE_LANGUAGE = process.env.REMINDER_TEMPLATE_LANGUAGE || "en_US";
+
 // Maps an agent's phone number to a display name, so a customer connected
 // to a live chat sees "you're now chatting with Ama" instead of a bare
 // phone number — that's what actually makes it read as a real person
@@ -227,6 +251,65 @@ async function notifyAgentSmart(agentPhone: string, message: string, summaryLabe
 async function notifyAgents(message: string, summaryLabel: string = "an update") {
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await notifyAgentSmart(number, message, summaryLabel);
+  }
+}
+
+// Sends one marketing message (campaign broadcast or win-back check-in) to
+// an opted-in customer. Always goes via the Marketing-category template —
+// unlike notifyAgentSmart's free-form-if-window-is-open shortcut, proactive
+// marketing content isn't a reply to anything the customer just said, so it
+// should never ride the service window; the template is the correct
+// channel every time.
+//
+// One-time setup required in Meta Business Manager before this works:
+//   Name:      hustle_marketing_update  (or set MARKETING_TEMPLATE_NAME to match)
+//   Category:  Marketing
+//   Language:  must match MARKETING_TEMPLATE_LANGUAGE above (default "en_US")
+//   Body:      "Hustleapp: {{1}}\n\nReply STOP to opt out of these updates."
+// Only ever sent to phones that have explicitly opted in (see marketing.ts)
+// — never to the general customer list.
+async function sendMarketingMessage(phone: string, bodyParam: string) {
+  await sendTemplateMessage(phone, MARKETING_TEMPLATE_NAME, MARKETING_TEMPLATE_LANGUAGE, bodyParam);
+}
+
+// "broadcast: <message>" — any of the 3 agents can send a one-off campaign
+// message to every opted-in customer. Checked as a global command (like "my
+// requests"), not tied to any specific booking or live chat.
+const BROADCAST_COMMAND_RE = /^broadcast:\s*([\s\S]+)$/i;
+
+async function handleBroadcastCommand(agentPhone: string, message: string) {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    await sendMessage(agentPhone, "Usage: broadcast: <message to send opted-in customers>");
+    return;
+  }
+
+  const phones = await getOptedInPhones();
+  if (phones.length === 0) {
+    await sendMessage(agentPhone, "No customers are opted in to marketing messages yet — nothing to send.");
+    return;
+  }
+
+  let sent = 0;
+  for (const phone of phones) {
+    try {
+      await sendMarketingMessage(phone, trimmed);
+      sent++;
+    } catch (err) {
+      console.error(`Broadcast send failed for ${phone}:`, err);
+    }
+  }
+
+  await sendMessage(agentPhone, `Broadcast sent to ${sent}/${phones.length} opted-in customer${phones.length === 1 ? "" : "s"}.`);
+
+  // Let the other agents know a campaign went out, for visibility.
+  for (const number of AGENT_NOTIFY_NUMBERS) {
+    if (number === agentPhone) continue;
+    await notifyAgentSmart(
+      number,
+      `${getAgentName(agentPhone)} sent a broadcast to ${sent} opted-in customers:\n"${trimmed}"`,
+      "a broadcast that went out"
+    );
   }
 }
 
@@ -541,6 +624,12 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     return;
   }
 
+  const broadcastMatch = text.trim().match(BROADCAST_COMMAND_RE);
+  if (broadcastMatch) {
+    await handleBroadcastCommand(agentPhone, broadcastMatch[1]);
+    return;
+  }
+
   const match = text.trim().match(AGENT_COMMAND_RE);
 
   if (!match) {
@@ -591,7 +680,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     if (text.includes(":")) {
       await sendMessage(
         agentPhone,
-        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: transfer <agent name> — hand it off with the recent history\n<customer phone>: end\n\nTo see what you're currently handling: my requests"
+        "Didn't catch that as a command. For a booking request:\n<reference>: quote <amount>\n<reference>: needs <question for the customer>\n<reference>: matched <provider name>\n<reference>: claim\n<reference>: done\n\nFor a live chat with a customer:\n<customer phone>: claim — then just type replies directly, no need to repeat their number\n<customer phone>: transfer <agent name> — hand it off with the recent history\n<customer phone>: end\n\nTo see what you're currently handling: my requests\n\nTo message every opted-in customer: broadcast: <message>"
       );
     }
     return;
@@ -842,6 +931,18 @@ app.post("/webhook", async (req: Request, res: Response) => {
     media = { id: message.audio.id, type: "audio" };
     text = transcript;
     await sendMessage(from, `🎙️ _I heard:_ "${transcript}"`);
+  } else if (message.type === "location" && message.location) {
+    // A dropped pin has no media ID to forward by reference the way
+    // image/video/audio do (WhatsApp location messages just carry raw
+    // coordinates) — so instead of adding a whole parallel attachment
+    // type, this converts it into a text line with a Maps link and lets
+    // it flow through every existing text path unchanged: it can be
+    // picked up as a booking's location, or relayed as a normal message
+    // during a live chat, in either direction (customer<->agent).
+    const { latitude, longitude, name, address } = message.location;
+    const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+    const label = [name, address].filter(Boolean).join(", ");
+    text = label ? `📍 ${label} (${mapsLink})` : `📍 Location shared: ${mapsLink}`;
   }
 
   console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
@@ -1009,6 +1110,102 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   const lower = text.toLowerCase();
   const now = Date.now();
 
+  // STOP / unsubscribe — exact match, works from any stage, always takes
+  // priority. This only affects marketing sends (campaigns, the win-back
+  // check-in); the customer can still book normally afterward.
+  const trimmedLower = text.trim().toLowerCase();
+  if (trimmedLower === "stop" || trimmedLower === "unsubscribe") {
+    await setMarketingOptIn(phone, false);
+    await sendMessage(
+      phone,
+      "You're unsubscribed from Hustleapp promos and check-ins. You can still book anytime — just message us here."
+    );
+    return;
+  }
+
+  // Soft flag: were we waiting on a reply to the marketing opt-in ask?
+  // Doesn't gate anything either way — just records a yes if there is one,
+  // then falls through to normal handling so the customer's message (which
+  // may be the start of a brand new request) still gets a real response.
+  if (session.data.awaitingMarketingOptIn) {
+    if (isAffirmative(text) && !isNegative(text)) {
+      await setMarketingOptIn(phone, true);
+      await sendMessage(
+        phone,
+        "Great, you're opted in — we'll send the occasional update or offer. Reply STOP anytime to opt out."
+      );
+    }
+    await updateSession(phone, { data: { awaitingMarketingOptIn: false } });
+    session = await getSession(phone);
+  }
+
+  // Soft flag: were we waiting on a reply to the reminder-fired offer
+  // ("want help booking this now?")? An affirmative reply kicks off a real
+  // booking (pre-filled from the reminder text where the service is
+  // recognizable) — a genuine action, so this one returns rather than
+  // falling through. Anything else just clears the flag and continues
+  // normally, same as the marketing flag above.
+  if (session.data.awaitingReminderOffer) {
+    const reminderText = session.data.awaitingReminderOffer as string;
+    if (isAffirmative(text) && !isNegative(text)) {
+      await resetForNewRequest(phone);
+      const resolved = await resolveServiceType(reminderText);
+      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      await sendMessage(phone, `Great — let's get that sorted. ${prompt}`);
+      await updateSession(phone, {
+        stage: "awaiting_mode",
+        data: {
+          lastPrompt: prompt,
+          ...(resolved.supported ? { serviceType: resolved.serviceType ?? reminderText } : {}),
+        },
+      });
+      return;
+    }
+    await updateSession(phone, { data: { awaitingReminderOffer: undefined } });
+    session = await getSession(phone);
+  }
+
+  // Continuing a reminder we don't have a usable date for yet — checked
+  // early since almost anything the customer types next is meant as the
+  // answer to "when should I remind you?", not a new command. "cancel" is
+  // special-cased to drop the in-progress reminder rather than being
+  // misread as a date.
+  if (session.data.pendingReminderText) {
+    const reminderText = session.data.pendingReminderText as string;
+
+    if (CANCEL_RE.test(text)) {
+      await updateSession(phone, { data: { pendingReminderText: undefined } });
+      await sendMessage(phone, "No problem, I've dropped that reminder.");
+      return;
+    }
+
+    const interpretation = await interpretDate(text, new Date(now));
+    if (interpretation.status === "valid" && interpretation.isoDate) {
+      const dueAt = Date.parse(`${interpretation.isoDate}T09:00:00Z`);
+      await createReminder(phone, reminderText, dueAt);
+      await updateSession(phone, { data: { pendingReminderText: undefined } });
+      await sendMessage(
+        phone,
+        `Got it — I'll remind you to ${reminderText} on ${interpretation.humanReadable ?? interpretation.isoDate}.`
+      );
+      return;
+    }
+
+    if (interpretation.status === "past") {
+      await sendMessage(
+        phone,
+        `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
+      );
+      return;
+    }
+
+    await sendMessage(
+      phone,
+      `Sorry, I didn't catch a date there — when should I remind you to ${reminderText}? (e.g. "next Monday", "15 August")`
+    );
+    return;
+  }
+
   const previousLastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
   const isBareGreetingMsg = BARE_GREETING_RE.test(text.trim());
 
@@ -1136,6 +1333,44 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       location: active.location,
     });
     return;
+  }
+
+  // A customer asking to be reminded about something later. Cheap keyword
+  // check first so this never costs an AI call on ordinary messages; the
+  // extractor itself then confirms it's really a reminder request (and not,
+  // say, "did you get my reminder") before anything is stored.
+  if (REMINDER_KEYWORD_RE.test(text)) {
+    const extracted = await extractReminderRequest(text);
+    if (extracted.isReminderRequest && extracted.text) {
+      const whenText = extracted.whenText;
+      const interpretation = whenText ? await interpretDate(whenText, new Date(now)) : undefined;
+
+      if (interpretation?.status === "valid" && interpretation.isoDate) {
+        const dueAt = Date.parse(`${interpretation.isoDate}T09:00:00Z`);
+        await createReminder(phone, extracted.text, dueAt);
+        await sendMessage(
+          phone,
+          `Got it — I'll remind you to ${extracted.text} on ${interpretation.humanReadable ?? interpretation.isoDate}.`
+        );
+        return;
+      }
+
+      if (interpretation?.status === "past") {
+        await sendMessage(
+          phone,
+          `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
+        );
+        await updateSession(phone, { data: { pendingReminderText: extracted.text } });
+        return;
+      }
+
+      // No usable date yet (none given, or couldn't confidently interpret
+      // it) — ask for one, and remember what to remind them about so their
+      // very next reply is read as the answer rather than a new message.
+      await sendMessage(phone, `Sure — when should I remind you to ${extracted.text}?`);
+      await updateSession(phone, { data: { pendingReminderText: extracted.text } });
+      return;
+    }
   }
 
   const isComplaintSignal = COMPLAINT_SIGNAL_WORDS.some((w) => lower.includes(w));
@@ -1788,7 +2023,23 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // Reset the in-progress booking fields (attachments, service type,
     // etc.) so they don't leak into the next booking — but this keeps
     // booking history and recent messages, unlike a full clearSession.
+    const shouldAskOptIn = !session.data.marketingOptInAsked && !(await isOptedIn(phone));
     await resetForNewRequest(phone);
+
+    // Ask once, ever, per customer — right after their first successful
+    // booking, since that's when they've just seen real value from the
+    // service. Set the flags AFTER the reset above (not before) so they
+    // survive it — resetForNewRequest only keeps data.marketingOptInAsked
+    // (in PERSISTENT_DATA_KEYS) if it's actually present at the time it
+    // runs, and awaitingMarketingOptIn needs to persist too, for the
+    // customer's next reply to be checked against it.
+    if (shouldAskOptIn) {
+      await sendMessage(
+        phone,
+        "One more thing — want occasional updates and offers from Hustleapp? Reply YES to opt in (totally optional, and you can reply STOP anytime)."
+      );
+      await updateSession(phone, { data: { marketingOptInAsked: true, awaitingMarketingOptIn: true } });
+    }
     return;
   }
 
@@ -1929,6 +2180,72 @@ function startUnclaimedLiveChatSweep() {
   }, SWEEP_INTERVAL_MS);
 }
 
+// --- 4e. Win-back check-in ---
+// A customer who's booked before but hasn't booked again in a while gets a
+// simple, low-pressure check-in — not a hard sell, just "still around if
+// you need anything." Only ever sent to phones that have explicitly opted
+// in to marketing content (see marketing.ts); a customer who's never
+// opted in can keep booking normally forever and simply never gets this.
+// Re-checked every sweep tick but only actually sends once per
+// WIN_BACK_AFTER_MS of continued silence, so someone who never comes back
+// gets an occasional nudge rather than either nothing or a message a minute.
+const WIN_BACK_AFTER_MS = 30 * 24 * 60 * 60 * 1000; // 30 days since their last booking
+
+function startWinBackSweep() {
+  setInterval(() => {
+    (async () => {
+      const now = Date.now();
+      for (const session of await getAllSessions()) {
+        const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+        if (pastBookings.length === 0) continue; // never booked — nothing to win back
+
+        if (!(await isOptedIn(session.phone))) continue;
+
+        const lastBooking = pastBookings.reduce((latest, b) => (b.submittedAt > latest.submittedAt ? b : latest));
+        const lastWinBackSentAt = session.data.lastWinBackSentAt as number | undefined;
+        const sinceLastBooking = now - lastBooking.submittedAt;
+        const sinceLastWinBack = lastWinBackSentAt ? now - lastWinBackSentAt : Infinity;
+
+        if (sinceLastBooking < WIN_BACK_AFTER_MS) continue; // booked recently enough, nothing to do
+        if (sinceLastWinBack < WIN_BACK_AFTER_MS) continue; // already checked in recently, don't repeat
+
+        await sendMarketingMessage(
+          session.phone,
+          `it's been a while! Last time we helped you find a ${lastBooking.serviceType}. Need a hand with anything today?`
+        ).catch((err) => console.error("Win-back send failed:", err));
+
+        await updateSession(session.phone, { data: { lastWinBackSentAt: now } });
+      }
+    })().catch((err) => console.error("Win-back sweep failed:", err));
+  }, SWEEP_INTERVAL_MS);
+}
+
+// --- 4f. Reminder firing ---
+// Fires any reminder whose due time has passed, via the Utility-category
+// reminder template — no marketing opt-in needed, since the customer
+// explicitly asked for this exact message. The template itself both
+// delivers the reminder and offers to help book it; a customer who replies
+// affirmatively is caught by the awaitingReminderOffer soft flag in
+// handleMessage above, which kicks off a real booking pre-filled from the
+// reminder's text.
+function startReminderSweep() {
+  setInterval(() => {
+    (async () => {
+      const now = Date.now();
+      for (const reminder of await getAllReminders()) {
+        if (reminder.fired) continue;
+        if (reminder.dueAt > now) continue;
+
+        await sendTemplateMessage(reminder.phone, REMINDER_TEMPLATE_NAME, REMINDER_TEMPLATE_LANGUAGE, reminder.text).catch(
+          (err) => console.error("Reminder send failed:", err)
+        );
+        await markReminderFired(reminder.id);
+        await updateSession(reminder.phone, { data: { awaitingReminderOffer: reminder.text } });
+      }
+    })().catch((err) => console.error("Reminder sweep failed:", err));
+  }, SWEEP_INTERVAL_MS);
+}
+
 // --- 5. Outbound sender ---
 // If real WhatsApp credentials aren't set yet (local testing before Meta
 // access is sorted out), just log what would have been sent instead of
@@ -2055,4 +2372,6 @@ app.listen(PORT, () => {
   startInactivitySweep();
   startUnclaimedRequestSweep();
   startUnclaimedLiveChatSweep();
+  startWinBackSweep();
+  startReminderSweep();
 });

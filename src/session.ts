@@ -49,7 +49,7 @@ export interface PastBooking {
 // restarting after "no", etc.) — everything else in .data is wiped so a
 // new booking never inherits stale fields (attachments, service type...)
 // from a previous one, while still remembering who this customer is.
-const PERSISTENT_DATA_KEYS = ["pastBookings", "messageLog"] as const;
+const PERSISTENT_DATA_KEYS = ["pastBookings", "messageLog", "marketingOptInAsked", "lastWinBackSentAt"] as const;
 
 const MESSAGE_LOG_LIMIT = 20;
 
