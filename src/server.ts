@@ -16,6 +16,7 @@ import { interpretDate } from "./dateInterpreter";
 import { matchServiceCategory } from "./serviceCategories";
 import { extractBookingDetails } from "./detailExtractor";
 import { transcribeVoiceNote } from "./voiceTranscriber";
+import { resolveServiceType } from "./serviceResolver";
 import { logRequestEvent } from "./googleSheet";
 import {
   createQuoteRequest,
@@ -84,6 +85,15 @@ const ESCALATION_TRIGGERS = [
   "manager",
   "sales representative",
   "customer service",
+  "speak to someone",
+  "speak with someone",
+  "talk to someone",
+  "talk with someone",
+  "speak to somebody",
+  "talk to somebody",
+  "speak to a person",
+  "talk to a person",
+  "real person",
 ];
 
 // Words/phrases that suggest a complaint or dispute rather than a routine
@@ -1268,6 +1278,22 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         ? "instant"
         : undefined;
 
+      // A service was mentioned in the opening message — check it's a real
+      // request before ever building a confirmation prompt around it (and
+      // normalize problem descriptions like "my AC isn't cooling" into a
+      // proper service name in the process).
+      if (extracted.serviceType) {
+        const resolved = await resolveServiceType(extracted.serviceType);
+        if (!resolved.supported) {
+          const suggestionText = resolved.suggestion
+            ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?`
+            : " Is there something else I can help you find?";
+          await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
+          return; // stay at "greeting" — their next message goes through this same path again
+        }
+        extracted.serviceType = resolved.serviceType ?? extracted.serviceType;
+      }
+
       if (extracted.serviceType || extracted.location) {
         let confirmPrompt: string;
         if (extracted.serviceType && extracted.location) {
@@ -1436,7 +1462,15 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       );
       return;
     }
-    await updateSession(phone, { data: { serviceType: text } });
+
+    const resolved = await resolveServiceType(text);
+    if (!resolved.supported) {
+      const suggestionText = resolved.suggestion ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?` : " Is there something else I can help you find?";
+      await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
+      return; // stay at awaiting_service_type — let them try again
+    }
+
+    await updateSession(phone, { data: { serviceType: resolved.serviceType ?? text } });
     await proceedAfterServiceType(phone, "Got it.");
     return;
   }

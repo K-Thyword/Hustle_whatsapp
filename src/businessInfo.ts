@@ -66,9 +66,10 @@ Cancellation / refund policy:
   every dispute/refund case individually
 
 How to reach a human:
-- Any of these words, said at any point in the chat, hands the conversation to
+- Any of these, said at any point in the chat, hands the conversation to
   a human agent: "agent", "human", "more help", "help", "manager",
-  "sales representative", "customer service"
+  "sales representative", "customer service", or simply asking to speak/talk
+  to someone ("I want to speak to someone", "can I talk to a person", etc.)
 
 How booking actually works (important — there is no live/real-time list of
 available providers yet):
