@@ -11,6 +11,11 @@
 // (server.ts's webhook handler), a customer can only ever be relayed
 // messages from a number that is both (a) an authorised agent number and
 // (b) the one that claimed this specific conversation.
+//
+// Backed by store.ts (Redis, with an automatic in-memory fallback) so a
+// crash or redeploy doesn't silently drop an in-progress claimed chat.
+
+import { kvGet, kvSet, kvDelete, kvGetAllWithPrefix } from "./store";
 
 // One line of the conversation while it's human-handled — kept so that if
 // an agent transfers the chat to a colleague, the new agent isn't starting
@@ -35,69 +40,76 @@ export interface LiveChat {
   transcript: LiveChatTranscriptEntry[];
 }
 
-const liveChats = new Map<string, LiveChat>();
+const LIVECHAT_KEY_PREFIX = "livechat:";
+const ACTIVE_CHAT_KEY_PREFIX = "activechat:";
+function liveChatKey(phone: string): string {
+  return `${LIVECHAT_KEY_PREFIX}${phone}`;
+}
+function activeChatKey(agentPhone: string): string {
+  return `${ACTIVE_CHAT_KEY_PREFIX}${agentPhone}`;
+}
 
 // Idempotent — if a live chat is already open for this phone (e.g. the
 // customer sent another escalation-triggering message before anyone
 // claimed the first one), this leaves the existing one (and any claim on
 // it) untouched rather than clobbering it.
-export function startLiveChat(phone: string): LiveChat {
-  const existing = liveChats.get(phone);
+export async function startLiveChat(phone: string): Promise<LiveChat> {
+  const existing = await kvGet<LiveChat>(liveChatKey(phone));
   if (existing) return existing;
   const chat: LiveChat = { phone, startedAt: Date.now(), transcript: [] };
-  liveChats.set(phone, chat);
+  await kvSet(liveChatKey(phone), chat);
   return chat;
 }
 
-export function getLiveChat(phone: string): LiveChat | undefined {
-  return liveChats.get(phone);
+export async function getLiveChat(phone: string): Promise<LiveChat | undefined> {
+  return kvGet<LiveChat>(liveChatKey(phone));
 }
 
-export function claimLiveChat(phone: string, agentPhone: string): LiveChat | undefined {
-  const chat = liveChats.get(phone);
+export async function claimLiveChat(phone: string, agentPhone: string): Promise<LiveChat | undefined> {
+  const chat = await getLiveChat(phone);
   if (!chat) return undefined;
   const updated: LiveChat = { ...chat, claimedBy: agentPhone, claimedAt: Date.now() };
-  liveChats.set(phone, updated);
+  await kvSet(liveChatKey(phone), updated);
   return updated;
 }
 
-export function unclaimLiveChat(phone: string): LiveChat | undefined {
-  const chat = liveChats.get(phone);
+export async function unclaimLiveChat(phone: string): Promise<LiveChat | undefined> {
+  const chat = await getLiveChat(phone);
   if (!chat) return undefined;
   const updated: LiveChat = { ...chat, claimedBy: undefined, claimedAt: undefined };
-  liveChats.set(phone, updated);
+  await kvSet(liveChatKey(phone), updated);
   return updated;
 }
 
-export function endLiveChat(phone: string): void {
-  liveChats.delete(phone);
+export async function endLiveChat(phone: string): Promise<void> {
+  await kvDelete(liveChatKey(phone));
 }
 
 // Records one line of a claimed conversation. No-op if the chat doesn't
 // exist (e.g. race with it just having ended) — this is purely a
 // convenience log for transfers, never the source of truth for anything.
-export function appendLiveChatMessage(
+export async function appendLiveChatMessage(
   phone: string,
   from: "customer" | "agent",
   text: string,
   agentPhone?: string
-): void {
+): Promise<void> {
   if (!text) return;
-  const chat = liveChats.get(phone);
+  const chat = await getLiveChat(phone);
   if (!chat) return;
   const entry: LiveChatTranscriptEntry = { from, text, at: Date.now(), agentPhone };
   const updatedTranscript = [...chat.transcript, entry].slice(-TRANSCRIPT_LIMIT);
-  liveChats.set(phone, { ...chat, transcript: updatedTranscript });
+  await kvSet(liveChatKey(phone), { ...chat, transcript: updatedTranscript });
 }
 
-export function getAllLiveChats(): LiveChat[] {
-  return Array.from(liveChats.values());
+export async function getAllLiveChats(): Promise<LiveChat[]> {
+  return kvGetAllWithPrefix<LiveChat>(LIVECHAT_KEY_PREFIX);
 }
 
-export function markLiveChatNudgeSent(phone: string): void {
-  const chat = liveChats.get(phone);
+export async function markLiveChatNudgeSent(phone: string): Promise<void> {
+  const chat = await getLiveChat(phone);
   if (!chat) return;
-  liveChats.set(phone, { ...chat, unclaimedNudgeSent: true });
+  await kvSet(liveChatKey(phone), { ...chat, unclaimedNudgeSent: true });
 }
 
 // --- Per-agent "active conversation" pointer ---
@@ -109,16 +121,14 @@ export function markLiveChatNudgeSent(phone: string): void {
 // ending a conversation clears it. An agent juggling more than one
 // claimed conversation can always switch which one is "active" by using
 // the explicit "<phone>: <message>" form.
-const activeChatByAgent = new Map<string, string>();
-
-export function setActiveChatForAgent(agentPhone: string, customerPhone: string): void {
-  activeChatByAgent.set(agentPhone, customerPhone);
+export async function setActiveChatForAgent(agentPhone: string, customerPhone: string): Promise<void> {
+  await kvSet(activeChatKey(agentPhone), customerPhone);
 }
 
-export function getActiveChatForAgent(agentPhone: string): string | undefined {
-  return activeChatByAgent.get(agentPhone);
+export async function getActiveChatForAgent(agentPhone: string): Promise<string | undefined> {
+  return kvGet<string>(activeChatKey(agentPhone));
 }
 
-export function clearActiveChatForAgent(agentPhone: string): void {
-  activeChatByAgent.delete(agentPhone);
+export async function clearActiveChatForAgent(agentPhone: string): Promise<void> {
+  await kvDelete(activeChatKey(agentPhone));
 }

@@ -25,15 +25,16 @@
 // notification already went out via a template, so the agent is prompted
 // to reply either way; the attachment simply arrives right after.
 //
-// In-memory, same as sessions.ts/quotes.ts — resets on redeploy, which is
-// an acceptable interim limitation consistent with the rest of this app.
+// Backed by store.ts (Redis, with an automatic in-memory fallback) so a
+// crash or redeploy doesn't wipe window state or a queued notification.
 
+import { kvGet, kvSet, kvDelete } from "./store";
 import type { MediaAttachment } from "./server";
 
 const WHATSAPP_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-// The most recent time we received a message FROM each agent number.
-const lastInboundAt = new Map<string, number>();
+const LAST_INBOUND_KEY_PREFIX = "agent-last-inbound:";
+const PENDING_KEY_PREFIX = "agent-pending:";
 
 export type PendingAgentItem =
   | { type: "text"; message: string }
@@ -44,36 +45,37 @@ export type PendingAgentItem =
 // Capped per agent so an agent who never replies doesn't accumulate an
 // unbounded backlog.
 const PENDING_LIMIT_PER_AGENT = 20;
-const pendingByAgent = new Map<string, PendingAgentItem[]>();
 
-export function recordAgentInbound(agentPhone: string): void {
-  lastInboundAt.set(agentPhone, Date.now());
+export async function recordAgentInbound(agentPhone: string): Promise<void> {
+  await kvSet(`${LAST_INBOUND_KEY_PREFIX}${agentPhone}`, Date.now());
 }
 
-export function isAgentWindowOpen(agentPhone: string): boolean {
-  const last = lastInboundAt.get(agentPhone);
+export async function isAgentWindowOpen(agentPhone: string): Promise<boolean> {
+  const last = await kvGet<number>(`${LAST_INBOUND_KEY_PREFIX}${agentPhone}`);
   if (!last) return false; // never heard from them — treat as closed
   return Date.now() - last < WHATSAPP_WINDOW_MS;
 }
 
-function queuePendingAgentItem(agentPhone: string, item: PendingAgentItem): void {
-  const existing = pendingByAgent.get(agentPhone) ?? [];
-  pendingByAgent.set(agentPhone, [...existing, item].slice(-PENDING_LIMIT_PER_AGENT));
+async function queuePendingAgentItem(agentPhone: string, item: PendingAgentItem): Promise<void> {
+  const key = `${PENDING_KEY_PREFIX}${agentPhone}`;
+  const existing = (await kvGet<PendingAgentItem[]>(key)) ?? [];
+  await kvSet(key, [...existing, item].slice(-PENDING_LIMIT_PER_AGENT));
 }
 
-export function queuePendingAgentMessage(agentPhone: string, message: string): void {
-  queuePendingAgentItem(agentPhone, { type: "text", message });
+export async function queuePendingAgentMessage(agentPhone: string, message: string): Promise<void> {
+  await queuePendingAgentItem(agentPhone, { type: "text", message });
 }
 
-export function queuePendingAgentMedia(agentPhone: string, attachment: MediaAttachment): void {
-  queuePendingAgentItem(agentPhone, { type: "media", attachment });
+export async function queuePendingAgentMedia(agentPhone: string, attachment: MediaAttachment): Promise<void> {
+  await queuePendingAgentItem(agentPhone, { type: "media", attachment });
 }
 
 // Removes and returns everything queued for this agent — call once the
 // window is confirmed open (i.e. right after recording an inbound message
 // from them) so the real content can go out as normal free-form messages.
-export function drainPendingAgentItems(agentPhone: string): PendingAgentItem[] {
-  const existing = pendingByAgent.get(agentPhone) ?? [];
-  pendingByAgent.delete(agentPhone);
+export async function drainPendingAgentItems(agentPhone: string): Promise<PendingAgentItem[]> {
+  const key = `${PENDING_KEY_PREFIX}${agentPhone}`;
+  const existing = (await kvGet<PendingAgentItem[]>(key)) ?? [];
+  await kvDelete(key);
   return existing;
 }

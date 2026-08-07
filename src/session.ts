@@ -1,8 +1,10 @@
-// In-memory session store, keyed by WhatsApp phone number.
-// Swap for Redis or a DB table once you're past prototyping —
-// this exists only so the rest of the app doesn't need to know
-// how sessions are persisted (deletion test: everything below
-// the interface can change without touching callers).
+// Conversation session store, keyed by WhatsApp phone number. Backed by
+// store.ts (Redis, with an automatic in-memory fallback) so a crash or
+// redeploy no longer drops a customer mid-booking — this used to be a
+// plain in-memory Map; the interface below is unchanged except that every
+// function is now async, since talking to Redis is inherently async.
+
+import { kvGet, kvSet, kvDelete, kvGetAllWithPrefix } from "./store";
 
 export type ConversationStage =
   | "greeting"
@@ -51,10 +53,13 @@ const PERSISTENT_DATA_KEYS = ["pastBookings", "messageLog"] as const;
 
 const MESSAGE_LOG_LIMIT = 20;
 
-const sessions = new Map<string, ConversationSession>();
+const SESSION_KEY_PREFIX = "session:";
+function sessionKey(phone: string): string {
+  return `${SESSION_KEY_PREFIX}${phone}`;
+}
 
-export function getSession(phone: string): ConversationSession {
-  const existing = sessions.get(phone);
+export async function getSession(phone: string): Promise<ConversationSession> {
+  const existing = await kvGet<ConversationSession>(sessionKey(phone));
   if (existing) return existing;
 
   const fresh: ConversationSession = {
@@ -63,37 +68,37 @@ export function getSession(phone: string): ConversationSession {
     data: {},
     updatedAt: Date.now(),
   };
-  sessions.set(phone, fresh);
+  await kvSet(sessionKey(phone), fresh);
   return fresh;
 }
 
-export function updateSession(
+export async function updateSession(
   phone: string,
   updates: Partial<Pick<ConversationSession, "stage" | "data">>
-): ConversationSession {
-  const session = getSession(phone);
+): Promise<ConversationSession> {
+  const session = await getSession(phone);
   const updated: ConversationSession = {
     ...session,
     ...updates,
     data: { ...session.data, ...(updates.data ?? {}) },
     updatedAt: Date.now(),
   };
-  sessions.set(phone, updated);
+  await kvSet(sessionKey(phone), updated);
   return updated;
 }
 
 // Full wipe — only use this if you genuinely want to forget this customer
 // entirely. For "start a new booking" flows, use resetForNewRequest()
 // instead so booking history and recent conversation context survive.
-export function clearSession(phone: string): void {
-  sessions.delete(phone);
+export async function clearSession(phone: string): Promise<void> {
+  await kvDelete(sessionKey(phone));
 }
 
 // Resets a session back to "greeting" for a fresh booking, but keeps the
 // persistent fields (past booking history, recent message log) so the bot
 // doesn't lose all memory of this customer every time a booking wraps up.
-export function resetForNewRequest(phone: string): ConversationSession {
-  const session = getSession(phone);
+export async function resetForNewRequest(phone: string): Promise<ConversationSession> {
+  const session = await getSession(phone);
   const persisted: Record<string, unknown> = {};
   for (const key of PERSISTENT_DATA_KEYS) {
     if (key in session.data) persisted[key] = session.data[key];
@@ -104,31 +109,30 @@ export function resetForNewRequest(phone: string): ConversationSession {
     data: persisted,
     updatedAt: Date.now(),
   };
-  sessions.set(phone, fresh);
+  await kvSet(sessionKey(phone), fresh);
   return fresh;
 }
 
 // Adds a completed booking to this customer's history (survives resets).
-export function addPastBooking(phone: string, booking: PastBooking): void {
-  const session = getSession(phone);
+export async function addPastBooking(phone: string, booking: PastBooking): Promise<void> {
+  const session = await getSession(phone);
   const existing = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-  updateSession(phone, { data: { pastBookings: [...existing, booking] } });
+  await updateSession(phone, { data: { pastBookings: [...existing, booking] } });
 }
 
 // All active sessions — used by the inactivity check-in sweep to find
-// customers who've gone quiet mid-booking. Returns live references, not
-// copies, so callers can updateSession() as normal.
-export function getAllSessions(): ConversationSession[] {
-  return Array.from(sessions.values());
+// customers who've gone quiet mid-booking.
+export async function getAllSessions(): Promise<ConversationSession[]> {
+  return kvGetAllWithPrefix<ConversationSession>(SESSION_KEY_PREFIX);
 }
 
 // Appends one line to a short rolling transcript of this customer's own
 // messages (not the bot's replies) — enough for the FAQ AI to have some
 // awareness of what's been discussed, without keeping unbounded history.
-export function appendMessageLog(phone: string, text: string): void {
+export async function appendMessageLog(phone: string, text: string): Promise<void> {
   if (!text) return;
-  const session = getSession(phone);
+  const session = await getSession(phone);
   const existing = (session.data.messageLog as string[] | undefined) ?? [];
   const updatedLog = [...existing, text].slice(-MESSAGE_LOG_LIMIT);
-  updateSession(phone, { data: { messageLog: updatedLog } });
+  await updateSession(phone, { data: { messageLog: updatedLog } });
 }

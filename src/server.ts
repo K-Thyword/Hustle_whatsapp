@@ -210,11 +210,11 @@ function getAgentName(agentPhone: string): string {
 // so the full detail still reaches them, just one round-trip later
 // instead of silently never arriving.
 async function notifyAgentSmart(agentPhone: string, message: string, summaryLabel: string) {
-  if (isAgentWindowOpen(agentPhone)) {
+  if (await isAgentWindowOpen(agentPhone)) {
     await sendMessage(agentPhone, message);
     return;
   }
-  queuePendingAgentMessage(agentPhone, message);
+  await queuePendingAgentMessage(agentPhone, message);
   await sendTemplateMessage(agentPhone, AGENT_NOTIFICATION_TEMPLATE_NAME, AGENT_NOTIFICATION_TEMPLATE_LANGUAGE, summaryLabel);
 }
 
@@ -265,9 +265,9 @@ async function endLiveChatAsAgent(agentPhone: string, phone: string, chat: { cla
     );
     return false;
   }
-  endLiveChat(phone);
-  clearActiveChatForAgent(agentPhone);
-  updateSession(phone, { stage: "greeting" });
+  await endLiveChat(phone);
+  await clearActiveChatForAgent(agentPhone);
+  await updateSession(phone, { stage: "greeting" });
   await sendMessage(agentPhone, `Marked the conversation with ${phone} as ended.`);
   await sendMessage(
     phone,
@@ -321,9 +321,9 @@ async function transferLiveChat(agentPhone: string, phone: string, chat: LiveCha
     return;
   }
 
-  claimLiveChat(phone, target);
-  clearActiveChatForAgent(agentPhone);
-  setActiveChatForAgent(target, phone);
+  await claimLiveChat(phone, target);
+  await clearActiveChatForAgent(agentPhone);
+  await setActiveChatForAgent(target, phone);
 
   const recentLines = chat.transcript.slice(-10).map((entry) =>
     entry.from === "customer" ? `Customer: ${entry.text}` : `${getAgentName(entry.agentPhone ?? agentPhone)}: ${entry.text}`
@@ -349,7 +349,7 @@ async function transferLiveChat(agentPhone: string, phone: string, chat: LiveCha
 }
 
 async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
-  const chat = getLiveChat(phone);
+  const chat = await getLiveChat(phone);
   if (!chat) {
     await sendMessage(agentPhone, `No active conversation found for ${phone} — they may not have an open escalation right now.`);
     return;
@@ -363,12 +363,12 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
       return;
     }
     if (chat.claimedBy === agentPhone) {
-      setActiveChatForAgent(agentPhone, phone);
+      await setActiveChatForAgent(agentPhone, phone);
       await sendMessage(agentPhone, `You've already claimed the conversation with ${phone} — it's your active chat, just type your reply.`);
       return;
     }
-    claimLiveChat(phone, agentPhone);
-    setActiveChatForAgent(agentPhone, phone);
+    await claimLiveChat(phone, agentPhone);
+    await setActiveChatForAgent(agentPhone, phone);
     await sendMessage(
       agentPhone,
       `You've claimed the conversation with ${phone} — it's now your active chat. Just type your reply and it'll go straight to them (no need to include their number again). Say "end" when you're done, "transfer <name>" to hand it off, or message another number to switch.`
@@ -390,8 +390,8 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
       await sendMessage(agentPhone, `You haven't claimed the conversation with ${phone}, so there's nothing to release.`);
       return;
     }
-    unclaimLiveChat(phone);
-    if (getActiveChatForAgent(agentPhone) === phone) clearActiveChatForAgent(agentPhone);
+    await unclaimLiveChat(phone);
+    if (await getActiveChatForAgent(agentPhone) === phone) await clearActiveChatForAgent(agentPhone);
     await sendMessage(agentPhone, `Released the conversation with ${phone} back to the team.`);
     await notifyAgents(
       `The conversation with ${phone} is back in the pool — ${getAgentName(agentPhone)} released it. Reply "${phone}: claim" to pick it up.`,
@@ -438,9 +438,9 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
   // Explicitly naming a number also makes it the agent's active chat, so
   // an agent juggling more than one claimed conversation can switch which
   // one their plain (unprefixed) messages go to just by prefixing once.
-  setActiveChatForAgent(agentPhone, phone);
+  await setActiveChatForAgent(agentPhone, phone);
   await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
-  appendLiveChatMessage(phone, "agent", rest.trim(), agentPhone);
+  await appendLiveChatMessage(phone, "agent", rest.trim(), agentPhone);
 }
 
 // --- "my requests": an agent checking what they're currently handling ---
@@ -450,10 +450,10 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
 const MY_REQUESTS_TRIGGERS = ["my requests", "myrequests", "my jobs", "my claims", "my status"];
 
 async function handleMyRequestsQuery(agentPhone: string): Promise<void> {
-  const myRequests = getAllQuoteRequests().filter(
+  const myRequests = (await getAllQuoteRequests()).filter(
     (r) => r.claimedBy === agentPhone && OPEN_STATUSES.includes(r.status)
   );
-  const myChats = getAllLiveChats().filter((c) => c.claimedBy === agentPhone);
+  const myChats = (await getAllLiveChats()).filter((c) => c.claimedBy === agentPhone);
 
   if (myRequests.length === 0 && myChats.length === 0) {
     await sendMessage(agentPhone, "You don't have any claimed requests or conversations right now.");
@@ -506,7 +506,7 @@ async function ensureRequestOwnership(
     return false;
   }
   if (!request.claimedBy) {
-    updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
+    await updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
     await sendMessage(agentPhone, `(Auto-claimed ${requestId} for you since no one else had.)`);
     await notifyOtherAgentsOfClaim(requestId, agentPhone);
   }
@@ -517,8 +517,8 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   // Any inbound message from an agent reopens their 24h window — record it
   // first, then flush anything that was queued while it was closed, so the
   // full-detail notifications they missed actually arrive now.
-  recordAgentInbound(agentPhone);
-  const queued = drainPendingAgentItems(agentPhone);
+  await recordAgentInbound(agentPhone);
+  const queued = await drainPendingAgentItems(agentPhone);
   for (const item of queued) {
     if (item.type === "text") {
       await sendMessage(agentPhone, item.message);
@@ -552,14 +552,14 @@ async function handleAgentMessage(agentPhone: string, text: string) {
     // that customer, so they don't have to re-type the number on every
     // single message. This is the "session" the claim opened; it stays
     // active until "end" (from either side) or a real reference switches it.
-    const activeCustomer = getActiveChatForAgent(agentPhone);
+    const activeCustomer = await getActiveChatForAgent(agentPhone);
     if (activeCustomer) {
-      const activeChat = getLiveChat(activeCustomer);
+      const activeChat = await getLiveChat(activeCustomer);
       if (!activeChat || activeChat.claimedBy !== agentPhone) {
         // Stale pointer — the conversation ended some other way (customer
         // restarted, another agent took over, etc). Clear it and fall
         // through to the normal unrecognized-message handling below.
-        clearActiveChatForAgent(agentPhone);
+        await clearActiveChatForAgent(agentPhone);
       } else {
         const bareAction = text.trim().toLowerCase();
         if (LIVE_CHAT_END_WORDS.includes(bareAction)) {
@@ -573,7 +573,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
         }
         if (text.trim()) {
           await sendMessage(activeCustomer, `*${getAgentName(agentPhone)}*: ${text.trim()}`);
-          appendLiveChatMessage(activeCustomer, "agent", text.trim(), agentPhone);
+          await appendLiveChatMessage(activeCustomer, "agent", text.trim(), agentPhone);
         }
         return;
       }
@@ -593,7 +593,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   const [, requestId, actionRaw, contentRaw] = match;
   const content = (contentRaw ?? "").trim();
-  const request = getQuoteRequest(requestId);
+  const request = await getQuoteRequest(requestId);
   if (!request) {
     await sendMessage(agentPhone, `Couldn't find a request with reference ${requestId} — double check the number.`);
     return;
@@ -618,7 +618,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
       await sendMessage(agentPhone, `You've already claimed ${requestId}.`);
       return;
     }
-    updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
+    await updateQuoteRequest(requestId, { claimedBy: agentPhone, claimedAt: Date.now() });
     await sendMessage(agentPhone, `You've claimed ${requestId} (${request.serviceType}, ${request.location}).`);
     await notifyOtherAgentsOfClaim(requestId, agentPhone);
     await logRequestEvent({
@@ -645,7 +645,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   }
 
   if (action === "matched") {
-    updateQuoteRequest(requestId, { matchedProvider: content || undefined });
+    await updateQuoteRequest(requestId, { matchedProvider: content || undefined });
     await sendMessage(
       request.phone,
       `Good news — we've matched you with ${content || "a provider"} for your ${request.serviceType} request. They'll be in touch, or one of our agents will confirm details with you shortly.`
@@ -663,7 +663,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   }
 
   if (action === "done" || action === "complete" || action === "completed") {
-    updateQuoteRequest(requestId, { status: "completed" });
+    await updateQuoteRequest(requestId, { status: "completed" });
     await sendMessage(
       request.phone,
       `Just checking in — your ${request.serviceType} job (${requestId}) has been marked as done! How did everything go? Reply with a quick rating from 1-5, or tell us how it went — it helps us keep quality high.`
@@ -680,7 +680,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   }
 
   if (action === "quote") {
-    updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content });
+    await updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content });
     await sendMessage(
       request.phone,
       `Good news — we've got a price for your ${request.serviceType} request: ${content}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`
@@ -698,7 +698,7 @@ async function handleAgentMessage(agentPhone: string, text: string) {
   }
 
   // "needs" / "ask" / "info" — the artisan needs more detail before pricing
-  updateQuoteRequest(requestId, { status: "awaiting_customer_info" });
+  await updateQuoteRequest(requestId, { status: "awaiting_customer_info" });
   await sendMessage(
     request.phone,
     `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content}`
@@ -868,7 +868,7 @@ interface ExtraQuestion {
 }
 
 async function beginJobDetails(phone: string) {
-  const session = getSession(phone);
+  const session = await getSession(phone);
   const serviceType = (session.data.serviceType as string) ?? "";
   const category = matchServiceCategory(serviceType);
 
@@ -892,7 +892,7 @@ async function beginJobDetails(phone: string) {
   if (queue.length > 0) {
     const [first, ...rest] = queue;
     await sendMessage(phone, first.question);
-    updateSession(phone, {
+    await updateSession(phone, {
       stage: "awaiting_extra_details",
       data: { extraQueue: rest, extraAnswers: [], currentExtraKey: first.key, lastPrompt: first.question },
     });
@@ -901,7 +901,7 @@ async function beginJobDetails(phone: string) {
 
   const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
   await sendMessage(phone, prompt);
-  updateSession(phone, { stage: "awaiting_description", data: { lastPrompt: prompt } });
+  await updateSession(phone, { stage: "awaiting_description", data: { lastPrompt: prompt } });
 }
 
 // --- 3b. Shared "what's next" routing for mode/service/location ---
@@ -914,21 +914,21 @@ async function beginJobDetails(phone: string) {
 // anything already known — instead of every entry point independently
 // (and redundantly) asking for service type, then location, from scratch.
 async function askLocationQuestion(phone: string, ack: string) {
-  const session = getSession(phone);
+  const session = await getSession(phone);
   const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
   const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
   const prompt = lastLocation
     ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or just tell me the new location.`
     : `${ack} Which area or location is this for?`;
   await sendMessage(phone, prompt);
-  updateSession(phone, {
+  await updateSession(phone, {
     stage: "awaiting_location",
     data: { lastPrompt: prompt, suggestedLastLocation: lastLocation },
   });
 }
 
 async function proceedAfterLocation(phone: string) {
-  const session = getSession(phone);
+  const session = await getSession(phone);
   const mode = session.data.mode as BookingMode;
 
   if (mode === "standard") {
@@ -944,7 +944,7 @@ async function proceedAfterLocation(phone: string) {
     if (suggestedDateHuman) {
       const confirmPrompt = `Just to confirm — you'd like this done on ${suggestedDateHuman}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
       await sendMessage(phone, confirmPrompt);
-      updateSession(phone, {
+      await updateSession(phone, {
         stage: "awaiting_date_confirmation",
         data: { pendingDateHuman: suggestedDateHuman, pendingDateIso: session.data.suggestedDateIso, lastPrompt: confirmPrompt },
       });
@@ -953,7 +953,7 @@ async function proceedAfterLocation(phone: string) {
 
     const prompt = "And what date would you like this done?";
     await sendMessage(phone, prompt);
-    updateSession(phone, { stage: "awaiting_date", data: { lastPrompt: prompt } });
+    await updateSession(phone, { stage: "awaiting_date", data: { lastPrompt: prompt } });
     return;
   }
 
@@ -961,7 +961,7 @@ async function proceedAfterLocation(phone: string) {
 }
 
 async function proceedAfterServiceType(phone: string, ack: string) {
-  const session = getSession(phone);
+  const session = await getSession(phone);
   if (session.data.location) {
     await proceedAfterLocation(phone);
     return;
@@ -975,8 +975,8 @@ async function proceedAfterMode(
   suggestedDateHuman?: string,
   suggestedDateIso?: string
 ) {
-  updateSession(phone, { data: { mode, suggestedDateHuman, suggestedDateIso } });
-  const session = getSession(phone);
+  await updateSession(phone, { data: { mode, suggestedDateHuman, suggestedDateIso } });
+  const session = await getSession(phone);
 
   if (session.data.serviceType) {
     await proceedAfterServiceType(phone, "Got it.");
@@ -984,7 +984,7 @@ async function proceedAfterMode(
   }
 
   await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-  updateSession(phone, { stage: "awaiting_service_type", data: { lastPrompt: "What kind of service do you need?" } });
+  await updateSession(phone, { stage: "awaiting_service_type", data: { lastPrompt: "What kind of service do you need?" } });
 }
 
 // --- 4. Conversation logic ---
@@ -999,7 +999,7 @@ async function proceedAfterMode(
 //
 // Escalation to a human can happen from any stage — checked first, always.
 async function handleMessage(phone: string, text: string, media?: MediaAttachment) {
-  let session = getSession(phone);
+  let session = await getSession(phone);
   const lower = text.toLowerCase();
   const now = Date.now();
 
@@ -1017,8 +1017,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const hoursSinceLast = (now - previousLastCustomerMessageAt) / 3_600_000;
     const isNewDay = !isSameCalendarDay(new Date(previousLastCustomerMessageAt), new Date(now));
     if (hoursSinceLast >= 24 || (isNewDay && isBareGreetingMsg)) {
-      if (session.stage === "escalated") endLiveChat(phone);
-      session = resetForNewRequest(phone);
+      if (session.stage === "escalated") await endLiveChat(phone);
+      session = await resetForNewRequest(phone);
     }
   }
 
@@ -1029,15 +1029,15 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // customer" context previously caused it to mistake the agent's name
   // for the customer's own — visible as the bot greeting a customer as
   // "Tee" right after their chat with an agent named Tee had ended.
-  const inClaimedLiveChat = session.stage === "escalated" && Boolean(getLiveChat(phone)?.claimedBy);
+  const inClaimedLiveChat = session.stage === "escalated" && Boolean((await getLiveChat(phone))?.claimedBy);
   if (!inClaimedLiveChat) {
-    appendMessageLog(phone, text);
+    await appendMessageLog(phone, text);
   }
   if (session.data.checkedIn || session.data.finalNudgeSent) {
-    updateSession(phone, { data: { checkedIn: false, finalNudgeSent: false } });
+    await updateSession(phone, { data: { checkedIn: false, finalNudgeSent: false } });
   }
-  updateSession(phone, { data: { lastCustomerMessageAt: now } });
-  session = getSession(phone);
+  await updateSession(phone, { data: { lastCustomerMessageAt: now } });
+  session = await getSession(phone);
 
   // If this customer is in an active, agent-claimed live chat, everything
   // they send — text and any attached media — goes straight to that agent
@@ -1047,16 +1047,16 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // still short-circuits back to the bot is an explicit "start over" —
   // customers shouldn't be stuck in a live chat if they want to bail.
   if (session.stage === "escalated") {
-    const activeChat = getLiveChat(phone);
+    const activeChat = await getLiveChat(phone);
     if (activeChat?.claimedBy) {
       if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
         await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
-        endLiveChat(phone);
-        clearActiveChatForAgent(activeChat.claimedBy);
+        await endLiveChat(phone);
+        await clearActiveChatForAgent(activeChat.claimedBy);
         const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
         await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
-        resetForNewRequest(phone);
-        updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+        await resetForNewRequest(phone);
+        await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
         return;
       }
 
@@ -1065,7 +1065,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       }
       if (text) {
         await sendMessage(activeChat.claimedBy, `[${phone}]: ${text}`);
-        appendLiveChatMessage(phone, "customer", text);
+        await appendLiveChatMessage(phone, "customer", text);
       }
       return;
     }
@@ -1077,7 +1077,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // wait for their next message rather than advancing the flow with "".
   if (media) {
     const existing = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
-    updateSession(phone, { data: { attachments: [...existing, media] } });
+    await updateSession(phone, { data: { attachments: [...existing, media] } });
 
     if (!text) {
       await sendMessage(
@@ -1092,7 +1092,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // directly, without needing to message an agent. Checked early so it
   // works from any stage, including "escalated".
   if (CANCEL_TRIGGERS.some((t) => lower.includes(t))) {
-    const active = getLatestActiveRequestForPhone(phone);
+    const active = await getLatestActiveRequestForPhone(phone);
     if (!active) {
       await sendMessage(
         phone,
@@ -1100,7 +1100,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       );
       return;
     }
-    updateQuoteRequest(active.requestId, { status: "cancelled" });
+    await updateQuoteRequest(active.requestId, { status: "cancelled" });
     await sendMessage(
       phone,
       `Done — I've cancelled request ${active.requestId} (${active.serviceType} in ${active.location}). Let me know if you'd like to book something else.`
@@ -1126,27 +1126,27 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       phone,
       "Sure thing — I'm looping in one of our team members now. Someone will be with you here shortly. (If you'd like to start a new request in the meantime, just say 'new request'.)"
     );
-    startLiveChat(phone);
+    await startLiveChat(phone);
     const notifyBody = isComplaintSignal
       ? `🚨 POSSIBLE COMPLAINT/DISPUTE — please prioritize 🚨\nCustomer ${phone} flagged automatically — message may indicate a complaint.\nTheir message: "${text}"\n\nReply "${phone}: claim" to pick up this conversation, then "${phone}: <message>" to chat with them directly.`
       : `Customer ${phone} asked to speak with an agent.\nTheir message: "${text}"\n\nReply "${phone}: claim" to pick up this conversation, then "${phone}: <message>" to chat with them directly.`;
     await notifyAgents(notifyBody, isComplaintSignal ? "a possible complaint" : "a customer request for an agent");
-    updateSession(phone, { stage: "escalated" });
+    await updateSession(phone, { stage: "escalated" });
     return;
   }
 
   if (session.stage === "escalated") {
     if (RESTART_TRIGGERS.some((t) => lower.includes(t))) {
-      const activeChat = getLiveChat(phone);
+      const activeChat = await getLiveChat(phone);
       if (activeChat?.claimedBy) {
         await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
-        clearActiveChatForAgent(activeChat.claimedBy);
+        await clearActiveChatForAgent(activeChat.claimedBy);
       }
-      endLiveChat(phone);
+      await endLiveChat(phone);
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
-      resetForNewRequest(phone);
-      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await resetForNewRequest(phone);
+      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
     await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly. (Say 'new request' if you'd like to start something new while you wait.)");
@@ -1160,18 +1160,18 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // applies once they're back at "greeting" (nothing else in progress), so
   // it can't hijack a brand-new booking they're partway through building.
   if (session.stage === "greeting") {
-    const pending = getPendingCustomerAction(phone);
+    const pending = await getPendingCustomerAction(phone);
     if (pending) {
       if (pending.status === "awaiting_customer_info") {
         await notifyAgents(`Customer's answer for ${pending.requestId}: "${text}"`, "a customer's answer");
-        updateQuoteRequest(pending.requestId, { status: "awaiting_quote" });
+        await updateQuoteRequest(pending.requestId, { status: "awaiting_quote" });
         await sendMessage(phone, "Thanks — I've passed that along. We'll get back to you with a price soon.");
         return;
       }
 
       if (pending.status === "quoted") {
         if (isAffirmative(text) && !isNegative(text)) {
-          updateQuoteRequest(pending.requestId, { status: "confirmed" });
+          await updateQuoteRequest(pending.requestId, { status: "confirmed" });
           await sendMessage(
             phone,
             `You're confirmed! One of our agents will be in touch to arrange your provider and payment for ${pending.requestId}.`
@@ -1198,7 +1198,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       }
 
       if (pending.status === "completed") {
-        updateQuoteRequest(pending.requestId, { status: "reviewed" });
+        await updateQuoteRequest(pending.requestId, { status: "reviewed" });
         await sendMessage(phone, "Thank you for the feedback — really appreciate it! Let us know anytime you need something else.");
         await notifyAgents(`Customer's review for ${pending.requestId} (${pending.serviceType}): "${text}"`, "a customer review");
         await logRequestEvent({
@@ -1279,7 +1279,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         }
         const ack = routed.reply ? `${routed.reply}\n\n` : "";
         await sendMessage(phone, `${ack}${confirmPrompt}`);
-        updateSession(phone, {
+        await updateSession(phone, {
           stage: "awaiting_extraction_confirmation",
           data: {
             candidateServiceType: extracted.serviceType,
@@ -1296,7 +1296,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       const ack = routed.reply ? `${routed.reply}\n\n` : "";
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `${ack}${prompt}`);
-      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
 
@@ -1314,7 +1314,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       const candidateDateIso = session.data.candidateDateIso as string | undefined;
       const candidateMode = session.data.candidateMode as BookingMode | undefined;
 
-      updateSession(phone, {
+      await updateSession(phone, {
         data: {
           serviceType: candidateServiceType,
           location: candidateLocation,
@@ -1329,7 +1329,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
 
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, prompt);
-      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
 
@@ -1343,7 +1343,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (correctionDateAttempt.status === "valid") {
       const candidateServiceType = session.data.candidateServiceType as string | undefined;
       const candidateLocation = session.data.candidateLocation as string | undefined;
-      updateSession(phone, { data: { serviceType: candidateServiceType, location: candidateLocation } });
+      await updateSession(phone, { data: { serviceType: candidateServiceType, location: candidateLocation } });
       await proceedAfterMode(phone, "standard", correctionDateAttempt.humanReadable, correctionDateAttempt.isoDate);
       return;
     }
@@ -1360,7 +1360,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // question plainly.
     const prompt = "No problem — what kind of service do you need?";
     await sendMessage(phone, prompt);
-    updateSession(phone, {
+    await updateSession(phone, {
       stage: "awaiting_service_type",
       data: {
         candidateServiceType: undefined,
@@ -1436,7 +1436,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       );
       return;
     }
-    updateSession(phone, { data: { serviceType: text } });
+    await updateSession(phone, { data: { serviceType: text } });
     await proceedAfterServiceType(phone, "Got it.");
     return;
   }
@@ -1465,7 +1465,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         AFFIRMATIVE_EMOJI.some((e) => text.includes(e)));
     const location = wantsSameLocation ? (suggestedLastLocation as string) : text;
 
-    updateSession(phone, { data: { location } });
+    await updateSession(phone, { data: { location } });
     await proceedAfterLocation(phone);
     return;
   }
@@ -1494,7 +1494,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // misread date turning into a booking for the wrong day.
     const confirmPrompt = `Just to confirm — you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
     await sendMessage(phone, confirmPrompt);
-    updateSession(phone, {
+    await updateSession(phone, {
       stage: "awaiting_date_confirmation",
       data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
     });
@@ -1504,7 +1504,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "awaiting_date_confirmation") {
     if (isAffirmative(text)) {
       const confirmedDate = (session.data.pendingDateHuman as string | undefined) ?? text;
-      updateSession(phone, { data: { dateWanted: confirmedDate } });
+      await updateSession(phone, { data: { dateWanted: confirmedDate } });
       await beginJobDetails(phone);
       return;
     }
@@ -1531,7 +1531,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
 
     const confirmPrompt = `Got it — just to confirm, you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
     await sendMessage(phone, confirmPrompt);
-    updateSession(phone, {
+    await updateSession(phone, {
       data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
     });
     return;
@@ -1555,7 +1555,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (queue.length > 0) {
       const [next, ...rest] = queue;
       await sendMessage(phone, next.question);
-      updateSession(phone, {
+      await updateSession(phone, {
         data: { extraAnswers: updatedAnswers, extraQueue: rest, currentExtraKey: next.key, lastPrompt: next.question },
       });
       return;
@@ -1576,7 +1576,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       const prompt =
         "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
       await sendMessage(phone, prompt);
-      updateSession(phone, {
+      await updateSession(phone, {
         stage: "awaiting_special_instructions",
         data: { description, recurring, budget, lastPrompt: prompt },
       });
@@ -1587,7 +1587,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // recurring and/or budget) — still need the actual job description.
     const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
     await sendMessage(phone, prompt);
-    updateSession(phone, { stage: "awaiting_description", data: { recurring, budget, lastPrompt: prompt } });
+    await updateSession(phone, { stage: "awaiting_description", data: { recurring, budget, lastPrompt: prompt } });
     return;
   }
 
@@ -1602,7 +1602,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     const prompt =
       "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
     await sendMessage(phone, prompt);
-    updateSession(phone, { stage: "awaiting_special_instructions", data: { description: text, lastPrompt: prompt } });
+    await updateSession(phone, { stage: "awaiting_special_instructions", data: { description: text, lastPrompt: prompt } });
     return;
   }
 
@@ -1630,7 +1630,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     ];
     const confirmPrompt = `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
     await sendMessage(phone, confirmPrompt);
-    updateSession(phone, {
+    await updateSession(phone, {
       stage: "awaiting_confirmation",
       data: { specialInstructions, lastPrompt: confirmPrompt },
     });
@@ -1641,8 +1641,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (!isAffirmative(text) || isNegative(text)) {
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `No worries, let's start over. ${prompt}`);
-      resetForNewRequest(phone);
-      updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await resetForNewRequest(phone);
+      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
     }
 
@@ -1705,10 +1705,10 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // already prompted that reply via template if needed).
     for (const attachment of attachments) {
       for (const number of AGENT_NOTIFY_NUMBERS) {
-        if (isAgentWindowOpen(number)) {
+        if (await isAgentWindowOpen(number)) {
           await sendMedia(number, attachment);
         } else {
-          queuePendingAgentMedia(number, attachment);
+          await queuePendingAgentMedia(number, attachment);
         }
       }
     }
@@ -1725,8 +1725,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       budget,
       submittedAt: Date.now(),
     };
-    addPastBooking(phone, booking);
-    createQuoteRequest({
+    await addPastBooking(phone, booking);
+    await createQuoteRequest({
       requestId: result.requestId,
       phone,
       serviceType: session.data.serviceType as string,
@@ -1745,12 +1745,12 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     // Reset the in-progress booking fields (attachments, service type,
     // etc.) so they don't leak into the next booking — but this keeps
     // booking history and recent messages, unlike a full clearSession.
-    resetForNewRequest(phone);
+    await resetForNewRequest(phone);
     return;
   }
 
   // request_submitted or unrecognized — reset for simplicity in this skeleton
-  resetForNewRequest(phone);
+  await resetForNewRequest(phone);
 }
 
 // --- 4b. Inactivity check-ins ---
@@ -1782,31 +1782,33 @@ const ACTIVE_STAGES: ConversationStage[] = [
 
 function startInactivitySweep() {
   setInterval(() => {
-    const now = Date.now();
-    for (const session of getAllSessions()) {
-      if (!ACTIVE_STAGES.includes(session.stage)) continue;
+    (async () => {
+      const now = Date.now();
+      for (const session of await getAllSessions()) {
+        if (!ACTIVE_STAGES.includes(session.stage)) continue;
 
-      const lastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
-      if (!lastCustomerMessageAt) continue;
+        const lastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
+        if (!lastCustomerMessageAt) continue;
 
-      const elapsed = now - lastCustomerMessageAt;
-      const checkedIn = Boolean(session.data.checkedIn);
-      const finalNudgeSent = Boolean(session.data.finalNudgeSent);
+        const elapsed = now - lastCustomerMessageAt;
+        const checkedIn = Boolean(session.data.checkedIn);
+        const finalNudgeSent = Boolean(session.data.finalNudgeSent);
 
-      if (!checkedIn && elapsed > CHECK_IN_AFTER_MS) {
-        sendMessage(
-          session.phone,
-          "Hey, just checking in — still there? Whenever you're ready, we can carry on from where we left off."
-        ).catch((err) => console.error("Inactivity check-in send failed:", err));
-        updateSession(session.phone, { data: { checkedIn: true } });
-      } else if (checkedIn && !finalNudgeSent && elapsed > FINAL_NUDGE_AFTER_MS) {
-        sendMessage(
-          session.phone,
-          "No worries if now isn't a good time — I'm here whenever you're ready to continue, just message me anytime."
-        ).catch((err) => console.error("Final nudge send failed:", err));
-        updateSession(session.phone, { data: { finalNudgeSent: true } });
+        if (!checkedIn && elapsed > CHECK_IN_AFTER_MS) {
+          await sendMessage(
+            session.phone,
+            "Hey, just checking in — still there? Whenever you're ready, we can carry on from where we left off."
+          ).catch((err) => console.error("Inactivity check-in send failed:", err));
+          await updateSession(session.phone, { data: { checkedIn: true } });
+        } else if (checkedIn && !finalNudgeSent && elapsed > FINAL_NUDGE_AFTER_MS) {
+          await sendMessage(
+            session.phone,
+            "No worries if now isn't a good time — I'm here whenever you're ready to continue, just message me anytime."
+          ).catch((err) => console.error("Final nudge send failed:", err));
+          await updateSession(session.phone, { data: { finalNudgeSent: true } });
+        }
       }
-    }
+    })().catch((err) => console.error("Inactivity sweep failed:", err));
   }, SWEEP_INTERVAL_MS);
 }
 
@@ -1820,30 +1822,32 @@ const STANDARD_UNCLAIMED_THRESHOLD_MS = 60 * 60 * 1000;
 
 function startUnclaimedRequestSweep() {
   setInterval(() => {
-    const now = Date.now();
-    for (const request of getAllQuoteRequests()) {
-      if (request.claimedBy) continue;
-      if (!OPEN_STATUSES.includes(request.status)) continue;
-      if (request.unclaimedNudgeSent) continue;
+    (async () => {
+      const now = Date.now();
+      for (const request of await getAllQuoteRequests()) {
+        if (request.claimedBy) continue;
+        if (!OPEN_STATUSES.includes(request.status)) continue;
+        if (request.unclaimedNudgeSent) continue;
 
-      const threshold = request.mode === "instant" ? INSTANT_UNCLAIMED_THRESHOLD_MS : STANDARD_UNCLAIMED_THRESHOLD_MS;
-      if (now - request.createdAt < threshold) continue;
+        const threshold = request.mode === "instant" ? INSTANT_UNCLAIMED_THRESHOLD_MS : STANDARD_UNCLAIMED_THRESHOLD_MS;
+        if (now - request.createdAt < threshold) continue;
 
-      const minutes = Math.round(threshold / 60000);
-      const message =
-        `⚠️ Unclaimed: ${request.requestId} (${request.serviceType}, ${request.location}, ${request.mode}) has been sitting for over ${minutes} minutes with no one claiming it. Please pick it up or check with the team.\n` +
-        `Reply "${request.requestId}: claim" to take it.`;
+        const minutes = Math.round(threshold / 60000);
+        const message =
+          `⚠️ Unclaimed: ${request.requestId} (${request.serviceType}, ${request.location}, ${request.mode}) has been sitting for over ${minutes} minutes with no one claiming it. Please pick it up or check with the team.\n` +
+          `Reply "${request.requestId}: claim" to take it.`;
 
-      notifyAgents(message, "an unclaimed request reminder").catch((err) =>
-        console.error("Unclaimed-request nudge send failed:", err)
-      );
-      if (BACKUP_AGENT_NUMBER) {
-        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed request reminder").catch((err) =>
-          console.error("Unclaimed-request backup nudge send failed:", err)
+        await notifyAgents(message, "an unclaimed request reminder").catch((err) =>
+          console.error("Unclaimed-request nudge send failed:", err)
         );
+        if (BACKUP_AGENT_NUMBER) {
+          await notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed request reminder").catch((err) =>
+            console.error("Unclaimed-request backup nudge send failed:", err)
+          );
+        }
+        await updateQuoteRequest(request.requestId, { unclaimedNudgeSent: true });
       }
-      updateQuoteRequest(request.requestId, { unclaimedNudgeSent: true });
-    }
+    })().catch((err) => console.error("Unclaimed-request sweep failed:", err));
   }, SWEEP_INTERVAL_MS);
 }
 
@@ -1856,27 +1860,29 @@ const LIVE_CHAT_UNCLAIMED_THRESHOLD_MS = 10 * 60 * 1000;
 
 function startUnclaimedLiveChatSweep() {
   setInterval(() => {
-    const now = Date.now();
-    for (const chat of getAllLiveChats()) {
-      if (chat.claimedBy) continue;
-      if (chat.unclaimedNudgeSent) continue;
-      if (now - chat.startedAt < LIVE_CHAT_UNCLAIMED_THRESHOLD_MS) continue;
+    (async () => {
+      const now = Date.now();
+      for (const chat of await getAllLiveChats()) {
+        if (chat.claimedBy) continue;
+        if (chat.unclaimedNudgeSent) continue;
+        if (now - chat.startedAt < LIVE_CHAT_UNCLAIMED_THRESHOLD_MS) continue;
 
-      const minutes = Math.round(LIVE_CHAT_UNCLAIMED_THRESHOLD_MS / 60000);
-      const message =
-        `⚠️ Unclaimed conversation: ${chat.phone} has been waiting over ${minutes} minutes with no one picking it up. Please check in.\n` +
-        `Reply "${chat.phone}: claim" to take it.`;
+        const minutes = Math.round(LIVE_CHAT_UNCLAIMED_THRESHOLD_MS / 60000);
+        const message =
+          `⚠️ Unclaimed conversation: ${chat.phone} has been waiting over ${minutes} minutes with no one picking it up. Please check in.\n` +
+          `Reply "${chat.phone}: claim" to take it.`;
 
-      notifyAgents(message, "an unclaimed conversation reminder").catch((err) =>
-        console.error("Unclaimed-chat nudge send failed:", err)
-      );
-      if (BACKUP_AGENT_NUMBER) {
-        notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed conversation reminder").catch((err) =>
-          console.error("Unclaimed-chat backup nudge send failed:", err)
+        await notifyAgents(message, "an unclaimed conversation reminder").catch((err) =>
+          console.error("Unclaimed-chat nudge send failed:", err)
         );
+        if (BACKUP_AGENT_NUMBER) {
+          await notifyAgentSmart(BACKUP_AGENT_NUMBER, message, "an unclaimed conversation reminder").catch((err) =>
+            console.error("Unclaimed-chat backup nudge send failed:", err)
+          );
+        }
+        await markLiveChatNudgeSent(chat.phone);
       }
-      markLiveChatNudgeSent(chat.phone);
-    }
+    })().catch((err) => console.error("Unclaimed-chat sweep failed:", err));
   }, SWEEP_INTERVAL_MS);
 }
 

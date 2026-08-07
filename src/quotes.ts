@@ -4,6 +4,11 @@
 // by their reference number (not a phone number), and this needs to stay
 // "live" independently of the customer's own conversation stage, which
 // resets back to "greeting" right after a booking is submitted.
+//
+// Backed by store.ts (Redis, with an automatic in-memory fallback) so a
+// crash or redeploy doesn't drop who's claimed what mid-negotiation.
+
+import { kvGet, kvSet, kvGetAllWithPrefix } from "./store";
 
 export type QuoteStatus =
   | "awaiting_quote" // submitted; agent/artisan haven't priced it yet
@@ -40,39 +45,43 @@ export interface QuoteRequest {
   createdAt: number;
 }
 
-const quoteRequests = new Map<string, QuoteRequest>();
+const QUOTE_KEY_PREFIX = "quote:";
+function quoteKey(requestId: string): string {
+  return `${QUOTE_KEY_PREFIX}${requestId}`;
+}
 
-export function createQuoteRequest(input: {
+export async function createQuoteRequest(input: {
   requestId: string;
   phone: string;
   serviceType: string;
   location: string;
   mode: string;
-}): void {
-  quoteRequests.set(input.requestId, {
+}): Promise<void> {
+  const record: QuoteRequest = {
     ...input,
     status: "awaiting_quote",
     createdAt: Date.now(),
-  });
+  };
+  await kvSet(quoteKey(input.requestId), record);
 }
 
-export function getQuoteRequest(requestId: string): QuoteRequest | undefined {
-  return quoteRequests.get(requestId);
+export async function getQuoteRequest(requestId: string): Promise<QuoteRequest | undefined> {
+  return kvGet<QuoteRequest>(quoteKey(requestId));
 }
 
-export function updateQuoteRequest(
+export async function updateQuoteRequest(
   requestId: string,
   updates: Partial<QuoteRequest>
-): QuoteRequest | undefined {
-  const existing = quoteRequests.get(requestId);
+): Promise<QuoteRequest | undefined> {
+  const existing = await getQuoteRequest(requestId);
   if (!existing) return undefined;
   const updated = { ...existing, ...updates };
-  quoteRequests.set(requestId, updated);
+  await kvSet(quoteKey(requestId), updated);
   return updated;
 }
 
-export function getAllQuoteRequests(): QuoteRequest[] {
-  return Array.from(quoteRequests.values());
+export async function getAllQuoteRequests(): Promise<QuoteRequest[]> {
+  return kvGetAllWithPrefix<QuoteRequest>(QUOTE_KEY_PREFIX);
 }
 
 // Finds this customer's request that's actively waiting on THEM
@@ -80,26 +89,24 @@ export function getAllQuoteRequests(): QuoteRequest[] {
 // give a post-job review — not just any request sitting in the passive
 // "awaiting_quote" state, so a customer starting an unrelated new
 // conversation isn't hijacked into replying to an old, dormant request.
-export function getPendingCustomerAction(phone: string): QuoteRequest | undefined {
-  for (const request of quoteRequests.values()) {
-    if (
+export async function getPendingCustomerAction(phone: string): Promise<QuoteRequest | undefined> {
+  const all = await getAllQuoteRequests();
+  return all.find(
+    (request) =>
       request.phone === phone &&
       (request.status === "awaiting_customer_info" ||
         request.status === "quoted" ||
         request.status === "completed")
-    ) {
-      return request;
-    }
-  }
-  return undefined;
+  );
 }
 
 // Most recent request for this phone that's still "open" (not already
 // cancelled, completed+reviewed, or declined) — used by the "cancel my
 // last request" path so it can find the right job without the customer
 // needing to know their own reference number.
-export function getLatestActiveRequestForPhone(phone: string): QuoteRequest | undefined {
-  const candidates = Array.from(quoteRequests.values())
+export async function getLatestActiveRequestForPhone(phone: string): Promise<QuoteRequest | undefined> {
+  const all = await getAllQuoteRequests();
+  const candidates = all
     .filter((r) => r.phone === phone && OPEN_STATUSES.includes(r.status))
     .sort((a, b) => b.createdAt - a.createdAt);
   return candidates[0];
