@@ -39,6 +39,11 @@ import {
   drainPendingAgentItems,
 } from "./agentMessaging";
 import {
+  isCustomerWindowOpen,
+  queuePendingCustomerMessage,
+  drainPendingCustomerItems,
+} from "./customerMessaging";
+import {
   startLiveChat,
   getLiveChat,
   claimLiveChat,
@@ -210,6 +215,17 @@ const MARKETING_TEMPLATE_LANGUAGE = process.env.MARKETING_TEMPLATE_LANGUAGE || "
 const REMINDER_TEMPLATE_NAME = process.env.REMINDER_TEMPLATE_NAME || "hustle_reminder";
 const REMINDER_TEMPLATE_LANGUAGE = process.env.REMINDER_TEMPLATE_LANGUAGE || "en_US";
 
+// A customer-facing Utility template, used whenever an agent needs to
+// reach a customer whose 24h window has closed — a live chat that went
+// quiet, or a "matched"/quote/done update that lands later than expected
+// (common for scheduled bookings, where the job date — and so the agent's
+// follow-up — may be days after the customer last messaged the bot).
+// Mirrors AGENT_NOTIFICATION_TEMPLATE_NAME, just for the other side of the
+// conversation. See notifyCustomerSmart below for the template to create.
+const CUSTOMER_NOTIFICATION_TEMPLATE_NAME =
+  process.env.CUSTOMER_NOTIFICATION_TEMPLATE_NAME || "hustle_customer_notification";
+const CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE = process.env.CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE || "en_US";
+
 // Maps an agent's phone number to a display name, so a customer connected
 // to a live chat sees "you're now chatting with Ama" instead of a bare
 // phone number — that's what actually makes it read as a real person
@@ -252,6 +268,28 @@ async function notifyAgents(message: string, summaryLabel: string = "an update")
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await notifyAgentSmart(number, message, summaryLabel);
   }
+}
+
+// Same idea as notifyAgentSmart, for the other side of the conversation:
+// an agent's reply, quote, match, or completion update to a customer. If
+// their window is open, it goes straight out as normal; if not, it's
+// queued and a short template ping goes out instead, so the agent's
+// message doesn't just silently vanish. The moment the customer replies to
+// that (or sends anything else), handleMessage drains the queue and the
+// full update reaches them, one round-trip later.
+//
+// One-time setup required in Meta Business Manager before this works:
+//   Name:      hustle_customer_notification  (or set CUSTOMER_NOTIFICATION_TEMPLATE_NAME to match)
+//   Category:  Utility
+//   Language:  must match CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE above (default "en_US")
+//   Body:      "Hustleapp: you have {{1}} waiting. Reply to this message to see the details."
+async function notifyCustomerSmart(phone: string, message: string, summaryLabel: string = "an update on your request") {
+  if (await isCustomerWindowOpen(phone)) {
+    await sendMessage(phone, message);
+    return;
+  }
+  await queuePendingCustomerMessage(phone, message);
+  await sendTemplateMessage(phone, CUSTOMER_NOTIFICATION_TEMPLATE_NAME, CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE, summaryLabel);
 }
 
 // Sends one marketing message (campaign broadcast or win-back check-in) to
@@ -470,7 +508,11 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
         "a claim update"
       );
     }
-    await sendMessage(phone, `You're now connected with *${getAgentName(agentPhone)}* from our team — go ahead and chat here.`);
+    await notifyCustomerSmart(
+      phone,
+      `You're now connected with *${getAgentName(agentPhone)}* from our team — go ahead and chat here.`,
+      `a message from ${getAgentName(agentPhone)}`
+    );
     return;
   }
 
@@ -528,7 +570,11 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
   // an agent juggling more than one claimed conversation can switch which
   // one their plain (unprefixed) messages go to just by prefixing once.
   await setActiveChatForAgent(agentPhone, phone);
-  await sendMessage(phone, `*${getAgentName(agentPhone)}*: ${rest.trim()}`);
+  await notifyCustomerSmart(
+    phone,
+    `*${getAgentName(agentPhone)}*: ${rest.trim()}`,
+    `a message from ${getAgentName(agentPhone)}`
+  );
   await appendLiveChatMessage(phone, "agent", rest.trim(), agentPhone);
 }
 
@@ -667,7 +713,11 @@ async function handleAgentMessage(agentPhone: string, text: string) {
           return;
         }
         if (text.trim()) {
-          await sendMessage(activeCustomer, `*${getAgentName(agentPhone)}*: ${text.trim()}`);
+          await notifyCustomerSmart(
+            activeCustomer,
+            `*${getAgentName(agentPhone)}*: ${text.trim()}`,
+            `a message from ${getAgentName(agentPhone)}`
+          );
           await appendLiveChatMessage(activeCustomer, "agent", text.trim(), agentPhone);
         }
         return;
@@ -741,9 +791,10 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   if (action === "matched") {
     await updateQuoteRequest(requestId, { matchedProvider: content || undefined });
-    await sendMessage(
+    await notifyCustomerSmart(
       request.phone,
-      `Good news — we've matched you with ${content || "a provider"} for your ${request.serviceType} request. They'll be in touch, or one of our agents will confirm details with you shortly.`
+      `Good news — we've matched you with ${content || "a provider"} for your ${request.serviceType} request. They'll be in touch, or one of our agents will confirm details with you shortly.`,
+      "a provider match for your request"
     );
     await sendMessage(agentPhone, `Match noted for ${requestId}, and the customer's been told.`);
     await logRequestEvent({
@@ -759,9 +810,10 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   if (action === "done" || action === "complete" || action === "completed") {
     await updateQuoteRequest(requestId, { status: "completed" });
-    await sendMessage(
+    await notifyCustomerSmart(
       request.phone,
-      `Just checking in — your ${request.serviceType} job (${requestId}) has been marked as done! How did everything go? Reply with a quick rating from 1-5, or tell us how it went — it helps us keep quality high.`
+      `Just checking in — your ${request.serviceType} job (${requestId}) has been marked as done! How did everything go? Reply with a quick rating from 1-5, or tell us how it went — it helps us keep quality high.`,
+      "a follow-up on your completed job"
     );
     await sendMessage(agentPhone, `Marked ${requestId} as completed, and asked the customer for a review.`);
     await logRequestEvent({
@@ -776,9 +828,10 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   if (action === "quote") {
     await updateQuoteRequest(requestId, { status: "quoted", quoteAmount: content });
-    await sendMessage(
+    await notifyCustomerSmart(
       request.phone,
-      `Good news — we've got a price for your ${request.serviceType} request: ${content}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`
+      `Good news — we've got a price for your ${request.serviceType} request: ${content}.\n\nReply 'yes' to accept and we'll get your provider confirmed, or let us know if you'd like to discuss it.`,
+      "a price quote for your request"
     );
     await sendMessage(agentPhone, `Quote sent to the customer for ${requestId}.`);
     await logRequestEvent({
@@ -794,9 +847,10 @@ async function handleAgentMessage(agentPhone: string, text: string) {
 
   // "needs" / "ask" / "info" — the artisan needs more detail before pricing
   await updateQuoteRequest(requestId, { status: "awaiting_customer_info" });
-  await sendMessage(
+  await notifyCustomerSmart(
     request.phone,
-    `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content}`
+    `Quick question from our team before we can confirm a price for your ${request.serviceType} request: ${content}`,
+    "a question from our team about your request"
   );
   await sendMessage(agentPhone, `Question sent to the customer for ${requestId}.`);
 }
@@ -1109,6 +1163,20 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   let session = await getSession(phone);
   const lower = text.toLowerCase();
   const now = Date.now();
+
+  // Flush anything an agent sent while this customer's window was closed
+  // (see customerMessaging.ts / notifyCustomerSmart) — their window is
+  // confirmed open the moment they message the bot at all, so any queued
+  // reply, quote, match, or completion update goes out now, before
+  // anything else in this message is handled.
+  const queuedForCustomer = await drainPendingCustomerItems(phone);
+  for (const item of queuedForCustomer) {
+    if (item.type === "text") {
+      await sendMessage(phone, item.message);
+    } else {
+      await sendMedia(phone, item.attachment);
+    }
+  }
 
   // STOP / unsubscribe — exact match, works from any stage, always takes
   // priority. This only affects marketing sends (campaigns, the win-back
