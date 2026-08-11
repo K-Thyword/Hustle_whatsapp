@@ -891,6 +891,26 @@ function isNegative(text: string): boolean {
   return NEGATIVE_EMOJI.some((e) => text.includes(e));
 }
 
+// A reply that is ENTIRELY just a short yes/no (optionally with trailing
+// punctuation) and nothing else — as opposed to a yes/no that also says
+// something more ("yes, also book me a plumber"). Soft-flag handlers use
+// this to tell "this reply fully answers the yes/no question, nothing left
+// to process" apart from "this reply answers it AND contains a real
+// message that still needs a response" — falling through to normal
+// handling on a truly bare reply is what produces a spurious "how can I
+// help" greeting, since it lands in the greeting stage with nothing to go
+// on but the word "yes".
+function isBareYesNo(text: string): boolean {
+  const stripped = text
+    .trim()
+    .toLowerCase()
+    .replace(/[!.?,\s]+$/g, "")
+    .trim();
+  if (AFFIRMATIVE_WORDS.includes(stripped) || NEGATIVE_WORDS.includes(stripped)) return true;
+  const original = text.trim();
+  return AFFIRMATIVE_EMOJI.includes(original) || NEGATIVE_EMOJI.includes(original);
+}
+
 // --- Recognizing a bare "hi"/"hello" with nothing else in it ---
 // Includes a handful of common Twi/Ga greetings so customers who open in
 // their own language get the same warm, natural handling as "hi"/"hello" —
@@ -904,8 +924,14 @@ const BARE_GREETING_RE =
 // ends up stored as the string "i already mentioned"). If we genuinely
 // can't find it in the conversation, say so honestly and ask them to
 // repeat it, rather than silently accepting the deflection as data.
+// The "already/earlier/before" alternative near the end also has to catch
+// deflections that name a concrete thing instead of a bare pronoun — "I
+// mentioned THE TIME earlier" as well as "I mentioned THAT earlier" — since
+// requiring a bare pronoun right after the verb missed real-world phrasing
+// like that (letting it fall through and get stored as literal answer
+// text, e.g. "special instructions: i mentioned the time earlier").
 const NON_ANSWER_RE =
-  /\b(i\s+already\s+(mentioned|said|told|stated|gave|wrote)|already\s+(mentioned|said|told|stated)(\s+(that|this|it))?|as\s+(i\s+)?(mentioned|said|stated)|like\s+i\s+said|see\s+above|i\s+(said|told\s+you|mentioned)\s+(that|this|it)(\s+already)?|read\s+above|scroll\s+up)\b/i;
+  /\b(i\s+already\s+(mentioned|said|told|stated|gave|wrote)|already\s+(mentioned|said|told|stated)(\s+(that|this|it))?|as\s+(i\s+)?(mentioned|said|stated)|like\s+i\s+said|see\s+above|i\s+(said|told\s+you|mentioned)\s+(that|this|it)(\s+already)?|i\s+(already\s+)?(said|told\s+you|mentioned|stated)\s+\S+.{0,40}?\b(earlier|before|already|above)\b|read\s+above|scroll\s+up)\b/i;
 
 function isNonAnswer(text: string): boolean {
   return NON_ANSWER_RE.test(text.trim());
@@ -1195,7 +1221,14 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // Doesn't gate anything either way — just records a yes if there is one,
   // then falls through to normal handling so the customer's message (which
   // may be the start of a brand new request) still gets a real response.
+  // Exception: a BARE "yes"/"no" with nothing else fully answers the
+  // opt-in question and has nothing left to process — falling through for
+  // that case lands in greeting-stage handling with only the word "yes" to
+  // go on, producing a spurious "just checking — what can I help you with
+  // today?" right after a customer finished an order. A reply with more
+  // than just yes/no ("yes, also book me a plumber") still falls through.
   if (session.data.awaitingMarketingOptIn) {
+    const bare = isBareYesNo(text);
     if (isAffirmative(text) && !isNegative(text)) {
       await setMarketingOptIn(phone, true);
       await sendMessage(
@@ -1204,6 +1237,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       );
     }
     await updateSession(phone, { data: { awaitingMarketingOptIn: false } });
+    if (bare) return;
     session = await getSession(phone);
   }
 
@@ -1211,10 +1245,13 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   // ("want help booking this now?")? An affirmative reply kicks off a real
   // booking (pre-filled from the reminder text where the service is
   // recognizable) — a genuine action, so this one returns rather than
-  // falling through. Anything else just clears the flag and continues
-  // normally, same as the marketing flag above.
+  // falling through. A bare "no" (nothing else) also returns, for the same
+  // reason as the marketing flag above — it fully answers the question, so
+  // falling through produces the same spurious greeting. Anything with
+  // more content than a bare yes/no still falls through normally.
   if (session.data.awaitingReminderOffer) {
     const reminderText = session.data.awaitingReminderOffer as string;
+    const bare = isBareYesNo(text);
     if (isAffirmative(text) && !isNegative(text)) {
       await resetForNewRequest(phone);
       const resolved = await resolveServiceType(reminderText);
@@ -1230,6 +1267,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       return;
     }
     await updateSession(phone, { data: { awaitingReminderOffer: undefined } });
+    if (bare) return;
     session = await getSession(phone);
   }
 
@@ -1953,6 +1991,18 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_special_instructions") {
+    // A deflection back to something said earlier ("I mentioned the time
+    // already") is neither a real answer nor a genuine "no, nothing to
+    // note" — matching the awaiting_description stage's handling, ask them
+    // to repeat it rather than silently storing the deflection text itself
+    // as the special instructions.
+    if (isNonAnswer(text)) {
+      await sendMessage(
+        phone,
+        "Sorry, I don't have that noted from earlier in our chat — could you let me know directly what you'd like our artisan to pay attention to, or just say 'no' if there isn't anything?"
+      );
+      return;
+    }
     const SKIP_WORDS = ["no", "none", "nothing", "n/a", "nope", "not really"];
     const skip = SKIP_WORDS.some((w) => lower === w || lower.startsWith(`${w} `) || lower.includes(w));
     const specialInstructions = skip ? undefined : text;
