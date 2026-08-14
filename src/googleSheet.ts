@@ -103,3 +103,33 @@ export async function logRequestEvent(row: RequestLogEvent): Promise<void> {
     console.error("Failed to append to Google Sheet log:", err);
   }
 }
+
+// A visible, checkable record of a notification that never actually
+// reached anyone — e.g. an agent's (or customer's) WhatsApp window was
+// closed AND the fallback template ping also failed to send, usually
+// because the template isn't approved yet in Meta or its language code
+// doesn't match. Before this, that failure only ever showed up as a
+// console.error line on the server — invisible to anyone without log
+// access, including whoever's actually waiting to hear about a booking.
+// Appended to the same sheet bookings already get logged to, so it's
+// somewhere a human will actually see it, plus always printed to the
+// console either way for anyone watching server logs.
+export async function logAlert(message: string): Promise<void> {
+  console.error("🚨 ALERT:", message);
+
+  const client = getClient();
+  if (!client) return; // sheet not configured — the console line above is all we get for now
+
+  try {
+    await client.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Sheet1!A:G",
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [[new Date().toISOString(), "ALERT", "delivery_failed", "", "", "", message]],
+      },
+    });
+  } catch (err) {
+    console.error("Failed to append alert to Google Sheet log:", err);
+  }
+}

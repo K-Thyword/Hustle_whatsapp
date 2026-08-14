@@ -20,7 +20,7 @@ import { setMarketingOptIn, isOptedIn, getOptedInPhones } from "./marketing";
 import { createReminder, getAllReminders, markReminderFired } from "./reminders";
 import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
-import { logRequestEvent } from "./googleSheet";
+import { logRequestEvent, logAlert } from "./googleSheet";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -261,7 +261,22 @@ async function notifyAgentSmart(agentPhone: string, message: string, summaryLabe
     return;
   }
   await queuePendingAgentMessage(agentPhone, message);
-  await sendTemplateMessage(agentPhone, AGENT_NOTIFICATION_TEMPLATE_NAME, AGENT_NOTIFICATION_TEMPLATE_LANGUAGE, summaryLabel);
+  const pinged = await sendTemplateMessage(
+    agentPhone,
+    AGENT_NOTIFICATION_TEMPLATE_NAME,
+    AGENT_NOTIFICATION_TEMPLATE_LANGUAGE,
+    summaryLabel
+  );
+  if (!pinged) {
+    // Window closed AND the fallback template failed too — this agent has
+    // been told nothing at all, and the queued content will just sit there
+    // until they happen to message the bot some other way. That's exactly
+    // the silent-failure gap that let a real booking never reach anyone —
+    // surface it somewhere a human will actually see it.
+    await logAlert(
+      `Agent notification never reached ${agentPhone} — "${summaryLabel}" is queued but undelivered. Window was closed and the fallback template send also failed (check whether hustle_agent_notification is approved in Meta, and its language code matches AGENT_NOTIFICATION_TEMPLATE_LANGUAGE).`
+    );
+  }
 }
 
 async function notifyAgents(message: string, summaryLabel: string = "an update") {
@@ -289,7 +304,17 @@ async function notifyCustomerSmart(phone: string, message: string, summaryLabel:
     return;
   }
   await queuePendingCustomerMessage(phone, message);
-  await sendTemplateMessage(phone, CUSTOMER_NOTIFICATION_TEMPLATE_NAME, CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE, summaryLabel);
+  const pinged = await sendTemplateMessage(
+    phone,
+    CUSTOMER_NOTIFICATION_TEMPLATE_NAME,
+    CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE,
+    summaryLabel
+  );
+  if (!pinged) {
+    await logAlert(
+      `Customer notification never reached ${phone} — "${summaryLabel}" is queued but undelivered. Window was closed and the fallback template send also failed (check whether hustle_customer_notification is approved in Meta, and its language code matches CUSTOMER_NOTIFICATION_TEMPLATE_LANGUAGE).`
+    );
+  }
 }
 
 // Sends one marketing message (campaign broadcast or win-back check-in) to
@@ -937,6 +962,29 @@ function isNonAnswer(text: string): boolean {
   return NON_ANSWER_RE.test(text.trim());
 }
 
+// A non-committal filler reply that doesn't actually answer whatever was
+// just asked — "idk", "whatever", "anywhere is fine" — as distinct from
+// isNonAnswer's much narrower "I already told you that" deflection. The
+// two need separate handling: isNonAnswer says "you already have this,
+// look it up," this says "I genuinely haven't given you anything usable
+// yet." Anchored to the whole trimmed message so it never matches a real,
+// substantive answer that merely contains one of these words/phrases.
+const VAGUE_REPLY_RE =
+  /^((i\s+)?(don'?t\s+know|dunno|idk|not\s+sure|unsure|no\s+idea)|(any\s*where|some\s*where)(\s+(is\s+)?(fine|ok(ay)?|good|works))?|(you|whatever\s+you)\s+(decide|choose|pick)|whatever|anything(\s+(is\s+)?(fine|ok(ay)?|good))?|(any|either)(\s+(one|place|location))?(\s+(is\s+)?(fine|ok(ay)?|good))?)$/i;
+
+function isVagueReply(text: string): boolean {
+  return VAGUE_REPLY_RE.test(text.trim().toLowerCase());
+}
+
+// Specific to the returning-customer location prompt, which itself asks
+// "...or somewhere else?" — customers naturally echo that exact phrasing
+// back to mean "not the same one," without realizing they haven't actually
+// given a new location yet. That's what let "Location: Somewhere else"
+// through as if it were real data. Caught separately from isVagueReply
+// since it's tied to this specific question's own wording.
+const LOCATION_REJECTS_SUGGESTION_RE =
+  /^((somewhere|some\s*where)\s+else|(a\s+)?different\s+(place|location|area)|another\s+(place|location|area)|not\s+(there|that|the\s+same)|elsewhere)$/i;
+
 function isSameCalendarDay(a: Date, b: Date): boolean {
   return (
     a.getUTCFullYear() === b.getUTCFullYear() &&
@@ -1011,7 +1059,10 @@ app.post("/webhook", async (req: Request, res: Response) => {
     media = { id: message.audio.id, type: "audio" };
     text = transcript;
     await sendMessage(from, `🎙️ _I heard:_ "${transcript}"`);
-  } else if (message.type === "location" && message.location) {
+  }
+
+  let isLocationPin = false;
+  if (message.type === "location" && message.location) {
     // A dropped pin has no media ID to forward by reference the way
     // image/video/audio do (WhatsApp location messages just carry raw
     // coordinates) — so instead of adding a whole parallel attachment
@@ -1023,6 +1074,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
     const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
     const label = [name, address].filter(Boolean).join(", ");
     text = label ? `📍 ${label} (${mapsLink})` : `📍 Location shared: ${mapsLink}`;
+    isLocationPin = true;
   }
 
   console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
@@ -1033,7 +1085,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
     if (AGENT_NOTIFY_NUMBERS.includes(from)) {
       await handleAgentMessage(from, text);
     } else {
-      await handleMessage(from, text, media);
+      await handleMessage(from, text, media, isLocationPin);
     }
   } catch (err) {
     console.error("Error handling message:", err);
@@ -1105,8 +1157,8 @@ async function askLocationQuestion(phone: string, ack: string) {
   const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
   const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
   const prompt = lastLocation
-    ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or just tell me the new location.`
-    : `${ack} Which area or location is this for?`;
+    ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
+    : `${ack} Which area or location is this for? You can also drop a pin 📍 and mention a nearby landmark to help our provider find you — both optional.`;
   await sendMessage(phone, prompt);
   await updateSession(phone, {
     stage: "awaiting_location",
@@ -1185,7 +1237,7 @@ async function proceedAfterMode(
 //   - "instant": skips the date, submitted for agents to find someone ASAP
 //
 // Escalation to a human can happen from any stage — checked first, always.
-async function handleMessage(phone: string, text: string, media?: MediaAttachment) {
+async function handleMessage(phone: string, text: string, media?: MediaAttachment, isLocationPin = false) {
   let session = await getSession(phone);
   const lower = text.toLowerCase();
   const now = Date.now();
@@ -1214,6 +1266,25 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       phone,
       "You're unsubscribed from Hustleapp promos and check-ins. You can still book anytime — just message us here."
     );
+    return;
+  }
+
+  // A dropped pin is an unambiguous "here's the place" signal — capture it
+  // as the booking's location the instant it arrives, even if we happen to
+  // be mid-way through asking about something else (date, description,
+  // special instructions...). Without this, a pin sent to correct an
+  // earlier location mistake — or just sent early, unprompted — silently
+  // gets swallowed into whatever field was in progress instead (this is
+  // what caused a real pin to land under "Special instructions" instead of
+  // "Location" after a customer tried to fix a bad "Somewhere else" entry).
+  // Excludes "awaiting_location" itself (handled directly, in place, below)
+  // and "awaiting_confirmation" (the summary's already been shown by then —
+  // silently rewriting it there would confuse more than it'd help).
+  if (isLocationPin && LOCATION_PIN_CAPTURE_STAGES.includes(session.stage)) {
+    await updateSession(phone, { data: { location: text } });
+    session = await getSession(phone);
+    const resumePrompt = session.data.lastPrompt as string | undefined;
+    await sendMessage(phone, `📍 Got your location noted.${resumePrompt ? ` Still need this though: ${resumePrompt}` : ""}`);
     return;
   }
 
@@ -1847,6 +1918,20 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       ) ||
         ["yes", "yeah", "yep"].includes(trimmedLower) ||
         AFFIRMATIVE_EMOJI.some((e) => text.includes(e)));
+
+    // Rejecting the suggestion without giving a real location ("somewhere
+    // else"), or a non-committal filler ("idk", "anywhere is fine") — either
+    // way, nothing usable has actually been said yet, so ask again instead
+    // of silently storing the phrase as if it were a real place. This is
+    // what let "Location: Somewhere else" through in the first place.
+    if (!wantsSameLocation && (LOCATION_REJECTS_SUGGESTION_RE.test(trimmedLower) || isVagueReply(text))) {
+      const prompt =
+        "No problem — what's the actual area or location for this? You're welcome to drop a pin 📍 and mention a nearby landmark too if that's easier — both optional.";
+      await sendMessage(phone, prompt);
+      await updateSession(phone, { data: { lastPrompt: prompt } });
+      return;
+    }
+
     const location = wantsSameLocation ? (suggestedLastLocation as string) : text;
 
     await updateSession(phone, { data: { location } });
@@ -1980,6 +2065,13 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       await sendMessage(
         phone,
         "Sorry, I don't have that noted from earlier in our chat — could you describe again what you need done?"
+      );
+      return;
+    }
+    if (isVagueReply(text)) {
+      await sendMessage(
+        phone,
+        "Could you be a bit more specific about what you need done? Even a short line helps — e.g. 'fix a leaking pipe under the sink'."
       );
       return;
     }
@@ -2190,6 +2282,22 @@ const ACTIVE_STAGES: ConversationStage[] = [
   "awaiting_description",
   "awaiting_special_instructions",
   "awaiting_confirmation",
+];
+
+// Stages where a dropped pin should be captured as the location immediately
+// even though it isn't the current question — see handleMessage's
+// isLocationPin handling near the top. Excludes "awaiting_location" (already
+// handled in place) and "awaiting_confirmation" (the summary's already been
+// shown by then).
+const LOCATION_PIN_CAPTURE_STAGES: ConversationStage[] = [
+  "awaiting_extraction_confirmation",
+  "awaiting_mode",
+  "awaiting_service_type",
+  "awaiting_date",
+  "awaiting_date_confirmation",
+  "awaiting_extra_details",
+  "awaiting_description",
+  "awaiting_special_instructions",
 ];
 
 function startInactivitySweep() {
@@ -2418,14 +2526,24 @@ async function sendMessage(to: string, body: string) {
 // graceful-failure pattern as sendMessage) — nothing else in the app
 // depends on it succeeding, though the queued notification behind it won't
 // reach the agent until they message the bot some other way.
-async function sendTemplateMessage(to: string, templateName: string, languageCode: string, bodyParam: string) {
+//
+// Returns whether the send actually succeeded, so callers like
+// notifyAgentSmart/notifyCustomerSmart can tell a genuine "reached nobody"
+// failure apart from a normal successful send, and raise a visible alert
+// instead of the failure just disappearing into server logs.
+async function sendTemplateMessage(
+  to: string,
+  templateName: string,
+  languageCode: string,
+  bodyParam: string
+): Promise<boolean> {
   const hasRealCredentials =
     process.env.WHATSAPP_ACCESS_TOKEN &&
     process.env.WHATSAPP_ACCESS_TOKEN !== "from-meta-business-manager";
 
   if (!hasRealCredentials) {
     console.log(`[DRY RUN — would send template "${templateName}" (${languageCode}) to ${to} with param "${bodyParam}"]`);
-    return;
+    return true;
   }
 
   const url = `https://graph.facebook.com/v20.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -2449,7 +2567,9 @@ async function sendTemplateMessage(to: string, templateName: string, languageCod
 
   if (!res.ok) {
     console.error("Failed to send template message:", await res.text());
+    return false;
   }
+  return true;
 }
 
 // Forwards a photo/video/document a customer already sent us, by its
