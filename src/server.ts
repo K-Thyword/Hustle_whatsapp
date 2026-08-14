@@ -20,7 +20,7 @@ import { setMarketingOptIn, isOptedIn, getOptedInPhones } from "./marketing";
 import { createReminder, getAllReminders, markReminderFired } from "./reminders";
 import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
-import { logRequestEvent, logAlert } from "./googleSheet";
+import { logRequestEvent, logAlert, logTranscriptLine } from "./googleSheet";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -282,6 +282,32 @@ async function notifyAgentSmart(agentPhone: string, message: string, summaryLabe
 async function notifyAgents(message: string, summaryLabel: string = "an update") {
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await notifyAgentSmart(number, message, summaryLabel);
+  }
+}
+
+// One unclear reply, a rejected date, a misread service type — any single
+// one of these is normal; people misread questions and fat-finger answers
+// all the time. Several of them in the same booking is a different signal:
+// this customer is actually struggling, not just having one bad moment.
+// Called wherever the bot has to push back on a reply (see the friction
+// points scattered through the stage handlers below) — tracks a per-session
+// count and fires ONE alert per session the moment it crosses the
+// threshold, rather than flooding agents with a ping per event.
+const STRUGGLE_ALERT_THRESHOLD = 2;
+
+async function recordFriction(phone: string): Promise<void> {
+  const session = await getSession(phone);
+  const count = ((session.data.frictionCount as number | undefined) ?? 0) + 1;
+  const alreadyAlerted = Boolean(session.data.strugglingAlertSent);
+  await updateSession(phone, { data: { frictionCount: count } });
+
+  if (count >= STRUGGLE_ALERT_THRESHOLD && !alreadyAlerted) {
+    await updateSession(phone, { data: { strugglingAlertSent: true } });
+    await notifyAgents(
+      `👀 Customer ${phone} might be having trouble booking — ${count} unclear replies so far this session. Worth a quick check-in?\n` +
+        `Reply "${phone}: claim" to jump in directly, or just keep an eye on it.`,
+      "a customer who might need a hand"
+    );
   }
 }
 
@@ -1242,6 +1268,8 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   const lower = text.toLowerCase();
   const now = Date.now();
 
+  await logTranscriptLine(phone, "customer", text || (media ? `[${media.type} attachment]` : ""));
+
   // Flush anything an agent sent while this customer's window was closed
   // (see customerMessaging.ts / notifyCustomerSmart) — their window is
   // confirmed open the moment they message the bot at all, so any queued
@@ -1710,6 +1738,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
             ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?`
             : " Is there something else I can help you find?";
           await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
+          await recordFriction(phone);
           return; // stay at "greeting" — their next message goes through this same path again
         }
         extracted.serviceType = resolved.serviceType ?? extracted.serviceType;
@@ -1881,6 +1910,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I don't have that noted from earlier in our chat — could you tell me again what kind of service you need?"
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1888,6 +1918,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (!resolved.supported) {
       const suggestionText = resolved.suggestion ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?` : " Is there something else I can help you find?";
       await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
+      await recordFriction(phone);
       return; // stay at awaiting_service_type — let them try again
     }
 
@@ -1902,6 +1933,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I don't have a location noted from earlier in our chat — could you tell me again which area this is for?"
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1929,6 +1961,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         "No problem — what's the actual area or location for this? You're welcome to drop a pin 📍 and mention a nearby landmark too if that's easier — both optional.";
       await sendMessage(phone, prompt);
       await updateSession(phone, { data: { lastPrompt: prompt } });
+      await recordFriction(phone);
       return;
     }
 
@@ -1947,6 +1980,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1955,6 +1989,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I didn't quite catch that date — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1987,6 +2022,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1995,6 +2031,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I still didn't catch that clearly — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -2010,6 +2047,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (isNonAnswer(text)) {
       const askedQuestion = (session.data.lastPrompt as string | undefined) ?? "that";
       await sendMessage(phone, `Sorry, I don't have an answer noted for that yet — could you tell me again: ${askedQuestion}`);
+      await recordFriction(phone);
       return;
     }
 
@@ -2066,6 +2104,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I don't have that noted from earlier in our chat — could you describe again what you need done?"
       );
+      await recordFriction(phone);
       return;
     }
     if (isVagueReply(text)) {
@@ -2073,6 +2112,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Could you be a bit more specific about what you need done? Even a short line helps — e.g. 'fix a leaking pipe under the sink'."
       );
+      await recordFriction(phone);
       return;
     }
     const prompt =
@@ -2093,6 +2133,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         "Sorry, I don't have that noted from earlier in our chat — could you let me know directly what you'd like our artisan to pay attention to, or just say 'no' if there isn't anything?"
       );
+      await recordFriction(phone);
       return;
     }
     const SKIP_WORDS = ["no", "none", "nothing", "n/a", "nope", "not really"];
@@ -2129,6 +2170,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     if (!isAffirmative(text) || isNegative(text)) {
       const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
       await sendMessage(phone, `No worries, let's start over. ${prompt}`);
+      await recordFriction(phone);
       await resetForNewRequest(phone);
       await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
       return;
@@ -2478,6 +2520,15 @@ function startReminderSweep() {
 // calling the real API and failing. Lets you test the full conversation
 // flow today without waiting on anything external.
 async function sendMessage(to: string, body: string) {
+  // Every message a customer actually receives, logged for later review —
+  // whether it came from scripted bot logic or an agent's relayed live-chat
+  // reply, since both look identical from the customer's side. Skipped for
+  // agent numbers themselves (those are internal command traffic, not part
+  // of a customer conversation).
+  if (!AGENT_NOTIFY_NUMBERS.includes(to) && to !== BACKUP_AGENT_NUMBER) {
+    await logTranscriptLine(to, "bot", body);
+  }
+
   const hasRealCredentials =
     process.env.WHATSAPP_ACCESS_TOKEN &&
     process.env.WHATSAPP_ACCESS_TOKEN !== "from-meta-business-manager";

@@ -59,6 +59,45 @@ All backend calls (`appApi.ts`) are mocked. Swap in real `fetch()` calls
 to `APP_API_BASE_URL` once the app dev team delivers the endpoints — no
 other file needs to change.
 
+## Visibility: transcripts, alerts, and a weekly review habit
+
+Nobody sees a bot-customer conversation as it happens unless a live chat
+gets escalated and claimed — that's a real blind spot, since it means the
+only way problems surface is someone happening to notice and screenshot
+one. Two things address this, both logged to the Google Sheet (see
+`src/googleSheet.ts` for setup):
+
+- **Transcripts tab** — every message a customer sends, and every message
+  they receive (scripted bot replies and an agent's relayed live-chat
+  replies alike), timestamped per phone number. This is the raw record —
+  reading it is still a manual, periodic thing, not something anyone gets
+  paged for.
+- **Real-time struggle alerts** — if a customer hits 2 or more "the bot
+  had to push back on that reply" moments in the same booking (a vague
+  answer, a rejected date, a location that didn't make sense), agents get
+  a WhatsApp alert once per session: *"Customer might be having trouble
+  booking — worth a quick check-in?"* This only catches struggle patterns
+  already built into the bot's checks — it won't flag a genuinely new kind
+  of confusion the first time it happens. That's what the transcript
+  review below is for.
+- **Delivery-failure alerts** — separately, if a notification to an agent
+  or customer never reaches anyone (WhatsApp window closed and the
+  fallback template also failed), that's logged as an `ALERT` row too.
+
+**Standing habit: a weekly pass over the sheet.** Once a week, skim the
+Transcripts tab for the last several days — specifically conversations
+that ended abruptly, looped, or show a struggle alert — plus any `ALERT`
+rows in the event log. The goal isn't to read everything; it's to catch
+patterns a single test conversation wouldn't reveal (the same confusing
+question tripping up multiple customers, a service type people keep
+asking for that isn't supported, a stage where people commonly abandon).
+Turn what you find into concrete fixes the same way every fix in this
+project has happened so far — bring specific examples, and they get
+root-caused and fixed as their own change, not batched into something
+vague. This is the realistic version of the bot "getting smarter": a
+short, repeatable, human-reviewed cycle backed by real conversation data,
+not an autonomous system quietly rewriting its own rules.
+
 ## Testing without a real phone
 
 You can simulate an inbound message by POSTing to `/webhook` directly with

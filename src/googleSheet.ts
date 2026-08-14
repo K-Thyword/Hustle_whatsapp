@@ -27,6 +27,12 @@
 //          the JSON key, kept as one line with \n for line breaks>
 //   5. First row of the sheet (headers), optional but recommended:
 //        Timestamp | Reference | Event | Customer | Service | Location | Detail
+//   6. For full conversation transcripts (see logTranscriptLine below), add
+//      a SECOND tab to the same spreadsheet named exactly "Transcripts",
+//      with header row: Timestamp | Phone | Direction | Message
+//      (kept on its own tab, not mixed into Sheet1's event log, since it's
+//      a much higher-volume, different-shaped stream — every message, not
+//      just lifecycle events)
 
 import { google } from "googleapis";
 
@@ -131,5 +137,39 @@ export async function logAlert(message: string): Promise<void> {
     });
   } catch (err) {
     console.error("Failed to append alert to Google Sheet log:", err);
+  }
+}
+
+// The actual back-and-forth of a conversation — not just the discrete
+// lifecycle events logRequestEvent captures. Without this, nobody but the
+// customer (and a live-chat agent, once one's claimed) ever sees what was
+// actually said; every bug found so far this project came from someone
+// manually screenshotting a test conversation, not from the system
+// surfacing anything on its own. "bot" direction covers everything the
+// customer receives — scripted bot replies AND an agent's relayed live-chat
+// messages alike, since from the customer's side of the phone it's all
+// just "Hustleapp" either way.
+export type TranscriptDirection = "customer" | "bot";
+
+export async function logTranscriptLine(phone: string, direction: TranscriptDirection, text: string): Promise<void> {
+  if (!text) return;
+  const client = getClient();
+  const row = [new Date().toISOString(), phone, direction, text];
+
+  if (!client) {
+    console.log("[Transcript log DRY RUN]", row);
+    return;
+  }
+
+  try {
+    await client.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Transcripts!A:D",
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] },
+    });
+  } catch (err) {
+    // Never let a logging failure break the actual customer/agent flow.
+    console.error("Failed to append to Transcripts sheet log:", err);
   }
 }
