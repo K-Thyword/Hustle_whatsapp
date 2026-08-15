@@ -8,9 +8,16 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { getRequests, getAlerts, getAgentStats, RequestSummary } from "./sheetsData";
 
-const hasRealKey =
-  process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== "from-console.anthropic.com";
-const anthropic = hasRealKey ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+// .trim() matters here: a key pasted into Railway's variable field with a
+// trailing newline or space (easy to do when copying a whole line from a
+// terminal or text file) passes this "is it configured" check fine, but
+// then makes Anthropic's client throw "is not a legal HTTP header value"
+// on every request, since raw newlines aren't allowed in HTTP headers —
+// confirmed live: the key looked right, was genuinely present, and still
+// failed until trimmed.
+const rawKey = process.env.ANTHROPIC_API_KEY?.trim();
+const hasRealKey = Boolean(rawKey) && rawKey !== "from-console.anthropic.com";
+const anthropic = hasRealKey ? new Anthropic({ apiKey: rawKey }) : null;
 
 function computedSummary(requests: RequestSummary[], sinceIso: string, alertCount: number): string {
   const inWindow = requests.filter((r) => r.submittedAt >= sinceIso);
