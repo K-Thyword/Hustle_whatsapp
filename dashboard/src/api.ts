@@ -10,6 +10,7 @@ import {
   sheetsConfigured,
 } from "./sheetsData";
 import { generateWeeklyDigest } from "./digest";
+import { sendDigestToAgents, whatsappConfigured } from "./whatsapp";
 
 export const api = Router();
 
@@ -64,4 +65,16 @@ api.get("/agents", async (_req: Request, res: Response) => {
 // --- Reports tab ---
 api.get("/digest", async (_req: Request, res: Response) => {
   res.json(await generateWeeklyDigest());
+});
+
+api.get("/digest/whatsapp-status", (_req: Request, res: Response) => {
+  res.json({ configured: whatsappConfigured() });
+});
+
+// Manual trigger, mainly for verifying the WhatsApp send actually works
+// without waiting for the Monday 8am scheduled run.
+api.post("/digest/send-now", async (_req: Request, res: Response) => {
+  const { text } = await generateWeeklyDigest();
+  const result = await sendDigestToAgents(text);
+  res.json(result);
 });

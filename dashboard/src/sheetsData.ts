@@ -272,14 +272,22 @@ export async function getOverview(sinceMs: number, windowLabel: string): Promise
     byService[r.serviceType] = (byService[r.serviceType] ?? 0) + 1;
   }
 
+  const alertsInWindow = alerts.filter((a) => a.timestamp >= since);
+  // No dedicated "alert type" column in the sheet — struggle alerts and
+  // delivery failures both land as plain ALERT rows, distinguished only by
+  // their message text. Matching on the fixed phrase recordFriction() uses
+  // in server.ts is good enough for a KPI count without needing a schema
+  // change.
+  const strugglingConversations = alertsInWindow.filter((a) => a.message.includes("having trouble booking")).length;
+
   return {
     windowLabel,
     submitted: inWindow.length,
     completed: inWindow.filter((r) => r.status === "completed" || r.status === "reviewed").length,
     cancelled: inWindow.filter((r) => r.status === "cancelled").length,
     open: requests.filter((r) => r.isOpen).length, // all-time open, not just this window
-    alerts: alerts.filter((a) => a.timestamp >= since).length,
-    strugglingConversations: 0, // struggle alerts flow through notifyAgents (WhatsApp), not the Sheet — see README
+    alerts: alertsInWindow.length,
+    strugglingConversations,
     byService,
   };
 }

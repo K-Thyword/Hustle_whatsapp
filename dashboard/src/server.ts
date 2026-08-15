@@ -4,6 +4,7 @@ import session from "express-session";
 import path from "path";
 import { requireAuth, checkPassword, isConfigured } from "./auth";
 import { api } from "./api";
+import { startWeeklyDigestScheduler } from "./scheduler";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -55,4 +56,5 @@ app.listen(PORT, () => {
   if (!isConfigured()) {
     console.warn("ADMIN_DASHBOARD_PASSWORD is not set — nobody can log in until it is.");
   }
+  startWeeklyDigestScheduler();
 });

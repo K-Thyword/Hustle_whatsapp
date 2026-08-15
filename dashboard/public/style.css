@@ -49,8 +49,10 @@ body {
 .nav-item:hover { background: rgba(255, 255, 255, 0.08); }
 .nav-item.active { background: var(--primary); color: white; }
 .nav-item.logout { margin-top: auto; opacity: 0.7; }
+.sidebar-updated { font-size: 11px; color: rgba(215, 228, 217, 0.5); padding: 4px 12px 0; }
 
 .content { flex: 1; padding: 28px 32px; max-width: 1100px; }
+.table-wrap { overflow-x: auto; }
 
 h1 { font-size: 22px; margin: 0 0 4px; }
 h2 { font-size: 16px; margin: 24px 0 12px; }
@@ -90,6 +92,12 @@ tr:last-child td { border-bottom: none; }
 .badge-closed { background: #eee; color: var(--text-muted); }
 .badge-cancelled { background: #fbe9e7; color: var(--danger); }
 .badge-alert { background: #fdecea; color: var(--danger); }
+
+.req-row:hover { background: #fafbf9; }
+.expand-arrow { width: 20px; color: var(--text-muted); }
+.req-timeline td { background: #fafbf9; padding: 12px 12px 12px 34px; }
+.timeline { display: flex; flex-direction: column; gap: 6px; }
+.timeline-item { font-size: 13px; }
 
 .filters { display: flex; gap: 8px; margin-bottom: 12px; }
 select, input[type="text"], input[type="search"] {
@@ -158,4 +166,30 @@ button.refresh {
   font-size: 12px;
   cursor: pointer;
   color: var(--text-muted);
+}
+
+/* Mobile: sidebar becomes a horizontally-scrollable top bar instead of a
+   left column, tables scroll instead of overflowing the screen, and the
+   Chats two-column layout stacks so the thread isn't squeezed to nothing. */
+@media (max-width: 768px) {
+  .app { flex-direction: column; }
+  .sidebar {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    padding: 10px 12px;
+    gap: 4px;
+  }
+  .brand { padding: 0 12px 0 0; flex-shrink: 0; }
+  .nav-item { white-space: nowrap; margin-bottom: 0; }
+  .nav-item.logout { margin-top: 0; margin-left: auto; }
+  .sidebar-updated { display: none; }
+  .content { padding: 16px; max-width: 100%; }
+  .kpi-row { flex-direction: column; }
+  .kpi-card { min-width: 0; }
+  .two-col { flex-direction: column; }
+  .conv-list { width: 100%; max-height: 220px; }
+  .thread { max-height: 400px; }
+  .chart-wrap { max-width: 100%; }
 }

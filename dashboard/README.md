@@ -9,7 +9,7 @@ Six tabs:
 - **Alerts** — delivery failures (agent/customer notifications that never actually arrived).
 - **Chats** — browse or search every logged conversation (Transcripts tab), same data used for the weekly manual review.
 - **Agents** — workload per agent, derived from who claimed each request.
-- **Reports** — an AI-written (or, without an Anthropic key, plainly computed) weekly summary, viewable anytime — the same content planned to also go out over WhatsApp eventually.
+- **Reports** — an AI-written (or, without an Anthropic key, plainly computed) weekly summary, viewable anytime, and (once the WhatsApp variables below are set) sent automatically to every agent in `AGENT_NOTIFY_NUMBERS` every Monday at 8am.
 
 ## Local development
 
@@ -33,8 +33,26 @@ Visit `http://localhost:3001`.
 | `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | **Same value** as the bot service's env var — copy it over. |
 | `AGENT_NAMES` | **Same value** as the bot service's env var — copy it over. Used to label the Agents tab and "claimed by" column with names instead of raw numbers. |
 | `ANTHROPIC_API_KEY` | Optional. **Same value** as the bot service's env var. Without it, Reports still works, just with a plain computed summary instead of an AI-written one. |
+| `WHATSAPP_ACCESS_TOKEN` | Optional — for the automatic Monday digest send. **Same value** as the bot service's env var. |
+| `WHATSAPP_PHONE_NUMBER_ID` | Optional — same as above. **Same value** as the bot service's env var. |
+| `AGENT_NOTIFY_NUMBERS` | Optional — same as above. **Same value** as the bot service's env var (comma-separated, digits only, no `+`). |
+| `WEEKLY_DIGEST_TEMPLATE_NAME` | Optional, defaults to `hustle_weekly_digest`. Must exist and be **approved** in Meta Business Manager first — see below. |
+| `WEEKLY_DIGEST_TEMPLATE_LANGUAGE` | Optional, defaults to `en_US`. Must exactly match the language you pick when creating the template in Meta. |
 
-These are all **read from the same Google Sheet the bot already writes to** — nothing new to set up in Google Cloud, just copy four values across.
+Everything except the WhatsApp send is **read from the same Google Sheet the bot already writes to** — nothing new to set up in Google Cloud, just copy values across.
+
+### Setting up the weekly WhatsApp send (optional)
+
+The digest is sent as a WhatsApp **template** message (not a plain message) specifically so it goes out reliably regardless of whether an agent's 24h conversation window happens to be open that Monday morning — templates are the one message type Meta allows outside that window.
+
+1. In Meta Business Manager → WhatsApp Manager → Message Templates, create a new template:
+   - Name: `hustle_weekly_digest`
+   - Category: **Utility**
+   - Language: **English (US)** (this is `en_US` — picking plain "English" gives a different language code and will fail to send, the same gotcha documented in the bot's own README)
+   - Body: one variable, e.g. `Hustleapp weekly summary: {{1}}`
+2. Submit it for approval (usually takes minutes to a few hours).
+3. Once approved, add the 5 variables above (`WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `AGENT_NOTIFY_NUMBERS`, and the two template ones if you didn't use the defaults) to this service on Railway.
+4. On the Reports tab, use the **"Send now"** button to confirm delivery works without waiting for Monday.
 
 ## Deploying on Railway (as a second service in the same project)
 

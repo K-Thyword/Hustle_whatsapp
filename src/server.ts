@@ -308,6 +308,12 @@ async function recordFriction(phone: string): Promise<void> {
         `Reply "${phone}: claim" to jump in directly, or just keep an eye on it.`,
       "a customer who might need a hand"
     );
+    // The WhatsApp ping above is real-time, but it's also fire-and-forget —
+    // nothing records that this happened anywhere durable. Log it the same
+    // way a delivery failure is logged, so it shows up on the dashboard's
+    // Alerts tab and Overview count too, not just as a message an agent may
+    // have since scrolled past.
+    await logAlert(`Customer ${phone} might be having trouble booking — ${count} unclear replies so far this session.`);
   }
 }
 
