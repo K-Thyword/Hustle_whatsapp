@@ -1011,6 +1011,28 @@ function isVagueReply(text: string): boolean {
 const LOCATION_REJECTS_SUGGESTION_RE =
   /^((somewhere|some\s*where)\s+else|(a\s+)?different\s+(place|location|area)|another\s+(place|location|area)|not\s+(there|that|the\s+same)|elsewhere)$/i;
 
+// A customer referring to a previous job's location without restating it —
+// "my usual place", "the same spot", "usual address" — rather than a new
+// location or a rejection of a suggested one (that's LOCATION_REJECTS_
+// SUGGESTION_RE, above). Deliberately NOT anchored to the whole message
+// (unlike the two regexes above) since this phrase is typically just one
+// clause inside a longer opening message, e.g. "plumber at my usual place
+// on Friday" — it needs to match as a substring there.
+const USUAL_PLACE_RE = /\b(my|the|our)?\s*(usual|regular|same|normal)\s+(place|location|spot|address)\b/i;
+
+// Shared by askLocationQuestion and the opening-message "usual place"
+// resolution below — a past booking saved before the location-vagueness
+// fixes existed could have junk stored as its location (e.g. "Somewhere
+// else"), so both callers need the same filtering rather than trusting the
+// most recent booking's location blindly.
+function getValidLastLocation(pastBookings: PastBooking[]): string | undefined {
+  const raw = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
+  if (!raw) return undefined;
+  const trimmedLower = raw.trim().toLowerCase();
+  if (LOCATION_REJECTS_SUGGESTION_RE.test(trimmedLower) || isVagueReply(raw)) return undefined;
+  return raw;
+}
+
 function isSameCalendarDay(a: Date, b: Date): boolean {
   return (
     a.getUTCFullYear() === b.getUTCFullYear() &&
@@ -1181,21 +1203,7 @@ async function beginJobDetails(phone: string) {
 async function askLocationQuestion(phone: string, ack: string) {
   const session = await getSession(phone);
   const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-  const rawLastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
-
-  // A past booking saved before the location-vagueness fixes existed could
-  // have a junk value stored as its location (e.g. "Somewhere else" — see
-  // the LOCATION_REJECTS_SUGGESTION_RE/isVagueReply checks in the
-  // awaiting_location handler). Suggesting THAT back as "same as last
-  // time" is worse than not suggesting anything — it produces nonsense
-  // like "Is this for Somewhere else again, or somewhere else?" — so treat
-  // a garbage stored value the same as having no last location at all.
-  const lastLocation =
-    rawLastLocation &&
-    !LOCATION_REJECTS_SUGGESTION_RE.test(rawLastLocation.trim().toLowerCase()) &&
-    !isVagueReply(rawLastLocation)
-      ? rawLastLocation
-      : undefined;
+  const lastLocation = getValidLastLocation(pastBookings);
 
   const prompt = lastLocation
     ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
@@ -1774,6 +1782,20 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
           return; // stay at "greeting" — their next message goes through this same path again
         }
         extracted.serviceType = resolved.serviceType ?? extracted.serviceType;
+      }
+
+      // extractBookingDetails deliberately never invents a location for
+      // "my usual place" — it has no way to know what that place actually
+      // is. But we do, if they've booked before: resolve it against their
+      // last valid location so the confirmation step shows the real
+      // address in one go, instead of the bot asking "which area is this
+      // for?" right after appearing to already understand "your usual
+      // place" in its own opening acknowledgment (confirmed live — that
+      // mismatch is exactly what made a repeat conversation feel like the
+      // bot wasn't listening). No history to resolve against — leave it
+      // unset and ask normally, same as today.
+      if (!extracted.location && USUAL_PLACE_RE.test(text)) {
+        extracted.location = getValidLastLocation(pastBookings);
       }
 
       if (extracted.serviceType || extracted.location) {
