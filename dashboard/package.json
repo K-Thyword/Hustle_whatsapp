@@ -1,0 +1,25 @@
+{
+  "name": "hustleapp-dashboard",
+  "version": "0.1.0",
+  "description": "Read-only ops dashboard over the Hustleapp WhatsApp bot's Google Sheet log (requests, alerts, transcripts, agent workload, weekly digest). Deployed as its own Railway service so it can never affect the live bot.",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "googleapis": "^174.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/express-session": "^1.18.0",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

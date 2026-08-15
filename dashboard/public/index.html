@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hustleapp Dashboard</title>
+<link rel="stylesheet" href="/style.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="app">
+    <nav class="sidebar">
+      <div class="brand">Hustleapp</div>
+      <button class="nav-item active" data-tab="overview">Overview</button>
+      <button class="nav-item" data-tab="requests">Requests</button>
+      <button class="nav-item" data-tab="alerts">Alerts</button>
+      <button class="nav-item" data-tab="chats">Chats</button>
+      <button class="nav-item" data-tab="agents">Agents</button>
+      <button class="nav-item" data-tab="reports">Reports</button>
+      <button id="logoutBtn" class="nav-item logout">Sign out</button>
+    </nav>
+    <main class="content">
+      <div id="sheetsWarning" class="banner hidden">
+        Google Sheets isn't configured on this service yet — showing empty data. Add GOOGLE_SHEETS_ID,
+        GOOGLE_SERVICE_ACCOUNT_EMAIL, and GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY to this service's environment.
+      </div>
+      <div id="tab-content"></div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
