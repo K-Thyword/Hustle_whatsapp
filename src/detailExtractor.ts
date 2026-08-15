@@ -18,6 +18,7 @@ import Anthropic from "@anthropic-ai/sdk";
 export interface ExtractedBookingDetails {
   serviceType?: string; // short, as the customer would say it — e.g. "painter"
   location?: string; // e.g. "Ho, Volta Region"
+  datePhrase?: string; // the date reference AS STATED, e.g. "Friday", "next Monday" — not a computed date, see below
 }
 
 const hasRealKey =
@@ -29,12 +30,15 @@ const SYSTEM_PROMPT = `Extract booking details a customer already stated when as
 Only fill in a field if it is clearly and explicitly stated in the message — never guess, infer, or pad from vague wording. If something isn't clearly there, omit it.
 
 Respond with strict JSON only, nothing else, no markdown formatting:
-{"serviceType": "string, omit if not stated", "location": "string, omit if not stated"}
+{"serviceType": "string, omit if not stated", "location": "string, omit if not stated", "datePhrase": "string, omit if not stated"}
+
+datePhrase: copy the date reference exactly as the customer wrote it (e.g. "Friday", "next Monday", "the 20th", "tomorrow") — do NOT compute or normalize it into an actual date yourself, that happens separately. This matters even when the date is just one clause in a longer sentence about something else entirely — don't skip it just because the message is mostly about the service or location.
 
 Examples:
 "I need a painter to paint my room, I am in Ho, Volta Region, can I get anyone?" -> {"serviceType": "painter", "location": "Ho, Volta Region"}
 "can I book a hairdresser" -> {"serviceType": "hairdresser"}
 "I need a plumber in Accra" -> {"serviceType": "plumber", "location": "Accra"}
+"i want a plumber at my usual place on Friday" -> {"serviceType": "plumber", "datePhrase": "Friday"}
 "is this Hustleapp" -> {}
 "hi, are you guys open" -> {}`;
 
@@ -65,6 +69,9 @@ export async function extractBookingDetails(message: string): Promise<ExtractedB
     }
     if (typeof parsed.location === "string" && parsed.location.trim()) {
       result.location = parsed.location.trim();
+    }
+    if (typeof parsed.datePhrase === "string" && parsed.datePhrase.trim()) {
+      result.datePhrase = parsed.datePhrase.trim();
     }
     return result;
   } catch (err) {

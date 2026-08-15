@@ -996,7 +996,7 @@ function isNonAnswer(text: string): boolean {
 // yet." Anchored to the whole trimmed message so it never matches a real,
 // substantive answer that merely contains one of these words/phrases.
 const VAGUE_REPLY_RE =
-  /^((i\s+)?(don'?t\s+know|dunno|idk|not\s+sure|unsure|no\s+idea)|(any\s*where|some\s*where)(\s+(is\s+)?(fine|ok(ay)?|good|works))?|(you|whatever\s+you)\s+(decide|choose|pick)|whatever|anything(\s+(is\s+)?(fine|ok(ay)?|good))?|(any|either)(\s+(one|place|location))?(\s+(is\s+)?(fine|ok(ay)?|good))?)$/i;
+  /^((i\s+)?(don'?t\s+know|dunno|idk|not\s+sure|unsure|no\s+idea)|(any\s*where|some\s*where)(\s+(is\s+)?(fine|ok(ay)?|good|works))?|(you|whatever\s+you)\s+(decide|choose|pick)|whatever|anything(\s+(is\s+)?(fine|ok(ay)?|good))?|(any|either)(\s+(one|place|location))?(\s+(is\s+)?(fine|ok(ay)?|good))?|huh\??|wha+t\??|eh\??|hmm+|nothing|n\/?a)$/i;
 
 function isVagueReply(text: string): boolean {
   return VAGUE_REPLY_RE.test(text.trim().toLowerCase());
@@ -1181,7 +1181,22 @@ async function beginJobDetails(phone: string) {
 async function askLocationQuestion(phone: string, ack: string) {
   const session = await getSession(phone);
   const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-  const lastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
+  const rawLastLocation = pastBookings.length > 0 ? pastBookings[pastBookings.length - 1].location : undefined;
+
+  // A past booking saved before the location-vagueness fixes existed could
+  // have a junk value stored as its location (e.g. "Somewhere else" — see
+  // the LOCATION_REJECTS_SUGGESTION_RE/isVagueReply checks in the
+  // awaiting_location handler). Suggesting THAT back as "same as last
+  // time" is worse than not suggesting anything — it produces nonsense
+  // like "Is this for Somewhere else again, or somewhere else?" — so treat
+  // a garbage stored value the same as having no last location at all.
+  const lastLocation =
+    rawLastLocation &&
+    !LOCATION_REJECTS_SUGGESTION_RE.test(rawLastLocation.trim().toLowerCase()) &&
+    !isVagueReply(rawLastLocation)
+      ? rawLastLocation
+      : undefined;
+
   const prompt = lastLocation
     ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
     : `${ack} Which area or location is this for? You can also drop a pin 📍 and mention a nearby landmark to help our provider find you — both optional.`;
@@ -1715,10 +1730,27 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
       // those out and confirm them explicitly before moving on, so the
       // bot never re-asks for something already said, and never silently
       // assumes it understood something it didn't.
-      const [extracted, dateAttempt] = await Promise.all([
+      const [extracted, wholeMessageDateAttempt] = await Promise.all([
         extractBookingDetails(text),
         interpretDate(text, new Date()),
       ]);
+
+      // interpretDate on the FULL opening message can miss a date that's
+      // just one clause in a longer, multi-topic sentence — its system
+      // prompt expects the message to be mainly ABOUT a date, so it
+      // under-extracts when it isn't (confirmed live: "I want a plumber at
+      // my usual place on Friday" came back with no date at all, even
+      // though the AI acknowledgment elsewhere in the same turn clearly
+      // understood "Friday" just fine — the extraction step just wasn't
+      // asked to look for it the right way). extractBookingDetails is
+      // already tuned for pulling specific spans out of a longer message,
+      // so when it caught an explicit date phrase but the whole-message
+      // pass came up empty, give interpretDate a second, focused try on
+      // just that phrase instead of giving up on the date entirely.
+      const dateAttempt =
+        wholeMessageDateAttempt.status !== "valid" && extracted.datePhrase
+          ? await interpretDate(extracted.datePhrase, new Date())
+          : wholeMessageDateAttempt;
       const extractedDateHuman = dateAttempt.status === "valid" ? dateAttempt.humanReadable : undefined;
       const extractedDateIso = dateAttempt.status === "valid" ? dateAttempt.isoDate : undefined;
       const extractedMode: BookingMode | undefined = extractedDateHuman
@@ -1851,6 +1883,23 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   }
 
   if (session.stage === "awaiting_mode") {
+    // The one stage in this flow that never checked for a deflection back
+    // to something already said — a customer replying "I mentioned the
+    // date already" or "I said Friday here" just fell through to the
+    // generic "let's make sure I've got this right" bounce below, which
+    // doesn't acknowledge the deflection at all and can loop the exact
+    // same question back at them more than once. Handled the same way
+    // every other stage handles it: say plainly that it isn't recoverable
+    // from here, and ask them to just restate it directly.
+    if (isNonAnswer(text)) {
+      await sendMessage(
+        phone,
+        "Sorry, I don't have that noted from earlier in our chat — could you just tell me directly: a specific date, or right away? Reply 'schedule' or 'instant', or send the date."
+      );
+      await recordFriction(phone);
+      return;
+    }
+
     if (lower.includes("instant")) {
       await proceedAfterMode(phone, "instant");
       return;
@@ -1883,6 +1932,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
         phone,
         `${dateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward, or say 'instant' if you need it right away?`
       );
+      await recordFriction(phone);
       return;
     }
 
@@ -1901,6 +1951,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
     }
 
     await sendMessage(phone, `Sorry, just to make sure I've got this right — ${reminder}`);
+    await recordFriction(phone);
     return;
   }
 

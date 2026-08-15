@@ -44,13 +44,26 @@ const isConfigured = Boolean(SHEET_ID && SERVICE_ACCOUNT_EMAIL && SERVICE_ACCOUN
 
 let sheetsClient: ReturnType<typeof google.sheets> | null = null;
 
+// The single most common way this env var arrives broken: someone copies
+// the private_key field straight out of the downloaded JSON key file
+// INCLUDING the surrounding double quotes (those are JSON string
+// delimiters, not part of the actual key) — OpenSSL then fails with an
+// opaque "DECODER routines::unsupported" error that gives no hint what's
+// actually wrong. Stripped defensively here so that one common mistake
+// doesn't need a round trip to notice.
+function normalizePrivateKey(raw: string): string {
+  let key = raw.trim();
+  if (key.startsWith('"') && key.endsWith('"')) key = key.slice(1, -1);
+  return key.replace(/\\n/g, "\n");
+}
+
 function getClient() {
   if (!isConfigured) return null;
   if (sheetsClient) return sheetsClient;
 
   const auth = new google.auth.JWT({
     email: SERVICE_ACCOUNT_EMAIL,
-    key: (SERVICE_ACCOUNT_PRIVATE_KEY as string).replace(/\\n/g, "\n"),
+    key: normalizePrivateKey(SERVICE_ACCOUNT_PRIVATE_KEY as string),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
