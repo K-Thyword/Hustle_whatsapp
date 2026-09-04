@@ -2003,7 +2003,24 @@ async function handleMessage(
     const reminder = "Would you like this done on a specific date, or right away? Reply 'schedule' or 'instant'.";
 
     if (routed.intent === "question" && routed.reply) {
-      await sendMessage(phone, `${routed.reply}\n\nAnd just to continue — ${reminder}`);
+      // Only tack the reminder onto the FIRST deflection. Without this
+      // cap, every follow-up question for the rest of the conversation —
+      // even ones with nothing to do with booking, like someone asking
+      // about a promo post — got "And just to continue — would you like
+      // this done on a specific date" bolted onto the end forever, which
+      // reads as the bot not actually listening. Once someone's asked a
+      // second unrelated question, they've made it clear they're not
+      // ready to answer that yet; they can still say "schedule"/"instant"
+      // whenever they are, since this stage keeps checking for that above
+      // on every message regardless.
+      const deflections = ((session.data.modeDeflectionCount as number | undefined) ?? 0) + 1;
+      await updateSession(phone, { data: { modeDeflectionCount: deflections } });
+
+      if (deflections === 1) {
+        await sendMessage(phone, `${routed.reply}\n\nAnd just to continue — ${reminder}`);
+      } else {
+        await sendMessage(phone, routed.reply);
+      }
       return;
     }
 

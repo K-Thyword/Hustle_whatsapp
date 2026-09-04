@@ -77,7 +77,8 @@ We don't have live status tracking yet, so if they ask for a status update on a 
 This customer just started this conversation by tapping "Send Message" on one of your ${
       context.referral.sourceType === "post" ? "posts" : "ads"
     } on Facebook/Instagram. What that post/ad said: "${postText}"
-If it's natural, acknowledge what they clicked on in your reply (e.g. "Saw you came from our post about X!") rather than treating them like a cold opener — but don't force it if their actual message already makes clear what they want regardless.`;
+If it's natural, acknowledge what they clicked on in your reply (e.g. "Saw you came from our post about X!") rather than treating them like a cold opener — but don't force it if their actual message already makes clear what they want regardless.
+IMPORTANT for classification: a vague opener right after clicking through — "can I get more info on this?", "tell me more", "is this still available?", "what's this about?" — is almost always asking about THIS SPECIFIC post/ad, not stating booking intent, even though the post might be about a service. Classify these as "question" (answer using what the post/ad said above, plus business info) unless they ALSO name an actual service/need of their own (e.g. "can I get more info, I need a plumber" — that part IS booking_intent). Jumping straight into "would you like this scheduled or instant" for someone who only asked about your post is a real, confusing failure mode — don't do it.`;
   }
 
   let postsSection = "";
