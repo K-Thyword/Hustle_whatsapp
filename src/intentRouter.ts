@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { BUSINESS_INFO } from "./businessInfo";
+import { getRecentPosts, PostEntry, MessageReferral } from "./googleSheet";
 
 // Decides how to respond to a message that isn't yet mid-way through a
 // structured booking step (i.e. the customer's opener, or an interruption
@@ -36,6 +37,10 @@ export interface ConversationContext {
     submittedAt: number;
   }[];
   recentMessages: string[];
+  // Present only when this message is the one that opened the conversation
+  // via a tap on a Facebook/Instagram ad or boosted post — see server.ts's
+  // webhook handler for where this comes from.
+  referral?: MessageReferral;
 }
 
 const hasRealKey =
@@ -43,7 +48,7 @@ const hasRealKey =
 
 const anthropic = hasRealKey ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
-function buildSystemPrompt(context?: ConversationContext): string {
+function buildSystemPrompt(context?: ConversationContext, recentPosts: PostEntry[] = []): string {
   let historySection = "";
   if (context && (context.pastBookings.length > 0 || context.recentMessages.length > 0)) {
     const bookingLines = context.pastBookings
@@ -64,6 +69,28 @@ ${context.recentMessages.length > 0 ? `\nRecent messages from them:\n${messageLi
 We don't have live status tracking yet, so if they ask for a status update on a specific booking, acknowledge the booking by its details/reference and suggest saying "agent" so a human can check on it — don't invent a status.`;
   }
 
+  let referralSection = "";
+  if (context?.referral && (context.referral.headline || context.referral.body)) {
+    const postText = [context.referral.headline, context.referral.body].filter(Boolean).join(" — ");
+    referralSection = `
+
+This customer just started this conversation by tapping "Send Message" on one of your ${
+      context.referral.sourceType === "post" ? "posts" : "ads"
+    } on Facebook/Instagram. What that post/ad said: "${postText}"
+If it's natural, acknowledge what they clicked on in your reply (e.g. "Saw you came from our post about X!") rather than treating them like a cold opener — but don't force it if their actual message already makes clear what they want regardless.`;
+  }
+
+  let postsSection = "";
+  if (recentPosts.length > 0) {
+    const postLines = recentPosts
+      .map((p) => `- [${p.date || "recent"}, ${p.platform || "social"}] ${p.summary}`)
+      .join("\n");
+    postsSection = `
+
+Recent posts/promotions (use this to answer questions like "is the offer from your post still on?" or "what was that thing you posted about?" — if none of these match what they're asking about, say you're not sure rather than guessing):
+${postLines}`;
+  }
+
   return `You are the WhatsApp assistant for Hustleapp, a marketplace connecting customers with artisans and professional service providers (not sellers of physical goods) — things like plumbers, electricians, carpenters, mechanics, hairdressers, chefs, accountants, lawyers, tutors, homecare nurses, and similar trades common in Ghana.
 
 Classify the customer's message into exactly one of these:
@@ -74,7 +101,7 @@ Classify the customer's message into exactly one of these:
 
 Then write a natural "reply" as a friendly, switched-on human support agent chatting on WhatsApp — never a corporate script, never a stale fixed line. Ground rules for the reply, depending on intent:
 
-- "question": answer it directly and helpfully using ONLY the business info below (if it's a greeting+question combo like "Hi, are you open?", acknowledge the greeting warmly in the same breath as answering). If the info below doesn't cover it, say you're not sure and suggest they ask a human — never invent details. Do NOT ask whether they want this scheduled or done right away — that's handled separately.
+- "question": answer it directly and helpfully using ONLY the business info (and, if relevant, the recent posts/promotions list) below (if it's a greeting+question combo like "Hi, are you open?", acknowledge the greeting warmly in the same breath as answering). If the info below doesn't cover it, say you're not sure and suggest they ask a human — never invent details. Do NOT ask whether they want this scheduled or done right away — that's handled separately.
 - "booking_intent": reply should be ONLY a short, warm acknowledgment of what they need (e.g. "Sure, happy to help you find a plumber!") — do NOT ask about date/timing yourself, and do NOT ask them to reply 'schedule' or 'instant' — the app adds that question separately right after your reply. Also do NOT state or imply what you'll ask them next (e.g. don't say "just need a quick description" or "let me get your location") and do NOT claim to have captured specific details yourself, even ones they mentioned (e.g. don't say "at your usual place" or "for Friday") — a separate step confirms exactly what was understood right after your reply, and your reply promising something different from what that step actually asks is exactly the kind of mismatch that makes the conversation feel broken. Keep it to the acknowledgment only.
 - "greeting": a warm welcome plus an open question inviting them to say what they need help with today. Don't assume they want to book yet.
 - "other": a brief, friendly line inviting them to clarify what they need help with.
@@ -90,6 +117,8 @@ Other style rules:
 Business info:
 ${BUSINESS_INFO}
 ${historySection}
+${postsSection}
+${referralSection}
 
 Respond with strict JSON only, nothing else, no markdown formatting:
 {"intent": "question" | "booking_intent" | "greeting" | "other", "reply": "string"}`;
@@ -104,10 +133,11 @@ export async function routeIntent(message: string, context?: ConversationContext
   }
 
   try {
+    const recentPosts = await getRecentPosts();
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 400,
-      system: buildSystemPrompt(context),
+      system: buildSystemPrompt(context, recentPosts),
       messages: [{ role: "user", content: message }],
     });
 

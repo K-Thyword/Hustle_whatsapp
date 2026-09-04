@@ -20,7 +20,7 @@ import { setMarketingOptIn, isOptedIn, getOptedInPhones } from "./marketing";
 import { createReminder, getAllReminders, markReminderFired } from "./reminders";
 import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
-import { logRequestEvent, logAlert, logTranscriptLine } from "./googleSheet";
+import { logRequestEvent, logAlert, logTranscriptLine, logReferral, MessageReferral } from "./googleSheet";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1131,7 +1131,25 @@ app.post("/webhook", async (req: Request, res: Response) => {
     isLocationPin = true;
   }
 
-  console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}`);
+  // Present only on the message that opened this conversation, when the
+  // customer got here by tapping "Send Message" on a Facebook/Instagram ad
+  // or a boosted post — Meta attaches it automatically, nothing on our end
+  // triggers it. Used to make the opening reply acknowledge what they
+  // clicked on instead of a generic greeting, and logged for attribution
+  // (see logReferral in googleSheet.ts).
+  const referral: MessageReferral | undefined = message.referral
+    ? {
+        sourceType: message.referral.source_type,
+        sourceUrl: message.referral.source_url,
+        sourceId: message.referral.source_id,
+        headline: message.referral.headline,
+        body: message.referral.body,
+        mediaType: message.referral.media_type,
+        ctwaClid: message.referral.ctwa_clid,
+      }
+    : undefined;
+
+  console.log(`Inbound from ${from}: ${text}${media ? ` [attached ${media.type}]` : ""}${referral ? " [via ad/post referral]" : ""}`);
 
   try {
     // Messages from an agent number are commands about a request (a
@@ -1139,7 +1157,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
     if (AGENT_NOTIFY_NUMBERS.includes(from)) {
       await handleAgentMessage(from, text);
     } else {
-      await handleMessage(from, text, media, isLocationPin);
+      await handleMessage(from, text, media, isLocationPin, referral);
     }
   } catch (err) {
     console.error("Error handling message:", err);
@@ -1292,12 +1310,22 @@ async function proceedAfterMode(
 //   - "instant": skips the date, submitted for agents to find someone ASAP
 //
 // Escalation to a human can happen from any stage — checked first, always.
-async function handleMessage(phone: string, text: string, media?: MediaAttachment, isLocationPin = false) {
+async function handleMessage(
+  phone: string,
+  text: string,
+  media?: MediaAttachment,
+  isLocationPin = false,
+  referral?: MessageReferral
+) {
   let session = await getSession(phone);
   const lower = text.toLowerCase();
   const now = Date.now();
 
   await logTranscriptLine(phone, "customer", text || (media ? `[${media.type} attachment]` : ""));
+
+  if (referral) {
+    await logReferral(phone, referral);
+  }
 
   // Flush anything an agent sent while this customer's window was closed
   // (see customerMessaging.ts / notifyCustomerSmart) — their window is
@@ -1730,7 +1758,7 @@ async function handleMessage(phone: string, text: string, media?: MediaAttachmen
   if (session.stage === "greeting") {
     const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
     const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
-    const routed = await routeIntent(text, { pastBookings, recentMessages });
+    const routed = await routeIntent(text, { pastBookings, recentMessages, referral });
 
     if (routed.intent === "question" && routed.reply) {
       await sendMessage(phone, routed.reply);

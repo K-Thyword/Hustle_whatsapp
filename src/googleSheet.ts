@@ -33,6 +33,14 @@
 //      (kept on its own tab, not mixed into Sheet1's event log, since it's
 //      a much higher-volume, different-shaped stream — every message, not
 //      just lifecycle events)
+//   7. For ad/post click attribution (see logReferral below), add a THIRD
+//      tab named exactly "Referrals", header row:
+//        Timestamp | Phone | SourceType | Headline | Body | SourceURL | CTWA_CLID
+//   8. For the bot to answer "is your post about X still on?" type
+//      questions (see getRecentPosts below), add a FOURTH tab named
+//      exactly "Posts", header row: Date | Platform | Summary | Link
+//      — this one you keep updated yourself whenever you post something
+//      worth the bot knowing about.
 
 import { google } from "googleapis";
 
@@ -184,5 +192,93 @@ export async function logTranscriptLine(phone: string, direction: TranscriptDire
   } catch (err) {
     // Never let a logging failure break the actual customer/agent flow.
     console.error("Failed to append to Transcripts sheet log:", err);
+  }
+}
+
+// When a customer taps "Send Message" on a Facebook/Instagram ad or a
+// boosted post, WhatsApp attaches a "referral" object to that first
+// inbound message — which ad/post it was, its headline/body, and (for
+// paid ads) a click ID Meta uses for attribution. Logged here purely for
+// visibility (which posts are actually driving conversations) — the
+// SAME data is also passed live into intentRouter's context so the bot's
+// opening reply can acknowledge it, see server.ts's webhook handler.
+// Add a THIRD tab to the sheet named exactly "Referrals", header row:
+//   Timestamp | Phone | SourceType | Headline | Body | SourceURL | CTWA_CLID
+export interface MessageReferral {
+  sourceType?: string; // "ad" | "post"
+  sourceUrl?: string;
+  sourceId?: string;
+  headline?: string;
+  body?: string;
+  mediaType?: string;
+  ctwaClid?: string;
+}
+
+export async function logReferral(phone: string, referral: MessageReferral): Promise<void> {
+  const row = [
+    new Date().toISOString(),
+    phone,
+    referral.sourceType ?? "",
+    referral.headline ?? "",
+    referral.body ?? "",
+    referral.sourceUrl ?? "",
+    referral.ctwaClid ?? "",
+  ];
+
+  const client = getClient();
+  if (!client) {
+    console.log("[Referral log DRY RUN]", row);
+    return;
+  }
+
+  try {
+    await client.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Referrals!A:G",
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] },
+    });
+  } catch (err) {
+    console.error("Failed to append to Referrals sheet log:", err);
+  }
+}
+
+// A short, manually-maintained list of recent posts/promotions — so a
+// customer asking "is the offer from your post still on?" with no ad
+// click involved (nothing for WhatsApp to attach automatically, unlike
+// logReferral above) still gets a real answer instead of "I'm not sure."
+// Add a FOURTH tab to the sheet named exactly "Posts", header row:
+//   Date | Platform | Summary | Link
+// Update it yourself whenever you post something worth the bot knowing
+// about — no code change or redeploy needed, it's read fresh (with a
+// short cache) on the next customer message.
+export interface PostEntry {
+  date: string;
+  platform: string;
+  summary: string;
+  link?: string;
+}
+
+let postsCache: { at: number; posts: PostEntry[] } | null = null;
+const POSTS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function getRecentPosts(): Promise<PostEntry[]> {
+  if (postsCache && Date.now() - postsCache.at < POSTS_CACHE_TTL_MS) return postsCache.posts;
+
+  const client = getClient();
+  if (!client) return [];
+
+  try {
+    const res = await client.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: "Posts!A2:D" });
+    const rows = (res.data.values as string[][] | undefined) ?? [];
+    const posts = rows
+      .filter((r) => r[2]) // must at least have a summary
+      .map((r) => ({ date: r[0] ?? "", platform: r[1] ?? "", summary: r[2] ?? "", link: r[3] || undefined }))
+      .slice(-15); // most recent ~15 is plenty of context without bloating the prompt
+    postsCache = { at: Date.now(), posts };
+    return posts;
+  } catch (err) {
+    console.error("Failed to read Posts sheet — recent-posts context will be empty until this resolves:", err);
+    return postsCache?.posts ?? [];
   }
 }

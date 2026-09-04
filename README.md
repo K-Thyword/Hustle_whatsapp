@@ -98,6 +98,30 @@ vague. This is the realistic version of the bot "getting smarter": a
 short, repeatable, human-reviewed cycle backed by real conversation data,
 not an autonomous system quietly rewriting its own rules.
 
+## Facebook/Instagram post & ad awareness
+
+Two related but separate things, both backed by the Google Sheet:
+
+- **Ad/post click attribution (automatic)** — when a customer taps "Send
+  Message" on a Facebook/Instagram ad or boosted post, WhatsApp attaches a
+  `referral` object (headline, body, which post/ad it was) to that first
+  message automatically — nothing to set up for this part. The bot's
+  opening reply now naturally acknowledges what they clicked on instead of
+  a generic greeting, and every click is logged to a **Referrals** tab
+  (header row: `Timestamp | Phone | SourceType | Headline | Body |
+  SourceURL | CTWA_CLID`) so you can see which posts are actually driving
+  conversations.
+- **Recent-posts memory (manual)** — for when a customer mentions a post
+  with no click involved ("is the discount from your post still on?"),
+  there's no automatic signal from Meta, so the bot instead checks a
+  **Posts** tab you keep updated yourself (header row: `Date | Platform |
+  Summary | Link`) — add a row whenever you post something worth the bot
+  knowing about. Read with a 5-minute cache, so a new row shows up on the
+  very next customer question, no redeploy needed.
+
+Both tabs are optional — without them, the bot behaves exactly as before,
+just without the extra context.
+
 ## Testing without a real phone
 
 You can simulate an inbound message by POSTing to `/webhook` directly with
