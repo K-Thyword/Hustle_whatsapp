@@ -264,10 +264,11 @@ export interface PostEntry {
 let postsCache: { at: number; posts: PostEntry[] } | null = null;
 const POSTS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Used by instagramSync.ts to auto-append newly detected Instagram posts on
-// each polling run without creating duplicate rows every time — dedupes by
-// link (the permalink), since that's the one field guaranteed both stable
-// and unique per post, unlike a Summary a human might later edit by hand.
+// Used by socialPostSync.ts to auto-append newly detected Instagram/
+// Facebook posts on each polling run without creating duplicate rows every
+// time — dedupes by link (the permalink/permalink_url), since that's the
+// one field guaranteed both stable and unique per post, unlike a Summary a
+// human might later edit by hand.
 // Returns whether a row was actually added (false = already present, or
 // sheet not configured).
 export async function appendPostIfNew(entry: PostEntry): Promise<boolean> {
@@ -316,11 +317,37 @@ export async function getRecentPosts(): Promise<PostEntry[]> {
     const posts = rows
       .filter((r) => r[2]) // must at least have a summary
       .map((r) => ({ date: r[0] ?? "", platform: r[1] ?? "", summary: r[2] ?? "", link: r[3] || undefined }))
-      .slice(-15); // most recent ~15 is plenty of context without bloating the prompt
+      // Sort newest-first by Date (YYYY-MM-DD strings sort correctly with
+      // plain string comparison) rather than assuming row order equals
+      // chronological order — socialPostSync.ts backfills Instagram and
+      // Facebook as two separate batches, so the LAST rows appended to the
+      // sheet aren't necessarily the most recent posts.
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, 15); // most recent ~15 is plenty of context without bloating the prompt
     postsCache = { at: Date.now(), posts };
     return posts;
   } catch (err) {
     console.error("Failed to read Posts sheet — recent-posts context will be empty until this resolves:", err);
     return postsCache?.posts ?? [];
+  }
+}
+
+// Used by socialPostSync.ts to decide, per source, how far back to
+// paginate before it's confident everything older has already been
+// synced — reading this once per sync run is far cheaper than the
+// per-candidate read appendPostIfNew already does above (that one stays,
+// since it's the actual correctness guarantee against duplicate rows;
+// this is purely a pagination-cutoff optimization).
+export async function getExistingPostLinks(): Promise<Set<string>> {
+  const client = getClient();
+  if (!client) return new Set();
+
+  try {
+    const res = await client.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: "Posts!D2:D" });
+    const rows = (res.data.values as string[][] | undefined) ?? [];
+    return new Set(rows.map((r) => r[0]).filter(Boolean));
+  } catch (err) {
+    console.error("Failed to read existing Posts links:", err);
+    return new Set();
   }
 }

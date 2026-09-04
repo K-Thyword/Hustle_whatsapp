@@ -115,21 +115,26 @@ Two related but separate things, both backed by the Google Sheet:
   mentions a post with no click involved ("is the discount from your post
   still on?"), there's no automatic signal from Meta, so the bot instead
   checks a **Posts** tab (header row: `Date | Platform | Summary | Link`).
-  You can keep it updated yourself, or set `INSTAGRAM_ACCESS_TOKEN` and
-  `INSTAGRAM_BUSINESS_ACCOUNT_ID` (see `src/instagramSync.ts`) to have the
-  bot pull your Instagram posts automatically — it backfills existing
-  posts on startup, then re-checks every 6 hours and only appends posts it
-  hasn't logged before (deduped by permalink), so it's safe to also add
-  rows by hand alongside it. Facebook Page posts aren't auto-synced yet —
-  only Instagram. Read with a 5-minute cache either way, so a new row
-  shows up on the very next customer question, no redeploy needed.
+  You can keep it updated yourself, or set `INSTAGRAM_ACCESS_TOKEN` +
+  `INSTAGRAM_BUSINESS_ACCOUNT_ID` and/or `FACEBOOK_PAGE_ID` (see
+  `src/socialPostSync.ts`) to have the bot pull posts automatically —
+  every Instagram media type (images, videos, carousels, Reels) and every
+  Facebook Page post, not just one or the other. It backfills existing
+  history on startup (paginating back through up to ~500 posts per source
+  the first time), then re-checks every 6 hours and only appends posts it
+  hasn't logged before (deduped by permalink) — each run after the first
+  stops almost immediately, since it exits as soon as it reaches a post
+  it already has. Safe to also add rows by hand alongside it. Read with a
+  5-minute cache either way, so a new row shows up on the very next
+  customer question, no redeploy needed.
 
   Getting the access token: create a **System User** in Meta Business
   Settings (Users > System users), assign it your Facebook Page and
   Instagram account as assets with full control, then generate a token
   from it with `instagram_basic`, `pages_read_engagement`, and
-  `business_management` permissions. A System User token doesn't expire —
-  a token generated from Graph API Explorer works too, but only lasts 60
+  `business_management` permissions — the same token covers both
+  Instagram and the Facebook Page. A System User token doesn't expire — a
+  token generated from Graph API Explorer works too, but only lasts 60
   days (even after "Extend Access Token") and would need re-generating on
   a schedule nobody's watching.
 
