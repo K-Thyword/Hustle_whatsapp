@@ -1,5 +1,5 @@
 // Automatically keeps the "Posts" Google Sheet tab (see googleSheet.ts's
-// getRecentPosts/appendPostIfNew) in sync with what's actually been posted
+// getRecentPosts/appendNewPosts) in sync with what's actually been posted
 // on Instagram AND Facebook, so the bot's recent-posts memory never goes
 // stale even if nobody remembers to add a row by hand. Covers every
 // Instagram media type (images, videos, carousels, Reels) and every
@@ -27,7 +27,7 @@
 // while a System User token doesn't, so this won't silently stop working
 // on a schedule nobody's watching.
 
-import { appendPostIfNew, getExistingPostLinks, PostEntry } from "./googleSheet";
+import { appendNewPosts, getExistingPostLinks, PostEntry } from "./googleSheet";
 
 const ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN;
 const IG_USER_ID = process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID;
@@ -122,52 +122,40 @@ async function fetchNewItems<T>(
   return results;
 }
 
-async function syncInstagram(existingLinks: Set<string>): Promise<number> {
-  if (!instagramConfigured) return 0;
+async function fetchInstagramEntries(existingLinks: Set<string>): Promise<PostEntry[]> {
+  if (!instagramConfigured) return [];
 
   const startUrl =
     `https://graph.facebook.com/${GRAPH_VERSION}/${IG_USER_ID}/media` +
     `?fields=id,caption,media_type,media_product_type,permalink,timestamp&limit=25&access_token=${ACCESS_TOKEN}`;
 
   const items = await fetchNewItems<InstagramMediaItem>(startUrl, existingLinks, (item) => item.permalink);
-  let added = 0;
 
   // Oldest first, so the sheet reads chronologically within each sync
   // batch rather than newest-first.
-  for (const item of [...items].reverse()) {
-    const entry: PostEntry = {
-      date: formatDate(item.timestamp),
-      platform: "Instagram",
-      summary: summarize(item.caption),
-      link: item.permalink,
-    };
-    if (await appendPostIfNew(entry)) added++;
-  }
-
-  return added;
+  return [...items].reverse().map((item) => ({
+    date: formatDate(item.timestamp),
+    platform: "Instagram",
+    summary: summarize(item.caption),
+    link: item.permalink,
+  }));
 }
 
-async function syncFacebook(existingLinks: Set<string>): Promise<number> {
-  if (!facebookConfigured) return 0;
+async function fetchFacebookEntries(existingLinks: Set<string>): Promise<PostEntry[]> {
+  if (!facebookConfigured) return [];
 
   const startUrl =
     `https://graph.facebook.com/${GRAPH_VERSION}/${FACEBOOK_PAGE_ID}/posts` +
     `?fields=id,message,story,permalink_url,created_time&limit=25&access_token=${ACCESS_TOKEN}`;
 
   const items = await fetchNewItems<FacebookPostItem>(startUrl, existingLinks, (item) => item.permalink_url);
-  let added = 0;
 
-  for (const item of [...items].reverse()) {
-    const entry: PostEntry = {
-      date: formatDate(item.created_time),
-      platform: "Facebook",
-      summary: summarize(item.message ?? item.story),
-      link: item.permalink_url,
-    };
-    if (await appendPostIfNew(entry)) added++;
-  }
-
-  return added;
+  return [...items].reverse().map((item) => ({
+    date: formatDate(item.created_time),
+    platform: "Facebook",
+    summary: summarize(item.message ?? item.story),
+    link: item.permalink_url,
+  }));
 }
 
 export async function syncSocialPosts(): Promise<void> {
@@ -181,10 +169,23 @@ export async function syncSocialPosts(): Promise<void> {
 
   try {
     const existingLinks = await getExistingPostLinks();
-    const [igAdded, fbAdded] = await Promise.all([syncInstagram(existingLinks), syncFacebook(existingLinks)]);
-    const total = igAdded + fbAdded;
-    if (total > 0) {
-      console.log(`[Social post sync] Added ${igAdded} Instagram + ${fbAdded} Facebook post(s) to the Posts sheet.`);
+    const [igEntries, fbEntries] = await Promise.all([
+      fetchInstagramEntries(existingLinks),
+      fetchFacebookEntries(existingLinks),
+    ]);
+
+    // Everything gathered above is already known-new relative to
+    // existingLinks (fetchNewItems stops as soon as it sees a post that
+    // isn't), so this is ONE read + ONE write to the Sheets API no matter
+    // how many hundred posts a first-time backfill turns up — looping a
+    // read+write per post here is what blew through Google's per-minute
+    // quota the first time this ran.
+    const added = await appendNewPosts([...igEntries, ...fbEntries]);
+    if (added > 0) {
+      console.log(
+        `[Social post sync] Added ${added} new post(s) to the Posts sheet ` +
+          `(${igEntries.length} Instagram, ${fbEntries.length} Facebook found).`
+      );
     }
   } catch (err) {
     console.error("[Social post sync] Failed to sync posts:", err);

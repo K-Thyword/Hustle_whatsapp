@@ -264,18 +264,22 @@ export interface PostEntry {
 let postsCache: { at: number; posts: PostEntry[] } | null = null;
 const POSTS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Used by socialPostSync.ts to auto-append newly detected Instagram/
-// Facebook posts on each polling run without creating duplicate rows every
-// time — dedupes by link (the permalink/permalink_url), since that's the
-// one field guaranteed both stable and unique per post, unlike a Summary a
-// human might later edit by hand.
-// Returns whether a row was actually added (false = already present, or
-// sheet not configured).
-export async function appendPostIfNew(entry: PostEntry): Promise<boolean> {
+// Used by socialPostSync.ts to append a whole batch of newly detected
+// Instagram/Facebook posts in ONE read + ONE write, however many there
+// are — a first-time backfill can easily be a few hundred posts across
+// two sources, and calling the Sheets API once per post (a read to check
+// for duplicates, then a write) blew through Google's per-minute quota
+// almost immediately. Dedupes by link (the permalink/permalink_url),
+// since that's the one field guaranteed both stable and unique per post,
+// unlike a Summary a human might later edit by hand.
+// Returns how many rows were actually added (skips ones already present).
+export async function appendNewPosts(entries: PostEntry[]): Promise<number> {
+  if (entries.length === 0) return 0;
+
   const client = getClient();
   if (!client) {
-    console.log("[Posts sync DRY RUN]", entry);
-    return false;
+    console.log("[Posts sync DRY RUN]", entries);
+    return 0;
   }
 
   try {
@@ -286,22 +290,24 @@ export async function appendPostIfNew(entry: PostEntry): Promise<boolean> {
     const existingLinks = new Set(
       ((existing.data.values as string[][] | undefined) ?? []).map((r) => r[0]).filter(Boolean)
     );
-    if (entry.link && existingLinks.has(entry.link)) {
-      return false; // already logged on a previous sync — nothing to do
-    }
+
+    const toAdd = entries.filter((entry) => !entry.link || !existingLinks.has(entry.link));
+    if (toAdd.length === 0) return 0;
 
     await client.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: "Posts!A:D",
       valueInputOption: "USER_ENTERED",
-      requestBody: { values: [[entry.date, entry.platform, entry.summary, entry.link ?? ""]] },
+      requestBody: {
+        values: toAdd.map((entry) => [entry.date, entry.platform, entry.summary, entry.link ?? ""]),
+      },
     });
 
-    postsCache = null; // invalidate so the very next customer question sees this, not up to 5 minutes late
-    return true;
+    postsCache = null; // invalidate so the very next customer question sees these, not up to 5 minutes late
+    return toAdd.length;
   } catch (err) {
-    console.error("Failed to append new post to Posts sheet:", err);
-    return false;
+    console.error("Failed to append new posts to Posts sheet:", err);
+    return 0;
   }
 }
 
@@ -333,11 +339,11 @@ export async function getRecentPosts(): Promise<PostEntry[]> {
 }
 
 // Used by socialPostSync.ts to decide, per source, how far back to
-// paginate before it's confident everything older has already been
-// synced — reading this once per sync run is far cheaper than the
-// per-candidate read appendPostIfNew already does above (that one stays,
-// since it's the actual correctness guarantee against duplicate rows;
-// this is purely a pagination-cutoff optimization).
+// paginate the Graph API before it's confident everything older has
+// already been synced — a separate, one-time-per-run read from the one
+// appendNewPosts does internally (that one is the actual correctness
+// guarantee against duplicate rows; this is purely a pagination-cutoff
+// optimization against the Graph API, not the Sheets API).
 export async function getExistingPostLinks(): Promise<Set<string>> {
   const client = getClient();
   if (!client) return new Set();
