@@ -1326,6 +1326,24 @@ async function handleMessage(
 
   if (referral) {
     await logReferral(phone, referral);
+
+    // A referral means they just tapped "Send Message" on an ad/post —
+    // Meta attaches this to whatever message results from that tap,
+    // whenever it happens, not just a customer's very first-ever message.
+    // Someone can click the ad again well into an old, possibly abandoned
+    // flow — confirmed live: a customer stuck mid-way through an old
+    // "schedule or instant?" prompt re-clicked an ad and kept getting
+    // that same irrelevant prompt bounced back instead of a real answer
+    // about what they'd just clicked. Treat a fresh referral as a fresh
+    // entry point: reset back to "greeting" so it gets a proper,
+    // referral-aware classification instead of being dragged through
+    // whatever multi-step flow the session happened to be sitting in.
+    // Skipped for "escalated" — a live agent is already handling this
+    // conversation, and silently pulling it back to the bot would be wrong.
+    if (session.stage !== "greeting" && session.stage !== "escalated") {
+      await updateSession(phone, { stage: "greeting" });
+      session = await getSession(phone);
+    }
   }
 
   // Flush anything an agent sent while this customer's window was closed
