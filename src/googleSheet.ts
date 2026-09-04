@@ -39,8 +39,10 @@
 //   8. For the bot to answer "is your post about X still on?" type
 //      questions (see getRecentPosts below), add a FOURTH tab named
 //      exactly "Posts", header row: Date | Platform | Summary | Link
-//      — this one you keep updated yourself whenever you post something
-//      worth the bot knowing about.
+//      — kept updated either by hand, or automatically for Instagram if
+//      INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_BUSINESS_ACCOUNT_ID are set (see
+//      instagramSync.ts) — both ways write to the same tab, so a manual
+//      row and an auto-synced row look identical to getRecentPosts().
 
 import { google } from "googleapis";
 
@@ -261,6 +263,46 @@ export interface PostEntry {
 
 let postsCache: { at: number; posts: PostEntry[] } | null = null;
 const POSTS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Used by instagramSync.ts to auto-append newly detected Instagram posts on
+// each polling run without creating duplicate rows every time — dedupes by
+// link (the permalink), since that's the one field guaranteed both stable
+// and unique per post, unlike a Summary a human might later edit by hand.
+// Returns whether a row was actually added (false = already present, or
+// sheet not configured).
+export async function appendPostIfNew(entry: PostEntry): Promise<boolean> {
+  const client = getClient();
+  if (!client) {
+    console.log("[Posts sync DRY RUN]", entry);
+    return false;
+  }
+
+  try {
+    const existing = await client.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: "Posts!D2:D",
+    });
+    const existingLinks = new Set(
+      ((existing.data.values as string[][] | undefined) ?? []).map((r) => r[0]).filter(Boolean)
+    );
+    if (entry.link && existingLinks.has(entry.link)) {
+      return false; // already logged on a previous sync — nothing to do
+    }
+
+    await client.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Posts!A:D",
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [[entry.date, entry.platform, entry.summary, entry.link ?? ""]] },
+    });
+
+    postsCache = null; // invalidate so the very next customer question sees this, not up to 5 minutes late
+    return true;
+  } catch (err) {
+    console.error("Failed to append new post to Posts sheet:", err);
+    return false;
+  }
+}
 
 export async function getRecentPosts(): Promise<PostEntry[]> {
   if (postsCache && Date.now() - postsCache.at < POSTS_CACHE_TTL_MS) return postsCache.posts;

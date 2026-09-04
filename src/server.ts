@@ -21,6 +21,7 @@ import { createReminder, getAllReminders, markReminderFired } from "./reminders"
 import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
 import { logRequestEvent, logAlert, logTranscriptLine, logReferral, MessageReferral } from "./googleSheet";
+import { startInstagramSyncScheduler } from "./instagramSync";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -2770,4 +2771,5 @@ app.listen(PORT, () => {
   startUnclaimedLiveChatSweep();
   startWinBackSweep();
   startReminderSweep();
+  startInstagramSyncScheduler();
 });

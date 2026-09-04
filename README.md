@@ -111,13 +111,27 @@ Two related but separate things, both backed by the Google Sheet:
   (header row: `Timestamp | Phone | SourceType | Headline | Body |
   SourceURL | CTWA_CLID`) so you can see which posts are actually driving
   conversations.
-- **Recent-posts memory (manual)** — for when a customer mentions a post
-  with no click involved ("is the discount from your post still on?"),
-  there's no automatic signal from Meta, so the bot instead checks a
-  **Posts** tab you keep updated yourself (header row: `Date | Platform |
-  Summary | Link`) — add a row whenever you post something worth the bot
-  knowing about. Read with a 5-minute cache, so a new row shows up on the
-  very next customer question, no redeploy needed.
+- **Recent-posts memory (manual or auto-synced)** — for when a customer
+  mentions a post with no click involved ("is the discount from your post
+  still on?"), there's no automatic signal from Meta, so the bot instead
+  checks a **Posts** tab (header row: `Date | Platform | Summary | Link`).
+  You can keep it updated yourself, or set `INSTAGRAM_ACCESS_TOKEN` and
+  `INSTAGRAM_BUSINESS_ACCOUNT_ID` (see `src/instagramSync.ts`) to have the
+  bot pull your Instagram posts automatically — it backfills existing
+  posts on startup, then re-checks every 6 hours and only appends posts it
+  hasn't logged before (deduped by permalink), so it's safe to also add
+  rows by hand alongside it. Facebook Page posts aren't auto-synced yet —
+  only Instagram. Read with a 5-minute cache either way, so a new row
+  shows up on the very next customer question, no redeploy needed.
+
+  Getting the access token: create a **System User** in Meta Business
+  Settings (Users > System users), assign it your Facebook Page and
+  Instagram account as assets with full control, then generate a token
+  from it with `instagram_basic`, `pages_read_engagement`, and
+  `business_management` permissions. A System User token doesn't expire —
+  a token generated from Graph API Explorer works too, but only lasts 60
+  days (even after "Extend Access Token") and would need re-generating on
+  a schedule nobody's watching.
 
 Both tabs are optional — without them, the bot behaves exactly as before,
 just without the extra context.
