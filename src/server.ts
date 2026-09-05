@@ -314,7 +314,10 @@ async function recordFriction(phone: string): Promise<void> {
     // way a delivery failure is logged, so it shows up on the dashboard's
     // Alerts tab and Overview count too, not just as a message an agent may
     // have since scrolled past.
-    await logAlert(`Customer ${phone} might be having trouble booking — ${count} unclear replies so far this session.`);
+    await logAlert(
+      `Customer ${phone} might be having trouble booking — ${count} unclear replies so far this session.`,
+      "struggle_alert"
+    );
   }
 }
 

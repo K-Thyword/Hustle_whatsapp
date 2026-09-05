@@ -133,17 +133,29 @@ export async function logRequestEvent(row: RequestLogEvent): Promise<void> {
   }
 }
 
-// A visible, checkable record of a notification that never actually
-// reached anyone — e.g. an agent's (or customer's) WhatsApp window was
-// closed AND the fallback template ping also failed to send, usually
-// because the template isn't approved yet in Meta or its language code
-// doesn't match. Before this, that failure only ever showed up as a
+// A visible, checkable record of something worth a human's attention.
+// Two genuinely different things get logged through this same function —
+// callers MUST pass the right `event` so the sheet stays useful for
+// telling them apart later:
+//   "delivery_failed" (default) — a notification that never actually
+//     reached anyone: an agent's (or customer's) WhatsApp window was
+//     closed AND the fallback template ping also failed to send, usually
+//     because the template isn't approved yet in Meta or its language
+//     code doesn't match. This is the one that means "go check Meta's
+//     template approval/language settings."
+//   "struggle_alert" — routine record-keeping for a real-time struggle
+//     ping that WAS sent to agents (see recordFriction in server.ts) —
+//     this is NOT a delivery failure, just a durable copy of something
+//     that already went out over WhatsApp, for the dashboard's Alerts
+//     tab/Overview count.
+// These two used to share the "delivery_failed" label unconditionally,
+// which meant a sheet full of routine struggle-alert records looked
+// identical to actual send failures — there was no way to tell, from the
+// sheet alone, whether notifications were really failing to deliver.
+// Before this existed at all, a failure only ever showed up as a
 // console.error line on the server — invisible to anyone without log
 // access, including whoever's actually waiting to hear about a booking.
-// Appended to the same sheet bookings already get logged to, so it's
-// somewhere a human will actually see it, plus always printed to the
-// console either way for anyone watching server logs.
-export async function logAlert(message: string): Promise<void> {
+export async function logAlert(message: string, event: "delivery_failed" | "struggle_alert" = "delivery_failed"): Promise<void> {
   console.error("🚨 ALERT:", message);
 
   const client = getClient();
@@ -155,7 +167,7 @@ export async function logAlert(message: string): Promise<void> {
       range: "Sheet1!A:G",
       valueInputOption: "USER_ENTERED",
       requestBody: {
-        values: [[new Date().toISOString(), "ALERT", "delivery_failed", "", "", "", message]],
+        values: [[new Date().toISOString(), "ALERT", event, "", "", "", message]],
       },
     });
   } catch (err) {
