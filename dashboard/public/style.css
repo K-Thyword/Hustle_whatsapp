@@ -99,7 +99,11 @@ tr:last-child td { border-bottom: none; }
 .timeline { display: flex; flex-direction: column; gap: 6px; }
 .timeline-item { font-size: 13px; }
 
-.filters { display: flex; gap: 8px; margin-bottom: 12px; }
+.filters { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+
+.dt-th { cursor: pointer; user-select: none; white-space: nowrap; }
+.dt-th.sorted-asc::after { content: " \25B2"; font-size: 9px; }
+.dt-th.sorted-desc::after { content: " \25BC"; font-size: 9px; }
 select, input[type="text"], input[type="search"] {
   padding: 7px 10px;
   border: 1px solid var(--border);
