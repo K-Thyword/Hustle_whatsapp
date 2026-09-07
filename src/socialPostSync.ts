@@ -192,12 +192,18 @@ export async function syncSocialPosts(): Promise<void> {
   }
 }
 
-// Every 6 hours is frequent enough that a new post shows up in the bot's
-// answers the same day it's published, without hammering either API's
-// rate limit (Instagram's is generous — 200 x account impressions per
-// 24h; Facebook Page reads are similarly generous) — plenty of headroom
-// even with two sources polled on the same schedule.
-const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// A customer can (and does) ask about a post within minutes of it going
+// live — e.g. clicking straight through from the post itself, or pasting
+// its link into chat right after seeing it. A 6-hour interval left the bot
+// answering from a stale Posts sheet for up to 6 hours after every post,
+// during which it would either say it doesn't recognize the post or, worse,
+// guess a different (older) one from what it does have synced. Hourly is
+// still well within both APIs' generous rate limits (Instagram: 200 x
+// account impressions per 24h; Facebook Page reads similarly generous) and
+// cuts the worst-case staleness to under an hour. For the "just posted,
+// need it now" case, POST /internal/sync-posts (see server.ts) forces an
+// immediate sync instead of waiting even that long.
+const SYNC_INTERVAL_MS = 60 * 60 * 1000;
 
 export function startSocialPostSyncScheduler(): void {
   if (!instagramConfigured && !facebookConfigured) return;

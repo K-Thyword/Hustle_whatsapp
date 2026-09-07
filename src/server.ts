@@ -21,7 +21,7 @@ import { createReminder, getAllReminders, markReminderFired } from "./reminders"
 import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
 import { logRequestEvent, logAlert, logTranscriptLine, logReferral, MessageReferral } from "./googleSheet";
-import { startSocialPostSyncScheduler } from "./socialPostSync";
+import { startSocialPostSyncScheduler, syncSocialPosts } from "./socialPostSync";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1063,6 +1063,23 @@ app.get("/webhook", (req: Request, res: Response) => {
   } else {
     res.sendStatus(403);
   }
+});
+
+// Manual trigger for the social-post sync (see socialPostSync.ts). The
+// scheduled sync only runs every SYNC_INTERVAL_MS, so a post shared minutes
+// ago may not be in the Posts sheet yet if a customer asks about it right
+// away — the team can hit this right after publishing to force an
+// immediate refresh instead of waiting. Reuses WHATSAPP_VERIFY_TOKEN as a
+// shared secret rather than adding a new env var — this only ever
+// triggers a read-only Graph API fetch + Sheet append, so it doesn't need
+// its own dedicated credential.
+app.post("/internal/sync-posts", async (req: Request, res: Response) => {
+  if (!VERIFY_TOKEN || req.query.token !== VERIFY_TOKEN) {
+    res.sendStatus(403);
+    return;
+  }
+  await syncSocialPosts();
+  res.sendStatus(200);
 });
 
 // A photo, video, document, or voice note a customer attaches while
