@@ -22,6 +22,8 @@ import { extractReminderRequest } from "./reminderExtractor";
 import { resolveServiceType } from "./serviceResolver";
 import { logRequestEvent, logAlert, logTranscriptLine, logReferral, MessageReferral } from "./googleSheet";
 import { startSocialPostSyncScheduler, syncSocialPosts } from "./socialPostSync";
+import { resolvePostedLink } from "./postLinkResolver";
+import { describeImage } from "./imageAnalyzer";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1109,7 +1111,19 @@ app.post("/webhook", async (req: Request, res: Response) => {
 
   if (message.type === "image" && message.image?.id) {
     media = { id: message.image.id, type: "image" };
-    text = (message.image.caption ?? "").trim();
+    const caption = (message.image.caption ?? "").trim();
+    // Best-effort: describe the image (see imageAnalyzer.ts) so a customer
+    // asking about a screenshot of one of our posts gets a real answer
+    // instead of the bot only seeing an empty/generic caption. Folded into
+    // `text` the same way transcribeVoiceNote folds speech into text below
+    // — everything downstream just sees text, media is still forwarded to
+    // agents as-is regardless of whether this succeeds.
+    const description = await describeImage(message.image.id, caption || undefined);
+    text = description
+      ? caption
+        ? `${caption}\n\n[Image the customer sent: ${description}]`
+        : `[Image the customer sent: ${description}]`
+      : caption;
   } else if (message.type === "video" && message.video?.id) {
     media = { id: message.video.id, type: "video" };
     text = (message.video.caption ?? "").trim();
@@ -1331,6 +1345,31 @@ async function proceedAfterMode(
 //   - "instant": skips the date, submitted for agents to find someone ASAP
 //
 // Escalation to a human can happen from any stage — checked first, always.
+// A customer pasting a link to one of our own posts mid-conversation isn't
+// a Meta-attached ad-click referral (that only fires when they tap "Send
+// Message" ON the post itself — see the real `referral` param below) — but
+// it should get the same treatment: instead of the bot saying "I can't
+// open links," resolve it (safely — see postLinkResolver.ts, which never
+// fetches the customer's URL directly) and answer using the actual post
+// content. Reuses the same referralSection prompt logic intentRouter.ts
+// already has for real referrals rather than a separate answer path. A
+// real ad-click referral, if present, is already authoritative and takes
+// priority over anything resolved from pasted text.
+async function resolveLinkReferral(
+  text: string,
+  existing?: MessageReferral
+): Promise<MessageReferral | undefined> {
+  if (existing) return existing;
+  const post = await resolvePostedLink(text);
+  if (!post) return undefined;
+  return {
+    sourceType: "post",
+    sourceUrl: post.link,
+    headline: `${post.platform} post from ${post.date}`,
+    body: post.summary,
+  };
+}
+
 async function handleMessage(
   phone: string,
   text: string,
@@ -1797,7 +1836,11 @@ async function handleMessage(
   if (session.stage === "greeting") {
     const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
     const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
-    const routed = await routeIntent(text, { pastBookings, recentMessages, referral });
+    const routed = await routeIntent(text, {
+      pastBookings,
+      recentMessages,
+      referral: await resolveLinkReferral(text, referral),
+    });
 
     if (routed.intent === "question" && routed.reply) {
       await sendMessage(phone, routed.reply);
@@ -2037,7 +2080,11 @@ async function handleMessage(
     // conversation doesn't stall.
     const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
     const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
-    const routed = await routeIntent(text, { pastBookings, recentMessages });
+    const routed = await routeIntent(text, {
+      pastBookings,
+      recentMessages,
+      referral: await resolveLinkReferral(text),
+    });
     const reminder = "Would you like this done on a specific date, or right away? Reply 'schedule' or 'instant'.";
 
     if (routed.intent === "question" && routed.reply) {

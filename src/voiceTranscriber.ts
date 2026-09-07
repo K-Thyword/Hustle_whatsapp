@@ -21,40 +21,9 @@
 // to retry or type instead, same conservative-fallback pattern used by
 // detailExtractor.ts.
 
+import { downloadWhatsAppMedia } from "./whatsappMedia";
+
 const hasOpenAiKey = Boolean(process.env.OPENAI_API_KEY);
-
-// WhatsApp media downloads are a two-step dance: resolve the media ID to a
-// short-lived signed URL, then fetch the actual bytes from that URL — both
-// requests need the same permanent access token used everywhere else in
-// server.ts, just against a different Graph endpoint.
-async function downloadWhatsAppMedia(
-  mediaId: string
-): Promise<{ buffer: ArrayBuffer; mimeType: string } | undefined> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
-  if (!token || token === "from-meta-business-manager") return undefined;
-
-  try {
-    const metaRes = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!metaRes.ok) {
-      console.error("Failed to resolve WhatsApp media URL:", await metaRes.text());
-      return undefined;
-    }
-    const meta = (await metaRes.json()) as { url?: string; mime_type?: string };
-    if (!meta.url) return undefined;
-
-    const fileRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${token}` } });
-    if (!fileRes.ok) {
-      console.error("Failed to download WhatsApp media:", await fileRes.text());
-      return undefined;
-    }
-    return { buffer: await fileRes.arrayBuffer(), mimeType: meta.mime_type ?? "audio/ogg" };
-  } catch (err) {
-    console.error("WhatsApp media download failed:", err);
-    return undefined;
-  }
-}
 
 export async function transcribeVoiceNote(mediaId: string): Promise<string | undefined> {
   if (!hasOpenAiKey) return undefined;
@@ -63,9 +32,10 @@ export async function transcribeVoiceNote(mediaId: string): Promise<string | und
   if (!downloaded) return undefined;
 
   try {
-    const ext = downloaded.mimeType.includes("ogg") ? "ogg" : "m4a";
+    const mimeType = downloaded.mimeType === "application/octet-stream" ? "audio/ogg" : downloaded.mimeType;
+    const ext = mimeType.includes("ogg") ? "ogg" : "m4a";
     const form = new FormData();
-    form.append("file", new Blob([downloaded.buffer], { type: downloaded.mimeType }), `voice-note.${ext}`);
+    form.append("file", new Blob([downloaded.buffer], { type: mimeType }), `voice-note.${ext}`);
     form.append("model", "whisper-1");
 
     const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
