@@ -11,10 +11,10 @@ import {
   PastBooking,
 } from "./session";
 import { findOrCreateUserByPhone, submitBookingRequest, BookingMode } from "./appApi";
-import { routeIntent } from "./intentRouter";
+import { routeIntent, RoutedIntent } from "./intentRouter";
 import { interpretDate } from "./dateInterpreter";
 import { matchServiceCategory } from "./serviceCategories";
-import { extractBookingDetails } from "./detailExtractor";
+import { extractBookingSlots, ExtractedSlots } from "./detailExtractor";
 import { transcribeVoiceNote } from "./voiceTranscriber";
 import { setMarketingOptIn, isOptedIn, getOptedInPhones } from "./marketing";
 import { createReminder, getAllReminders, markReminderFired } from "./reminders";
@@ -171,18 +171,17 @@ const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediate
 // to module scope (it used to be declared inline, once, right before its
 // one use) so both checks can share the exact same list instead of
 // drifting out of sync with each other.
-const ACTIVE_BOOKING_STAGES: ConversationStage[] = [
-  "awaiting_mode",
-  "awaiting_extraction_confirmation",
-  "awaiting_service_type",
-  "awaiting_location",
-  "awaiting_date",
-  "awaiting_date_confirmation",
-  "awaiting_extra_details",
-  "awaiting_description",
-  "awaiting_special_instructions",
-  "awaiting_confirmation",
-];
+// The two stages where a booking draft is actively in progress. Used for:
+// recognizing a stray "hi" mid-flow, recognizing when a customer explicitly
+// steps away (see the decline-signal check below), the inactivity sweep,
+// and deciding whether a dropped pin should be captured as the location
+// immediately even though it isn't specifically being asked for. Used to
+// be three separate near-identical lists (one per use, each of the old
+// nine granular stages repeated in each) that had already drifted out of
+// sync with each other once ("awaiting_mode" was missing from one) —
+// consolidating the whole flow into two stages made keeping just one list
+// straightforward.
+const ACTIVE_BOOKING_STAGES: ConversationStage[] = ["collecting_booking", "awaiting_confirmation"];
 
 // A customer explicitly stepping away mid-booking — "that's all for now",
 // "never mind", "not right now" — is unambiguous, but nothing previously
@@ -1090,8 +1089,9 @@ const LOCATION_REJECTS_SUGGESTION_RE =
 // on Friday" — it needs to match as a substring there.
 const USUAL_PLACE_RE = /\b(my|the|our)?\s*(usual|regular|same|normal)\s+(place|location|spot|address)\b/i;
 
-// Shared by askLocationQuestion and the opening-message "usual place"
-// resolution below — a past booking saved before the location-vagueness
+// Shared by getNextMissingPrompt's location question and the "usual place"
+// resolution in advanceBookingCollection — a past booking saved before the
+// location-vagueness
 // fixes existed could have junk stored as its location (e.g. "Somewhere
 // else"), so both callers need the same filtering rather than trusting the
 // most recent booking's location blindly.
@@ -1257,25 +1257,69 @@ app.post("/webhook", async (req: Request, res: Response) => {
   }
 });
 
-// --- 3. Extra job-detail questions, tailored per service category ---
-// Instead of one generic "describe the job" prompt for everything, some
-// trades get a short, specific queue of questions first (headcount for
-// catering, home size for cleaning, pickup/drop-off for moving...), plus a
-// "one-time or regular?" question for trades where that's common, and a
-// rough budget question for jobs that are normally priced with a quote.
-// Unmatched service types fall straight through to the generic prompt,
-// unchanged from before.
+// --- 3. Conversational booking collection ---
+// Replaces what used to be nine separate rigid single-question stages
+// (schedule/instant, then service type, then location, then date, then
+// date confirmation, then category follow-ups, then description, then
+// special instructions — each accepting only one specific kind of answer)
+// with one flow that runs on every booking-related message: extract
+// whatever's newly stated (see detailExtractor.ts — any field, any order,
+// at any point in the conversation), merge it in, and ask for whichever
+// REQUIRED field is still missing next. A customer who states three things
+// in one message doesn't get asked for any of them again; a customer who
+// answers out of order still gets everything collected correctly. There is
+// no more separate "schedule or instant?" gate — timing is just another
+// slot, and a specific date or "no rush, whenever" are equally valid
+// answers to it.
+//
+// Deliberately kept semi-deterministic rather than fully AI-driven end to
+// end: the extractor (AI) only ever fills in fields — it never decides
+// what's "done" or what to ask next. getNextMissingPrompt below (a plain,
+// pure, testable function) always makes that call from the actual session
+// data. Every previous bug in this flow traced back to letting something
+// improvise a decision instead of just extracting information — keeping
+// completeness deterministic avoids repeating that while still letting the
+// conversation itself feel natural rather than scripted.
+//
+// Category-specific follow-up questions (see serviceCategories.ts — e.g.
+// "how many people is this catering for?") are the one part that stays a
+// small ordered queue rather than a free slot: they can only even be
+// determined once the service type is known and resolved, so there's no
+// artificial rigidity being removed there. A customer who volunteers other
+// info while one of these is pending still gets it picked up — extraction
+// runs on every turn regardless of what's currently pending.
+
+const NO_PREFERENCE_PHRASES = [
+  "whenever",
+  "no rush",
+  "no preference",
+  "any time",
+  "anytime",
+  "no specific date",
+  "not fussed",
+  "flexible",
+  "no particular date",
+];
+
 type ExtraQuestionKey = "recurring" | "followup" | "budget";
 interface ExtraQuestion {
   key: ExtraQuestionKey;
   question: string;
 }
+interface ExtraAnswer {
+  key: ExtraQuestionKey;
+  question: string;
+  answer: string;
+}
 
-async function beginJobDetails(phone: string) {
-  const session = await getSession(phone);
-  const serviceType = (session.data.serviceType as string) ?? "";
+const BUDGET_SKIP_WORDS = ["no", "not sure", "none", "n/a", "dont know", "don't know", "idk"];
+
+// Builds the category-specific queue once a service type is known and
+// resolved — same three question types as before (recurring, per-category
+// follow-ups, budget), just computed on demand rather than only right
+// after location happened to be asked.
+function buildExtraQueue(serviceType: string): ExtraQuestion[] {
   const category = matchServiceCategory(serviceType);
-
   const queue: ExtraQuestion[] = [];
   if (category?.asksRecurring) {
     queue.push({
@@ -1292,104 +1336,261 @@ async function beginJobDetails(phone: string) {
       question: "Do you have a rough budget in mind for this? Reply with an amount, or say 'not sure' if you don't have one yet.",
     });
   }
+  return queue;
+}
 
-  if (queue.length > 0) {
-    const [first, ...rest] = queue;
-    await sendMessage(phone, first.question);
-    await updateSession(phone, {
-      stage: "awaiting_extra_details",
-      data: { extraQueue: rest, extraAnswers: [], currentExtraKey: first.key, lastPrompt: first.question },
-    });
-    return;
+// The single source of truth for "what's still needed" — a pure read of
+// session data, no side effects, easy to unit-test on its own. Returns the
+// next prompt to send, or undefined once everything required is filled
+// (the caller then moves to awaiting_confirmation). The order below is
+// just the DEFAULT question order when nothing else is known yet — it's
+// not enforced, since extraction runs every turn regardless of what's
+// being asked; this only decides what to ask about when more than one
+// thing is still missing.
+function getNextMissingPrompt(
+  data: Record<string, unknown>,
+  pastBookings: PastBooking[]
+): { prompt: string; awaitingExtra?: ExtraQuestion } | undefined {
+  if (!data.serviceType) {
+    return {
+      prompt:
+        "What kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.",
+    };
   }
 
-  const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
-  await sendMessage(phone, prompt);
-  await updateSession(phone, { stage: "awaiting_description", data: { lastPrompt: prompt } });
-}
-
-// --- 3b. Shared "what's next" routing for mode/service/location ---
-// Several entry points can each independently already know the mode,
-// service type, and/or location before this point in the conversation —
-// a direct "schedule"/"instant" reply, a date mentioned early, or details
-// already extracted and confirmed from the customer's opening message.
-// These three functions form one linear chain that always asks for
-// whichever of those three is still missing, and skips straight past
-// anything already known — instead of every entry point independently
-// (and redundantly) asking for service type, then location, from scratch.
-async function askLocationQuestion(phone: string, ack: string) {
-  const session = await getSession(phone);
-  const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-  const lastLocation = getValidLastLocation(pastBookings);
-
-  const prompt = lastLocation
-    ? `${ack} Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
-    : `${ack} Which area or location is this for? You can also drop a pin 📍 and mention a nearby landmark to help our provider find you — both optional.`;
-  await sendMessage(phone, prompt);
-  await updateSession(phone, {
-    stage: "awaiting_location",
-    data: { lastPrompt: prompt, suggestedLastLocation: lastLocation },
-  });
-}
-
-async function proceedAfterLocation(phone: string) {
-  const session = await getSession(phone);
-  const mode = session.data.mode as BookingMode;
-
-  if (mode === "standard") {
-    // A date may already be locked in (confirmed as part of an earlier
-    // extraction-confirmation step) — if so, there's nothing left to ask.
-    const dateWanted = session.data.dateWanted as string | undefined;
-    if (dateWanted) {
-      await beginJobDetails(phone);
-      return;
-    }
-
-    const suggestedDateHuman = session.data.suggestedDateHuman as string | undefined;
-    if (suggestedDateHuman) {
-      const confirmPrompt = `Just to confirm — you'd like this done on ${suggestedDateHuman}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
-      await sendMessage(phone, confirmPrompt);
-      await updateSession(phone, {
-        stage: "awaiting_date_confirmation",
-        data: { pendingDateHuman: suggestedDateHuman, pendingDateIso: session.data.suggestedDateIso, lastPrompt: confirmPrompt },
-      });
-      return;
-    }
-
-    const prompt = "And what date would you like this done?";
-    await sendMessage(phone, prompt);
-    await updateSession(phone, { stage: "awaiting_date", data: { lastPrompt: prompt } });
-    return;
+  if (!data.location) {
+    const lastLocation = getValidLastLocation(pastBookings);
+    return {
+      prompt: lastLocation
+        ? `Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
+        : "Which area or location is this for? You can also drop a pin 📍 and mention a nearby landmark to help our provider find you — both optional.",
+    };
   }
 
-  await beginJobDetails(phone);
-}
-
-async function proceedAfterServiceType(phone: string, ack: string) {
-  const session = await getSession(phone);
-  if (session.data.location) {
-    await proceedAfterLocation(phone);
-    return;
+  if (!data.timingMode) {
+    return {
+      prompt:
+        "When would you like this done — a specific date, or is it something you need as soon as possible? Either works, just let me know.",
+    };
   }
-  await askLocationQuestion(phone, ack);
+
+  const extraQueue = (data.extraQueue as ExtraQuestion[] | undefined) ?? [];
+  if (extraQueue.length > 0) {
+    return { prompt: extraQueue[0].question, awaitingExtra: extraQueue[0] };
+  }
+
+  if (!data.description) {
+    return {
+      prompt: "Tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.",
+    };
+  }
+
+  if (!data.specialInstructionsAsked) {
+    return {
+      prompt:
+        "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.",
+    };
+  }
+
+  return undefined; // everything required is in — ready for the final review
 }
 
-async function proceedAfterMode(
+function buildBookingSummary(data: Record<string, unknown>): string {
+  return [
+    `Service: ${data.serviceType}`,
+    `Location: ${data.location}`,
+    ...(data.timingMode === "date" ? [`Date: ${data.dateWanted}`] : []),
+    `Details: ${data.description}`,
+    ...(data.recurring ? [`Frequency: ${data.recurring}`] : []),
+    ...(data.budget ? [`Budget: ${data.budget}`] : []),
+    ...(data.specialInstructions ? [`Special instructions: ${data.specialInstructions}`] : []),
+  ].join("\n");
+}
+
+// Runs one turn of the conversational booking flow: answers a genuine
+// tangential question if there is one, merges whatever new info the
+// customer just gave (in any order, any combination) into the session,
+// then either asks for the next missing thing or — once everything
+// required is in — moves to the final review-and-confirm step. `ack`, if
+// given, is prepended to whatever the bot says next (used for the first
+// message of a booking, where routeIntent already crafted a warm
+// acknowledgment).
+async function advanceBookingCollection(
   phone: string,
-  mode: BookingMode,
-  suggestedDateHuman?: string,
-  suggestedDateIso?: string
-) {
-  await updateSession(phone, { data: { mode, suggestedDateHuman, suggestedDateIso } });
-  const session = await getSession(phone);
+  text: string,
+  ack?: string,
+  preRouted?: RoutedIntent
+): Promise<void> {
+  let session = await getSession(phone);
+  const priorExtraQueue = (session.data.extraQueue as ExtraQuestion[] | undefined) ?? [];
+  const pendingExtra = priorExtraQueue.length > 0 ? priorExtraQueue[0] : undefined;
 
-  if (session.data.serviceType) {
-    await proceedAfterServiceType(phone, "Got it.");
+  const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+  const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
+  // The caller may already have classified this exact message (the
+  // greeting-stage handler runs routeIntent to decide booking_intent vs.
+  // question in the first place) — reuse that instead of paying for a
+  // second, redundant AI call on the very first message of every booking.
+  const routed =
+    preRouted ??
+    (await routeIntent(text, {
+      pastBookings,
+      recentMessages,
+      referral: await resolveLinkReferral(text),
+    }));
+  const isPureQuestion = routed.intent === "question" && !pendingExtra;
+  const questionAck = routed.intent === "question" ? routed.reply : undefined;
+
+  const nonAnswerNote = isNonAnswer(text)
+    ? "Sorry, I don't have that noted from earlier in our chat — could you just tell me directly?"
+    : undefined;
+  const vagueNote =
+    !nonAnswerNote && isVagueReply(text)
+      ? "A bit more detail would help me get this right — could you be a little more specific?"
+      : undefined;
+
+  const knownForExtraction = {
+    serviceType: session.data.serviceType as string | undefined,
+    location: session.data.location as string | undefined,
+    description: session.data.description as string | undefined,
+    specialInstructions: session.data.specialInstructions as string | undefined,
+    recurring: session.data.recurring as string | undefined,
+    budget: session.data.budget as string | undefined,
+  };
+  const extracted: ExtractedSlots = text.trim() ? await extractBookingSlots(text, knownForExtraction) : {};
+
+  const updates: Record<string, unknown> = {};
+
+  // --- service type ---
+  if (extracted.serviceType && !session.data.serviceType) {
+    const resolved = await resolveServiceType(extracted.serviceType);
+    if (!resolved.supported) {
+      const suggestionText = resolved.suggestion
+        ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?`
+        : " Is there something else I can help you find?";
+      await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
+      await recordFriction(phone);
+      return; // stay in collecting_booking with serviceType still unset
+    }
+    updates.serviceType = resolved.serviceType ?? extracted.serviceType;
+    updates.extraQueue = buildExtraQueue(updates.serviceType as string);
+    updates.extraAnswers = [];
+  }
+
+  // --- location ---
+  if (extracted.location && !session.data.location) {
+    updates.location = extracted.location;
+  } else if (!session.data.location && !extracted.location) {
+    const lastLocation = getValidLastLocation(pastBookings);
+    const trimmedLower = text.trim().toLowerCase();
+    const wantsSameLocation =
+      Boolean(lastLocation) &&
+      (["same", "same place", "same location", "same as before", "same as last time"].some(
+        (w) => trimmedLower === w || trimmedLower.startsWith(w)
+      ) ||
+        ["yes", "yeah", "yep"].includes(trimmedLower));
+    if (wantsSameLocation) {
+      updates.location = lastLocation;
+    } else if (USUAL_PLACE_RE.test(text) && lastLocation) {
+      updates.location = lastLocation;
+    }
+  }
+
+  // --- timing ---
+  if (!session.data.timingMode) {
+    const timingSource = extracted.timingPhrase ?? text;
+    const lowerTiming = timingSource.toLowerCase();
+    if (NO_PREFERENCE_PHRASES.some((p) => lowerTiming.includes(p)) || INSTANT_PHRASES.some((p) => lowerTiming.includes(p))) {
+      updates.timingMode = "asap";
+    } else if (timingSource.trim()) {
+      const dateAttempt = await interpretDate(timingSource, new Date());
+      if (dateAttempt.status === "valid") {
+        updates.timingMode = "date";
+        updates.dateWanted = dateAttempt.humanReadable;
+      } else if (dateAttempt.status === "past") {
+        await sendMessage(
+          phone,
+          `${dateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward, or just say there's no rush if you don't need a specific date?`
+        );
+        await recordFriction(phone);
+        return;
+      }
+    }
+  }
+
+  // --- description ---
+  if (extracted.description && !session.data.description) {
+    updates.description = extracted.description;
+  }
+
+  // --- special instructions (only ever set from something volunteered
+  // unprompted here — the explicit ask-once happens via
+  // getNextMissingPrompt/specialInstructionsAsked below) ---
+  if (extracted.specialInstructions) {
+    updates.specialInstructions = extracted.specialInstructions;
+    updates.specialInstructionsAsked = true;
+  }
+
+  // --- recurring / budget volunteered unprompted ---
+  if (extracted.recurring && !session.data.recurring) updates.recurring = extracted.recurring;
+  if (extracted.budget && !session.data.budget) {
+    const lowerBudget = extracted.budget.toLowerCase();
+    if (!BUDGET_SKIP_WORDS.some((w) => lowerBudget.includes(w))) updates.budget = extracted.budget;
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await updateSession(phone, { data: updates });
+    session = await getSession(phone);
+  }
+
+  // --- pending category-specific follow-up answer ---
+  // Consume the raw reply as the answer to whatever follow-up question was
+  // pending BEFORE this turn — skipped if the message turned out to be
+  // purely a tangential question, since there's nothing to record as an
+  // answer in that case.
+  if (pendingExtra && !isPureQuestion) {
+    const currentQueue = (session.data.extraQueue as ExtraQuestion[] | undefined) ?? [];
+    if (currentQueue[0]?.question === pendingExtra.question) {
+      const existingAnswers = (session.data.extraAnswers as ExtraAnswer[] | undefined) ?? [];
+      const updatedAnswers: ExtraAnswer[] = [
+        ...existingAnswers,
+        { key: pendingExtra.key, question: pendingExtra.question, answer: text },
+      ];
+      const remainingQueue = currentQueue.slice(1);
+      const dataUpdate: Record<string, unknown> = { extraAnswers: updatedAnswers, extraQueue: remainingQueue };
+
+      if (remainingQueue.length === 0) {
+        const recurring = updatedAnswers.find((a) => a.key === "recurring")?.answer;
+        const rawBudget = updatedAnswers.find((a) => a.key === "budget")?.answer;
+        const budget =
+          rawBudget && !BUDGET_SKIP_WORDS.some((w) => rawBudget.toLowerCase().includes(w)) ? rawBudget : undefined;
+        const followupPairs = updatedAnswers.filter((a) => a.key === "followup");
+        if (recurring) dataUpdate.recurring = recurring;
+        if (budget) dataUpdate.budget = budget;
+        if (followupPairs.length > 0 && !session.data.description) {
+          dataUpdate.description = followupPairs.map((a) => `${a.question} ${a.answer}`).join(" | ");
+        }
+      }
+
+      await updateSession(phone, { data: dataUpdate });
+      session = await getSession(phone);
+    }
+  }
+
+  // --- what's next? ---
+  const prefix = [questionAck, nonAnswerNote, vagueNote, ack].filter(Boolean).join("\n\n");
+  const next = getNextMissingPrompt(session.data, pastBookings);
+
+  if (!next) {
+    const confirmPrompt = `Here's what I've got:\n${buildBookingSummary(session.data)}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
+    await sendMessage(phone, prefix ? `${prefix}\n\n${confirmPrompt}` : confirmPrompt);
+    await updateSession(phone, { stage: "awaiting_confirmation", data: { lastPrompt: confirmPrompt } });
     return;
   }
 
-  await sendMessage(phone, "Great — what kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.");
-  await updateSession(phone, { stage: "awaiting_service_type", data: { lastPrompt: "What kind of service do you need?" } });
+  const messageOut = prefix ? `${prefix}\n\n${next.prompt}` : next.prompt;
+  await sendMessage(phone, messageOut);
+  await updateSession(phone, { stage: "collecting_booking", data: { lastPrompt: next.prompt } });
 }
 
 // --- 4. Conversation logic ---
@@ -1436,6 +1637,31 @@ async function handleMessage(
   referral?: MessageReferral
 ) {
   let session = await getSession(phone);
+
+  // Migration shim: a session persisted before the booking flow was
+  // consolidated from nine rigid stages into one conversational
+  // "collecting_booking" stage may still be sitting in Redis under one of
+  // the old stage names (a customer mid-booking when this deployed). None
+  // of those stage names have a handler anymore, so without this a session
+  // like that would silently fall through the rest of this function with
+  // no reply at all. Remap it forward — their already-given data (service
+  // type, location, etc.) is untouched, only .stage changes, so they don't
+  // lose anything, they just resume in the new flow on their next message.
+  const DEPRECATED_STAGES = new Set([
+    "awaiting_mode",
+    "awaiting_service_type",
+    "awaiting_location",
+    "awaiting_date",
+    "awaiting_date_confirmation",
+    "awaiting_extraction_confirmation",
+    "awaiting_extra_details",
+    "awaiting_description",
+    "awaiting_special_instructions",
+  ]);
+  if (DEPRECATED_STAGES.has(session.stage as string)) {
+    session = await updateSession(phone, { stage: "collecting_booking" });
+  }
+
   const lower = text.toLowerCase();
   const now = Date.now();
 
@@ -1515,14 +1741,24 @@ async function handleMessage(
   // gets swallowed into whatever field was in progress instead (this is
   // what caused a real pin to land under "Special instructions" instead of
   // "Location" after a customer tried to fix a bad "Somewhere else" entry).
-  // Excludes "awaiting_location" itself (handled directly, in place, below)
-  // and "awaiting_confirmation" (the summary's already been shown by then —
-  // silently rewriting it there would confuse more than it'd help).
-  if (isLocationPin && LOCATION_PIN_CAPTURE_STAGES.includes(session.stage)) {
+  // Only "collecting_booking" — excludes "awaiting_confirmation" (the
+  // summary's already been shown by then; silently rewriting it there
+  // would confuse more than it'd help). Location capture during
+  // "collecting_booking" itself just runs the normal turn logic, same as
+  // any other newly-given field, via advanceBookingCollection below.
+  if (isLocationPin && session.stage === "collecting_booking") {
     await updateSession(phone, { data: { location: text } });
     session = await getSession(phone);
-    const resumePrompt = session.data.lastPrompt as string | undefined;
-    await sendMessage(phone, `📍 Got your location noted.${resumePrompt ? ` Still need this though: ${resumePrompt}` : ""}`);
+    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+    const next = getNextMissingPrompt(session.data, pastBookings);
+    if (!next) {
+      const confirmPrompt = `Here's what I've got:\n${buildBookingSummary(session.data)}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
+      await sendMessage(phone, `📍 Got your location noted.\n\n${confirmPrompt}`);
+      await updateSession(phone, { stage: "awaiting_confirmation", data: { lastPrompt: confirmPrompt } });
+    } else {
+      await sendMessage(phone, `📍 Got your location noted. Still need this though: ${next.prompt}`);
+      await updateSession(phone, { data: { lastPrompt: next.prompt } });
+    }
     return;
   }
 
@@ -1564,15 +1800,17 @@ async function handleMessage(
     if (isAffirmative(text) && !isNegative(text)) {
       await resetForNewRequest(phone);
       const resolved = await resolveServiceType(reminderText);
-      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      if (resolved.supported) {
+        await updateSession(phone, { data: { serviceType: resolved.serviceType ?? reminderText } });
+      }
+      session = await getSession(phone);
+      const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
+      const next = getNextMissingPrompt(session.data, pastBookings) ?? {
+        prompt: "What kind of service do you need?",
+      };
+      const prompt = next.prompt;
       await sendMessage(phone, `Great — let's get that sorted. ${prompt}`);
-      await updateSession(phone, {
-        stage: "awaiting_mode",
-        data: {
-          lastPrompt: prompt,
-          ...(resolved.supported ? { serviceType: resolved.serviceType ?? reminderText } : {}),
-        },
-      });
+      await updateSession(phone, { stage: "collecting_booking", data: { lastPrompt: prompt } });
       return;
     }
     await updateSession(phone, { data: { awaitingReminderOffer: undefined } });
@@ -1671,10 +1909,10 @@ async function handleMessage(
         await sendMessage(activeChat.claimedBy, `Customer ${phone} started a new request — this conversation has ended.`);
         await endLiveChat(phone);
         await clearActiveChatForAgent(activeChat.claimedBy);
-        const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+        const prompt = "What kind of service do you need?";
         await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
         await resetForNewRequest(phone);
-        await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+        await updateSession(phone, { stage: "collecting_booking", data: { lastPrompt: prompt } });
         return;
       }
 
@@ -1717,7 +1955,7 @@ async function handleMessage(
       // what they mean. Drop it and confirm, rather than the confusing
       // "I don't see an open request" reply, which is technically true of
       // submitted requests but not what a customer mid-booking is asking.
-      if (ACTIVE_STAGES.includes(session.stage)) {
+      if (ACTIVE_BOOKING_STAGES.includes(session.stage)) {
         await resetForNewRequest(phone);
         await sendMessage(
           phone,
@@ -1812,10 +2050,10 @@ async function handleMessage(
         await clearActiveChatForAgent(activeChat.claimedBy);
       }
       await endLiveChat(phone);
-      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
+      const prompt = "What kind of service do you need?";
       await sendMessage(phone, `No problem, let's get you sorted. ${prompt}`);
       await resetForNewRequest(phone);
-      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await updateSession(phone, { stage: "collecting_booking", data: { lastPrompt: prompt } });
       return;
     }
     await sendMessage(phone, "Thanks for your patience — our team's been notified and will jump in here shortly. (Say 'new request' if you'd like to start something new while you wait.)");
@@ -1912,101 +2150,16 @@ async function handleMessage(
     }
 
     if (routed.intent === "booking_intent") {
-      // Don't just acknowledge and ask everything from scratch — the
-      // opening message often already states the service and/or location
-      // (sometimes even a date), e.g. "I need a painter, I'm in Ho". Pull
-      // those out and confirm them explicitly before moving on, so the
-      // bot never re-asks for something already said, and never silently
-      // assumes it understood something it didn't.
-      const [extracted, wholeMessageDateAttempt] = await Promise.all([
-        extractBookingDetails(text),
-        interpretDate(text, new Date()),
-      ]);
-
-      // interpretDate on the FULL opening message can miss a date that's
-      // just one clause in a longer, multi-topic sentence — its system
-      // prompt expects the message to be mainly ABOUT a date, so it
-      // under-extracts when it isn't (confirmed live: "I want a plumber at
-      // my usual place on Friday" came back with no date at all, even
-      // though the AI acknowledgment elsewhere in the same turn clearly
-      // understood "Friday" just fine — the extraction step just wasn't
-      // asked to look for it the right way). extractBookingDetails is
-      // already tuned for pulling specific spans out of a longer message,
-      // so when it caught an explicit date phrase but the whole-message
-      // pass came up empty, give interpretDate a second, focused try on
-      // just that phrase instead of giving up on the date entirely.
-      const dateAttempt =
-        wholeMessageDateAttempt.status !== "valid" && extracted.datePhrase
-          ? await interpretDate(extracted.datePhrase, new Date())
-          : wholeMessageDateAttempt;
-      const extractedDateHuman = dateAttempt.status === "valid" ? dateAttempt.humanReadable : undefined;
-      const extractedDateIso = dateAttempt.status === "valid" ? dateAttempt.isoDate : undefined;
-      const extractedMode: BookingMode | undefined = extractedDateHuman
-        ? "standard"
-        : INSTANT_PHRASES.some((p) => lower.includes(p))
-        ? "instant"
-        : undefined;
-
-      // A service was mentioned in the opening message — check it's a real
-      // request before ever building a confirmation prompt around it (and
-      // normalize problem descriptions like "my AC isn't cooling" into a
-      // proper service name in the process).
-      if (extracted.serviceType) {
-        const resolved = await resolveServiceType(extracted.serviceType);
-        if (!resolved.supported) {
-          const suggestionText = resolved.suggestion
-            ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?`
-            : " Is there something else I can help you find?";
-          await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
-          await recordFriction(phone);
-          return; // stay at "greeting" — their next message goes through this same path again
-        }
-        extracted.serviceType = resolved.serviceType ?? extracted.serviceType;
-      }
-
-      // extractBookingDetails deliberately never invents a location for
-      // "my usual place" — it has no way to know what that place actually
-      // is. But we do, if they've booked before: resolve it against their
-      // last valid location so the confirmation step shows the real
-      // address in one go, instead of the bot asking "which area is this
-      // for?" right after appearing to already understand "your usual
-      // place" in its own opening acknowledgment (confirmed live — that
-      // mismatch is exactly what made a repeat conversation feel like the
-      // bot wasn't listening). No history to resolve against — leave it
-      // unset and ask normally, same as today.
-      if (!extracted.location && USUAL_PLACE_RE.test(text)) {
-        extracted.location = getValidLastLocation(pastBookings);
-      }
-
-      if (extracted.serviceType || extracted.location) {
-        let confirmPrompt: string;
-        if (extracted.serviceType && extracted.location) {
-          confirmPrompt = `Just to confirm — you're after a ${extracted.serviceType}, in ${extracted.location}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
-        } else if (extracted.serviceType) {
-          confirmPrompt = `Just to confirm — you're after a ${extracted.serviceType}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
-        } else {
-          confirmPrompt = `Just to confirm — this is for ${extracted.location}${extractedDateHuman ? `, for ${extractedDateHuman}` : ""}. Did I get that right? Reply 'yes' to confirm, or just tell me what I got wrong.`;
-        }
-        const ack = routed.reply ? `${routed.reply}\n\n` : "";
-        await sendMessage(phone, `${ack}${confirmPrompt}`);
-        await updateSession(phone, {
-          stage: "awaiting_extraction_confirmation",
-          data: {
-            candidateServiceType: extracted.serviceType,
-            candidateLocation: extracted.location,
-            candidateDateHuman: extractedDateHuman,
-            candidateDateIso: extractedDateIso,
-            candidateMode: extractedMode,
-            lastPrompt: confirmPrompt,
-          },
-        });
-        return;
-      }
-
-      const ack = routed.reply ? `${routed.reply}\n\n` : "";
-      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
-      await sendMessage(phone, `${ack}${prompt}`);
-      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      // The opening message goes through the exact same conversational
+      // collector every later message does (see advanceBookingCollection
+      // above) — whatever it states ("I need a painter, I'm in Ho") gets
+      // picked up immediately, with no separate "did I get that right?"
+      // confirmation step. That intermediate confirmation used to exist
+      // for extraction accuracy, but the final review-before-submit step
+      // (awaiting_confirmation, still in place) already shows everything
+      // together for one real confirmation — asking twice was exactly the
+      // kind of over-scripted step this flow was rebuilt to avoid.
+      await advanceBookingCollection(phone, text, routed.reply, routed);
       return;
     }
 
@@ -2016,442 +2169,29 @@ async function handleMessage(
     return;
   }
 
-  if (session.stage === "awaiting_extraction_confirmation") {
-    if (isAffirmative(text) && !isNegative(text)) {
-      const candidateServiceType = session.data.candidateServiceType as string | undefined;
-      const candidateLocation = session.data.candidateLocation as string | undefined;
-      const candidateDateHuman = session.data.candidateDateHuman as string | undefined;
-      const candidateDateIso = session.data.candidateDateIso as string | undefined;
-      const candidateMode = session.data.candidateMode as BookingMode | undefined;
-
-      await updateSession(phone, {
-        data: {
-          serviceType: candidateServiceType,
-          location: candidateLocation,
-          dateWanted: candidateDateHuman,
-        },
-      });
-
-      if (candidateMode) {
-        await proceedAfterMode(phone, candidateMode, candidateDateHuman, candidateDateIso);
-        return;
-      }
-
-      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
-      await sendMessage(phone, prompt);
-      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
-      return;
-    }
-
-    // Not a clear "yes" — but they may have jumped straight to giving a
-    // date instead of confirming first (e.g. replying "friday"). Read
-    // that as implicit confirmation of the service/location plus the
-    // date, rather than discarding everything and starting over. The
-    // date itself still goes through its own explicit confirm step below,
-    // consistent with how dates are always double-checked elsewhere.
-    const correctionDateAttempt = await interpretDate(text, new Date());
-    if (correctionDateAttempt.status === "valid") {
-      const candidateServiceType = session.data.candidateServiceType as string | undefined;
-      const candidateLocation = session.data.candidateLocation as string | undefined;
-      await updateSession(phone, { data: { serviceType: candidateServiceType, location: candidateLocation } });
-      await proceedAfterMode(phone, "standard", correctionDateAttempt.humanReadable, correctionDateAttempt.isoDate);
-      return;
-    }
-    if (correctionDateAttempt.status === "past") {
-      await sendMessage(
-        phone,
-        `${correctionDateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward? Or reply 'yes' if I got the service/location right and you'll give the date next.`
-      );
-      return;
-    }
-
-    // Genuinely not a yes and not a date — don't compound one uncertain
-    // guess with another; drop back to asking the most fundamental
-    // question plainly.
-    const prompt = "No problem — what kind of service do you need?";
-    await sendMessage(phone, prompt);
-    await updateSession(phone, {
-      stage: "awaiting_service_type",
-      data: {
-        candidateServiceType: undefined,
-        candidateLocation: undefined,
-        candidateDateHuman: undefined,
-        candidateDateIso: undefined,
-        candidateMode: undefined,
-        lastPrompt: prompt,
-      },
-    });
-    return;
-  }
-
-  if (session.stage === "awaiting_mode") {
-    // The one stage in this flow that never checked for a deflection back
-    // to something already said — a customer replying "I mentioned the
-    // date already" or "I said Friday here" just fell through to the
-    // generic "let's make sure I've got this right" bounce below, which
-    // doesn't acknowledge the deflection at all and can loop the exact
-    // same question back at them more than once. Handled the same way
-    // every other stage handles it: say plainly that it isn't recoverable
-    // from here, and ask them to just restate it directly.
-    if (isNonAnswer(text)) {
-      await sendMessage(
-        phone,
-        "Sorry, I don't have that noted from earlier in our chat — could you just tell me directly: a specific date, or right away? Reply 'schedule' or 'instant', or send the date."
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    if (lower.includes("instant")) {
-      await proceedAfterMode(phone, "instant");
-      return;
-    }
-
-    if (lower.includes("schedule")) {
-      await proceedAfterMode(phone, "standard");
-      return;
-    }
-
-    // People rarely answer literally — "tomorrow", "asap", "next Monday",
-    // "right away" all clearly mean one or the other even without saying
-    // the word. Catch urgency phrasing first...
-    if (INSTANT_PHRASES.some((p) => lower.includes(p))) {
-      await proceedAfterMode(phone, "instant");
-      return;
-    }
-
-    // ...then check whether they've actually just told us a date ("tomorrow",
-    // "next Monday", "15th August") — that unambiguously means "schedule",
-    // and we can remember the date now so we don't ask them to repeat it
-    // later when we'd normally ask for the date.
-    const dateAttempt = await interpretDate(text, new Date());
-    if (dateAttempt.status === "valid") {
-      await proceedAfterMode(phone, "standard", dateAttempt.humanReadable, dateAttempt.isoDate);
-      return;
-    }
-    if (dateAttempt.status === "past") {
-      await sendMessage(
-        phone,
-        `${dateAttempt.humanReadable ?? "That date"} has already passed — could you give me a date from today onward, or say 'instant' if you need it right away?`
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    // Not a direct "schedule"/"instant", not urgency phrasing, not a date —
-    // see if it's actually a question first (e.g. "do you work weekends?"),
-    // answer it, then remind them of the pending choice so the
-    // conversation doesn't stall.
-    const pastBookings = (session.data.pastBookings as PastBooking[] | undefined) ?? [];
-    const recentMessages = (session.data.messageLog as string[] | undefined) ?? [];
-    const routed = await routeIntent(text, {
-      pastBookings,
-      recentMessages,
-      referral: await resolveLinkReferral(text),
-    });
-    const reminder = "Would you like this done on a specific date, or right away? Reply 'schedule' or 'instant'.";
-
-    if (routed.intent === "question" && routed.reply) {
-      // Only tack the reminder onto the FIRST deflection. Without this
-      // cap, every follow-up question for the rest of the conversation —
-      // even ones with nothing to do with booking, like someone asking
-      // about a promo post — got "And just to continue — would you like
-      // this done on a specific date" bolted onto the end forever, which
-      // reads as the bot not actually listening. Once someone's asked a
-      // second unrelated question, they've made it clear they're not
-      // ready to answer that yet; they can still say "schedule"/"instant"
-      // whenever they are, since this stage keeps checking for that above
-      // on every message regardless.
-      const deflections = ((session.data.modeDeflectionCount as number | undefined) ?? 0) + 1;
-      await updateSession(phone, { data: { modeDeflectionCount: deflections } });
-
-      if (deflections === 1) {
-        await sendMessage(phone, `${routed.reply}\n\nAnd just to continue — ${reminder}`);
-      } else {
-        await sendMessage(phone, routed.reply);
-      }
-      return;
-    }
-
-    await sendMessage(phone, `Sorry, just to make sure I've got this right — ${reminder}`);
-    await recordFriction(phone);
-    return;
-  }
-
-  if (session.stage === "awaiting_service_type") {
-    if (isNonAnswer(text)) {
-      await sendMessage(
-        phone,
-        "Sorry, I don't have that noted from earlier in our chat — could you tell me again what kind of service you need?"
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    const resolved = await resolveServiceType(text);
-    if (!resolved.supported) {
-      const suggestionText = resolved.suggestion ? ` Would ${resolved.suggestion} work instead, or is there something else I can help you find?` : " Is there something else I can help you find?";
-      await sendMessage(phone, `Sorry, that's not something we currently have providers for.${suggestionText}`);
-      await recordFriction(phone);
-      return; // stay at awaiting_service_type — let them try again
-    }
-
-    await updateSession(phone, { data: { serviceType: resolved.serviceType ?? text } });
-    await proceedAfterServiceType(phone, "Got it.");
-    return;
-  }
-
-  if (session.stage === "awaiting_location") {
-    if (isNonAnswer(text)) {
-      await sendMessage(
-        phone,
-        "Sorry, I don't have a location noted from earlier in our chat — could you tell me again which area this is for?"
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    // Only treat this as "reuse my last location" on a clearly closed-ended
-    // reply — not on isAffirmative()'s broad substring match, since a real
-    // location name could easily contain "ok"/"sure"/etc as a substring
-    // (e.g. "Okaishie").
-    const suggestedLastLocation = session.data.suggestedLastLocation as string | undefined;
-    const trimmedLower = lower.trim();
-    const wantsSameLocation =
-      Boolean(suggestedLastLocation) &&
-      (["same", "same place", "same location", "same as before", "same as last time"].some(
-        (w) => trimmedLower === w || trimmedLower.startsWith(w)
-      ) ||
-        ["yes", "yeah", "yep"].includes(trimmedLower) ||
-        AFFIRMATIVE_EMOJI.some((e) => text.includes(e)));
-
-    // Rejecting the suggestion without giving a real location ("somewhere
-    // else"), or a non-committal filler ("idk", "anywhere is fine") — either
-    // way, nothing usable has actually been said yet, so ask again instead
-    // of silently storing the phrase as if it were a real place. This is
-    // what let "Location: Somewhere else" through in the first place.
-    if (!wantsSameLocation && (LOCATION_REJECTS_SUGGESTION_RE.test(trimmedLower) || isVagueReply(text))) {
-      const prompt =
-        "No problem — what's the actual area or location for this? You're welcome to drop a pin 📍 and mention a nearby landmark too if that's easier — both optional.";
-      await sendMessage(phone, prompt);
-      await updateSession(phone, { data: { lastPrompt: prompt } });
-      await recordFriction(phone);
-      return;
-    }
-
-    const location = wantsSameLocation ? (suggestedLastLocation as string) : text;
-
-    await updateSession(phone, { data: { location } });
-    await proceedAfterLocation(phone);
-    return;
-  }
-
-  if (session.stage === "awaiting_date") {
-    const interpretation = await interpretDate(text, new Date());
-
-    if (interpretation.status === "past") {
-      await sendMessage(
-        phone,
-        `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    if (interpretation.status === "unclear") {
-      await sendMessage(
-        phone,
-        "Sorry, I didn't quite catch that date — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    // We're reasonably confident, but always read it back and get an
-    // explicit yes before locking it in — cheap insurance against a
-    // misread date turning into a booking for the wrong day.
-    const confirmPrompt = `Just to confirm — you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
-    await sendMessage(phone, confirmPrompt);
-    await updateSession(phone, {
-      stage: "awaiting_date_confirmation",
-      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
-    });
-    return;
-  }
-
-  if (session.stage === "awaiting_date_confirmation") {
-    if (isAffirmative(text)) {
-      const confirmedDate = (session.data.pendingDateHuman as string | undefined) ?? text;
-      await updateSession(phone, { data: { dateWanted: confirmedDate } });
-      await beginJobDetails(phone);
-      return;
-    }
-
-    // Not a clear "yes" — treat their reply as a fresh date attempt rather
-    // than assuming they meant "no", since they may have just retyped it.
-    const interpretation = await interpretDate(text, new Date());
-
-    if (interpretation.status === "past") {
-      await sendMessage(
-        phone,
-        `${interpretation.humanReadable ?? "That date"} has already passed — could you give me a date from today onward?`
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    if (interpretation.status === "unclear") {
-      await sendMessage(
-        phone,
-        "Sorry, I still didn't catch that clearly — could you try again? For example: 'tomorrow', '15th August', or 'next Monday'."
-      );
-      await recordFriction(phone);
-      return;
-    }
-
-    const confirmPrompt = `Got it — just to confirm, you'd like this done on ${interpretation.humanReadable}. Is that right? Reply 'yes' to confirm, or send the correct date.`;
-    await sendMessage(phone, confirmPrompt);
-    await updateSession(phone, {
-      data: { pendingDateHuman: interpretation.humanReadable, pendingDateIso: interpretation.isoDate, lastPrompt: confirmPrompt },
-    });
-    return;
-  }
-
-  if (session.stage === "awaiting_extra_details") {
-    if (isNonAnswer(text)) {
-      const askedQuestion = (session.data.lastPrompt as string | undefined) ?? "that";
-      await sendMessage(phone, `Sorry, I don't have an answer noted for that yet — could you tell me again: ${askedQuestion}`);
-      await recordFriction(phone);
-      return;
-    }
-
-    const askedQuestion = (session.data.lastPrompt as string) ?? "";
-    const askedKey = (session.data.currentExtraKey as ExtraQuestionKey | undefined) ?? "followup";
-    const existingAnswers =
-      (session.data.extraAnswers as { key: ExtraQuestionKey; question: string; answer: string }[] | undefined) ?? [];
-    const updatedAnswers = [...existingAnswers, { key: askedKey, question: askedQuestion, answer: text }];
-
-    const queue = (session.data.extraQueue as ExtraQuestion[] | undefined) ?? [];
-
-    if (queue.length > 0) {
-      const [next, ...rest] = queue;
-      await sendMessage(phone, next.question);
-      await updateSession(phone, {
-        data: { extraAnswers: updatedAnswers, extraQueue: rest, currentExtraKey: next.key, lastPrompt: next.question },
-      });
-      return;
-    }
-
-    const recurring = updatedAnswers.find((a) => a.key === "recurring")?.answer;
-    const rawBudget = updatedAnswers.find((a) => a.key === "budget")?.answer;
-    const BUDGET_SKIP_WORDS = ["no", "not sure", "none", "n/a", "dont know", "don't know", "idk"];
-    const budget =
-      rawBudget && !BUDGET_SKIP_WORDS.some((w) => rawBudget.toLowerCase().includes(w)) ? rawBudget : undefined;
-    const followupPairs = updatedAnswers.filter((a) => a.key === "followup");
-
-    if (followupPairs.length > 0) {
-      // Specifics already collected via follow-up questions — skip the
-      // generic "describe the job" prompt and build the description from
-      // what we already have.
-      const description = followupPairs.map((a) => `${a.question} ${a.answer}`).join(" | ");
-      const prompt =
-        "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
-      await sendMessage(phone, prompt);
-      await updateSession(phone, {
-        stage: "awaiting_special_instructions",
-        data: { description, recurring, budget, lastPrompt: prompt },
-      });
-      return;
-    }
-
-    // No follow-up questions for this category (e.g. we only asked
-    // recurring and/or budget) — still need the actual job description.
-    const prompt = "Thanks — now tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.";
-    await sendMessage(phone, prompt);
-    await updateSession(phone, { stage: "awaiting_description", data: { recurring, budget, lastPrompt: prompt } });
-    return;
-  }
-
-  if (session.stage === "awaiting_description") {
-    if (isNonAnswer(text)) {
-      await sendMessage(
-        phone,
-        "Sorry, I don't have that noted from earlier in our chat — could you describe again what you need done?"
-      );
-      await recordFriction(phone);
-      return;
-    }
-    if (isVagueReply(text)) {
-      await sendMessage(
-        phone,
-        "Could you be a bit more specific about what you need done? Even a short line helps — e.g. 'fix a leaking pipe under the sink'."
-      );
-      await recordFriction(phone);
-      return;
-    }
-    const prompt =
-      "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.";
-    await sendMessage(phone, prompt);
-    await updateSession(phone, { stage: "awaiting_special_instructions", data: { description: text, lastPrompt: prompt } });
-    return;
-  }
-
-  if (session.stage === "awaiting_special_instructions") {
-    // A deflection back to something said earlier ("I mentioned the time
-    // already") is neither a real answer nor a genuine "no, nothing to
-    // note" — matching the awaiting_description stage's handling, ask them
-    // to repeat it rather than silently storing the deflection text itself
-    // as the special instructions.
-    if (isNonAnswer(text)) {
-      await sendMessage(
-        phone,
-        "Sorry, I don't have that noted from earlier in our chat — could you let me know directly what you'd like our artisan to pay attention to, or just say 'no' if there isn't anything?"
-      );
-      await recordFriction(phone);
-      return;
-    }
-    const SKIP_WORDS = ["no", "none", "nothing", "n/a", "nope", "not really"];
-    const skip = SKIP_WORDS.some((w) => lower === w || lower.startsWith(`${w} `) || lower.includes(w));
-    const specialInstructions = skip ? undefined : text;
-
-    const mode = session.data.mode as BookingMode;
-    const serviceType = session.data.serviceType as string;
-    const location = session.data.location as string;
-    const dateWanted = session.data.dateWanted as string | undefined;
-    const description = session.data.description as string;
-    const recurring = session.data.recurring as string | undefined;
-    const budget = session.data.budget as string | undefined;
-
-    const summaryLines = [
-      `Service: ${serviceType}`,
-      `Location: ${location}`,
-      ...(mode === "standard" ? [`Date: ${dateWanted}`] : []),
-      `Details: ${description}`,
-      ...(recurring ? [`Frequency: ${recurring}`] : []),
-      ...(budget ? [`Budget: ${budget}`] : []),
-      ...(specialInstructions ? [`Special instructions: ${specialInstructions}`] : []),
-    ];
-    const confirmPrompt = `Here's what I've got:\n${summaryLines.join("\n")}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
-    await sendMessage(phone, confirmPrompt);
-    await updateSession(phone, {
-      stage: "awaiting_confirmation",
-      data: { specialInstructions, lastPrompt: confirmPrompt },
-    });
+  if (session.stage === "collecting_booking") {
+    await advanceBookingCollection(phone, text);
     return;
   }
 
   if (session.stage === "awaiting_confirmation") {
     if (!isAffirmative(text) || isNegative(text)) {
-      const prompt = "Would you like this done on a specific date, or right away? Just reply 'schedule' or 'instant'.";
-      await sendMessage(phone, `No worries, let's start over. ${prompt}`);
+      const prompt = "No worries, let's start over. What kind of service do you need?";
+      await sendMessage(phone, prompt);
       await recordFriction(phone);
       await resetForNewRequest(phone);
-      await updateSession(phone, { stage: "awaiting_mode", data: { lastPrompt: prompt } });
+      await updateSession(phone, { stage: "collecting_booking", data: { lastPrompt: prompt } });
       return;
     }
 
     const user = await findOrCreateUserByPhone(phone);
-    const mode = session.data.mode as BookingMode;
+    // "mode" only ever mattered downstream for two things — the turnaround-
+    // time message and the unclaimed-request nudge threshold in quotes.ts —
+    // both real, so it's still computed and stored exactly as before. The
+    // difference is customers are never asked to explicitly choose between
+    // "schedule" and "instant" anymore; it's derived from whatever timing
+    // they actually gave (see advanceBookingCollection's timingMode field).
+    const mode: BookingMode = session.data.timingMode === "date" ? "standard" : "instant";
     const attachments = (session.data.attachments as MediaAttachment[] | undefined) ?? [];
     const specialInstructions = session.data.specialInstructions as string | undefined;
     const recurring = session.data.recurring as string | undefined;
@@ -2587,41 +2327,12 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 // Only nudge customers who are genuinely mid-booking and waiting on us to
 // hear back from them — not on the greeting screen, not already handed to
 // a human agent, and not just after finishing a booking.
-const ACTIVE_STAGES: ConversationStage[] = [
-  "awaiting_extraction_confirmation",
-  "awaiting_mode",
-  "awaiting_service_type",
-  "awaiting_location",
-  "awaiting_date",
-  "awaiting_date_confirmation",
-  "awaiting_extra_details",
-  "awaiting_description",
-  "awaiting_special_instructions",
-  "awaiting_confirmation",
-];
-
-// Stages where a dropped pin should be captured as the location immediately
-// even though it isn't the current question — see handleMessage's
-// isLocationPin handling near the top. Excludes "awaiting_location" (already
-// handled in place) and "awaiting_confirmation" (the summary's already been
-// shown by then).
-const LOCATION_PIN_CAPTURE_STAGES: ConversationStage[] = [
-  "awaiting_extraction_confirmation",
-  "awaiting_mode",
-  "awaiting_service_type",
-  "awaiting_date",
-  "awaiting_date_confirmation",
-  "awaiting_extra_details",
-  "awaiting_description",
-  "awaiting_special_instructions",
-];
-
 function startInactivitySweep() {
   setInterval(() => {
     (async () => {
       const now = Date.now();
       for (const session of await getAllSessions()) {
-        if (!ACTIVE_STAGES.includes(session.stage)) continue;
+        if (!ACTIVE_BOOKING_STAGES.includes(session.stage)) continue;
 
         const lastCustomerMessageAt = session.data.lastCustomerMessageAt as number | undefined;
         if (!lastCustomerMessageAt) continue;

@@ -8,15 +8,7 @@ import { kvGet, kvSet, kvDelete, kvGetAllWithPrefix } from "./store";
 
 export type ConversationStage =
   | "greeting"
-  | "awaiting_mode"
-  | "awaiting_service_type"
-  | "awaiting_location"
-  | "awaiting_date"
-  | "awaiting_date_confirmation"
-  | "awaiting_extraction_confirmation" // confirming service/location/date already given in the opening message
-  | "awaiting_extra_details" // service-specific follow-ups, recurring, budget
-  | "awaiting_description"
-  | "awaiting_special_instructions"
+  | "collecting_booking" // conversational info-gathering — see server.ts's advanceBookingCollection
   | "awaiting_confirmation"
   | "request_submitted"
   | "escalated";

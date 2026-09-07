@@ -6,7 +6,7 @@
 //
 // The resulting text is handed back to server.ts as a plain string and
 // from that point on is handled completely normally by the rest of the
-// app: nothing downstream (extractBookingDetails, stage logic, non-answer
+// app: nothing downstream (extractBookingSlots, stage logic, non-answer
 // detection, agent commands...) needs to know or care that a message
 // originated as speech rather than typed text. That's what keeps this a
 // small, bolt-on addition rather than a parallel voice-specific
