@@ -164,6 +164,64 @@ const REMINDER_KEYWORD_RE = /\bremind(er|ers)?\b/i;
 // customer's very first message, so urgency stated up front isn't ignored.
 const INSTANT_PHRASES = ["asap", "as soon as possible", "right away", "immediately", "urgent", "urgently"];
 
+// Every stage of the multi-step booking flow — used both to recognize a
+// stray "hi" mid-flow (see ACTIVE_BOOKING_STAGES's bare-greeting guard
+// below) and to recognize when a customer explicitly steps away from it
+// (see the decline-signal check near the top of handleMessage). Promoted
+// to module scope (it used to be declared inline, once, right before its
+// one use) so both checks can share the exact same list instead of
+// drifting out of sync with each other.
+const ACTIVE_BOOKING_STAGES: ConversationStage[] = [
+  "awaiting_mode",
+  "awaiting_extraction_confirmation",
+  "awaiting_service_type",
+  "awaiting_location",
+  "awaiting_date",
+  "awaiting_date_confirmation",
+  "awaiting_extra_details",
+  "awaiting_description",
+  "awaiting_special_instructions",
+  "awaiting_confirmation",
+];
+
+// A customer explicitly stepping away mid-booking — "that's all for now",
+// "never mind", "not right now" — is unambiguous, but nothing previously
+// recognized it: every stage's fallback for unrecognized input just
+// re-asked whatever it was already asking, verbatim, no matter what the
+// customer actually said. Confirmed live — a customer who said "thank you
+// for the information, that will be all for now" while mid-way through the
+// schedule/instant question got the exact same "Would you like this done
+// on a specific date, or right away?" bounced back at them, which reads as
+// the bot not listening at all. Phrase-list match (like INSTANT_PHRASES
+// above) rather than a single do-everything regex — easy to extend.
+const DECLINE_PHRASES = [
+  "that's all for now",
+  "that is all for now",
+  "that'll be all",
+  "that will be all",
+  "no thanks",
+  "no thank you",
+  "not right now",
+  "not interested",
+  "never mind",
+  "nevermind",
+  "i'm good",
+  "im good",
+  "i am good",
+  "maybe later",
+  "maybe another time",
+  "i'll get back to you",
+  "ill get back to you",
+  "i'll think about it",
+  "ill think about it",
+  "not today",
+];
+
+function isDeclineSignal(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  return DECLINE_PHRASES.some((p) => lower.includes(p));
+}
+
 // Lets a customer break out of "escalated" mode and start fresh — either
 // while waiting for an agent to claim their conversation, or mid-way
 // through an active claimed live chat (see the live-chat relay block in
@@ -1432,6 +1490,23 @@ async function handleMessage(
     return;
   }
 
+  // A customer explicitly stepping away mid-booking — see DECLINE_PHRASES
+  // above for the real conversation that surfaced this. Only special-cased
+  // while an actual multi-step flow is running (ACTIVE_BOOKING_STAGES) —
+  // at "greeting" or once a booking's fully confirmed, the same words are
+  // just normal chat and should flow through to the AI as usual, not get
+  // hijacked here. Resets to "greeting" (not "escalated" or anything
+  // stickier) so if they come back later, they get a fresh, normal
+  // response rather than being dropped back into the same interrogation.
+  if (ACTIVE_BOOKING_STAGES.includes(session.stage) && isDeclineSignal(text)) {
+    await updateSession(phone, { stage: "greeting", data: { lastPrompt: undefined } });
+    await sendMessage(
+      phone,
+      "No worries at all — I'll leave it there for now. Whenever you're ready to pick this back up, or if you need anything else, just message me here."
+    );
+    return;
+  }
+
   // A dropped pin is an unambiguous "here's the place" signal — capture it
   // as the booking's location the instant it arrives, even if we happen to
   // be mid-way through asking about something else (date, description,
@@ -1812,18 +1887,7 @@ async function handleMessage(
   // treated as their answer to whatever we just asked, and it shouldn't
   // restart the flow either — just acknowledge it and pick up right where
   // we left off, the way a person would.
-  const MID_FLOW_GUARD_STAGES: ConversationStage[] = [
-    "awaiting_extraction_confirmation",
-    "awaiting_service_type",
-    "awaiting_location",
-    "awaiting_date",
-    "awaiting_date_confirmation",
-    "awaiting_extra_details",
-    "awaiting_description",
-    "awaiting_special_instructions",
-    "awaiting_confirmation",
-  ];
-  if (MID_FLOW_GUARD_STAGES.includes(session.stage) && isBareGreetingMsg) {
+  if (ACTIVE_BOOKING_STAGES.includes(session.stage) && isBareGreetingMsg) {
     const lastPrompt = (session.data.lastPrompt as string | undefined) ?? "Let's continue with your request — where were we?";
     await sendMessage(phone, `Hey! Good to hear from you — picking up right where we left off.\n\n${lastPrompt}`);
     return;
