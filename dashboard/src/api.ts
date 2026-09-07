@@ -4,6 +4,7 @@ import {
   getAlerts,
   getConversations,
   getTranscriptForPhone,
+  getTranscriptLines,
   searchTranscripts,
   getOverview,
   getAgentStats,
@@ -50,6 +51,14 @@ api.get("/conversations", async (_req: Request, res: Response) => {
 
 api.get("/conversations/:phone", async (req: Request, res: Response) => {
   res.json(await getTranscriptForPhone(req.params.phone));
+});
+
+// Every raw transcript line, unfiltered — the Chats tab uses this once per
+// load to compute unread counts client-side (see app.js), since "unread" is
+// inherently per-browser here (no per-agent accounts) rather than something
+// this stateless, read-only service can track server-side.
+api.get("/transcripts", async (_req: Request, res: Response) => {
+  res.json(await getTranscriptLines());
 });
 
 api.get("/transcripts/search", async (req: Request, res: Response) => {

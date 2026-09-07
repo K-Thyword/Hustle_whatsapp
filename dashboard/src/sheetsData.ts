@@ -198,10 +198,16 @@ export interface ConversationSummary {
   phone: string;
   lastMessage: string;
   lastTimestamp: string;
+  firstTimestamp: string; // when this phone number first ever messaged — powers the Contacts tab
   messageCount: number;
 }
 
-async function getTranscriptLines(): Promise<TranscriptLine[]> {
+// Exported (not just used internally) so the Chats tab can pull every raw
+// line once and derive unread counts client-side against each browser's own
+// "last seen per phone" state — there's no server-side notion of "read"
+// here, since the dashboard has no per-agent accounts to hang it off of
+// (see auth.ts) and stays deliberately stateless/read-only otherwise.
+export async function getTranscriptLines(): Promise<TranscriptLine[]> {
   const rows = await fetchTranscriptRows();
   return rows
     .filter((row) => row.length >= 4)
@@ -219,15 +225,23 @@ export async function getConversations(): Promise<ConversationSummary[]> {
 
   for (const line of lines) {
     const existing = byPhone.get(line.phone);
-    if (!existing || line.timestamp >= existing.lastTimestamp) {
+    if (!existing) {
       byPhone.set(line.phone, {
         phone: line.phone,
         lastMessage: line.text,
         lastTimestamp: line.timestamp,
-        messageCount: (existing?.messageCount ?? 0) + 1,
+        firstTimestamp: line.timestamp,
+        messageCount: 1,
       });
     } else {
       existing.messageCount += 1;
+      if (line.timestamp >= existing.lastTimestamp) {
+        existing.lastMessage = line.text;
+        existing.lastTimestamp = line.timestamp;
+      }
+      if (line.timestamp < existing.firstTimestamp) {
+        existing.firstTimestamp = line.timestamp;
+      }
     }
   }
 

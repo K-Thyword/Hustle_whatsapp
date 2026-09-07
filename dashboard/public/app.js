@@ -26,6 +26,41 @@ function statusBadge(status, isOpen) {
   return `<span class="badge ${isOpen ? "badge-open" : "badge-closed"}">${esc(status)}</span>`;
 }
 
+// --- Unread tracking (per-browser, not per-agent — this dashboard has one
+// shared login for everyone, so "unread" can only mean "unread on this
+// device." A phone that's never been opened on this browser counts every
+// customer message as unread; opening its thread marks it caught up, and
+// only new customer messages after that point count from then on. ---
+const LAST_SEEN_KEY = "hustle_dashboard_last_seen";
+
+function loadLastSeenMap() {
+  try {
+    return JSON.parse(localStorage.getItem(LAST_SEEN_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function markPhoneSeen(phone) {
+  const map = loadLastSeenMap();
+  map[phone] = new Date().toISOString();
+  localStorage.setItem(LAST_SEEN_KEY, JSON.stringify(map));
+}
+
+// Counts customer (not bot) messages per phone with a timestamp after that
+// phone's last-seen mark, defaulting to "never seen" (epoch) so a
+// never-opened conversation shows its full customer message count.
+function computeUnreadCounts(lines) {
+  const lastSeen = loadLastSeenMap();
+  const counts = {};
+  for (const l of lines) {
+    if (l.direction !== "customer") continue;
+    const seenAt = lastSeen[l.phone] || "";
+    if (l.timestamp > seenAt) counts[l.phone] = (counts[l.phone] || 0) + 1;
+  }
+  return counts;
+}
+
 // --- Tab: Overview ---
 async function renderOverview() {
   contentEl.innerHTML = `<h1>Overview</h1><p class="muted">A snapshot of recent activity.</p>
@@ -158,9 +193,16 @@ async function renderChats() {
 
   const convList = document.getElementById("convList");
   const thread = document.getElementById("thread");
+  let unreadCounts = {};
+
+  function unreadBadge(phone) {
+    const n = unreadCounts[phone];
+    return n ? `<span class="unread-badge">${n}</span>` : "";
+  }
 
   async function loadConversations() {
-    const convs = await api("/conversations");
+    const [convs, lines] = await Promise.all([api("/conversations"), api("/transcripts")]);
+    unreadCounts = computeUnreadCounts(lines);
     if (!convs.length) {
       convList.innerHTML = `<p class="muted" style="padding:12px">No conversations logged yet.</p>`;
       return;
@@ -168,7 +210,7 @@ async function renderChats() {
     convList.innerHTML = convs
       .map(
         (c) => `<div class="conv-item" data-phone="${esc(c.phone)}">
-          <div class="conv-phone">${esc(c.phone)}</div>
+          <div class="conv-phone">${esc(c.phone)} ${unreadBadge(c.phone)}</div>
           <div class="conv-preview">${esc(c.lastMessage)}</div>
           <div class="msg-time">${fmtTime(c.lastTimestamp)} · ${c.messageCount} msgs</div>
         </div>`
@@ -181,6 +223,20 @@ async function renderChats() {
         loadThread(el.dataset.phone);
       })
     );
+  }
+
+  // Re-renders just the badges/highlight against the in-memory unreadCounts
+  // — used right after marking a phone seen, so the count clears instantly
+  // without a full re-fetch of conversations + transcripts.
+  function refreshUnreadBadges() {
+    convList.querySelectorAll(".conv-item").forEach((el) => {
+      const phone = el.dataset.phone;
+      const phoneEl = el.querySelector(".conv-phone");
+      const existingBadge = phoneEl.querySelector(".unread-badge");
+      if (existingBadge) existingBadge.remove();
+      const badge = unreadBadge(phone);
+      if (badge) phoneEl.insertAdjacentHTML("beforeend", ` ${badge}`);
+    });
   }
 
   async function loadThread(phone) {
@@ -196,6 +252,9 @@ async function renderChats() {
         </div>`
       )
       .join("");
+    markPhoneSeen(phone);
+    delete unreadCounts[phone];
+    refreshUnreadBadges();
   }
 
   let searchTimer;
@@ -223,6 +282,27 @@ async function renderChats() {
   });
 
   loadConversations();
+}
+
+// --- Tab: Contacts ---
+// Every unique phone number that has ever messaged the bot, one row each —
+// reuses /api/conversations, which is already grouped/deduped by phone (a
+// repeat contact days later lands back in the same entry, it never creates
+// a second one), just sorted and displayed differently than the Chats list.
+async function renderContacts() {
+  contentEl.innerHTML = `<h1>Contacts</h1><p class="muted">Every unique number that has messaged the bot — no duplicates, ordered by first contact.</p><div id="contactsTable"></div>`;
+  const convs = await api("/conversations");
+  if (!convs.length) {
+    document.getElementById("contactsTable").innerHTML = `<p class="muted">No contacts logged yet.</p>`;
+    return;
+  }
+  const sorted = [...convs].sort((a, b) => (a.firstTimestamp < b.firstTimestamp ? 1 : -1));
+  document.getElementById("contactsTable").innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>Phone</th><th>First contacted</th><th>Last contacted</th><th>Messages</th></tr></thead>
+    <tbody>${sorted
+      .map((c) => `<tr><td>${esc(c.phone)}</td><td>${fmtTime(c.firstTimestamp)}</td><td>${fmtTime(c.lastTimestamp)}</td><td>${c.messageCount}</td></tr>`)
+      .join("")}</tbody></table></div>
+    <p class="muted" style="margin-top:10px">${sorted.length} unique contact${sorted.length === 1 ? "" : "s"}.</p>`;
 }
 
 // --- Tab: Agents ---
@@ -283,12 +363,20 @@ async function renderReports() {
   load();
 }
 
-const tabs = { overview: renderOverview, requests: renderRequests, alerts: renderAlerts, chats: renderChats, agents: renderAgents, reports: renderReports };
+const tabs = {
+  overview: renderOverview,
+  requests: renderRequests,
+  alerts: renderAlerts,
+  chats: renderChats,
+  contacts: renderContacts,
+  agents: renderAgents,
+  reports: renderReports,
+};
 
 // Chats and Reports both hold in-progress state a background refresh would
 // clobber (a selected conversation mid-read, a "Send now" button click) —
 // only the plain data-table tabs auto-refresh.
-const AUTO_REFRESH_TABS = new Set(["overview", "requests", "alerts", "agents"]);
+const AUTO_REFRESH_TABS = new Set(["overview", "requests", "alerts", "contacts", "agents"]);
 let currentTab = "overview";
 let lastRefreshAt = Date.now();
 
