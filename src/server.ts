@@ -1347,12 +1347,15 @@ function buildExtraQueue(serviceType: string): ExtraQuestion[] {
 // not enforced, since extraction runs every turn regardless of what's
 // being asked; this only decides what to ask about when more than one
 // thing is still missing.
+type MissingField = "serviceType" | "location" | "timing" | "extra" | "description" | "specialInstructions";
+
 function getNextMissingPrompt(
   data: Record<string, unknown>,
   pastBookings: PastBooking[]
-): { prompt: string; awaitingExtra?: ExtraQuestion } | undefined {
+): { field: MissingField; prompt: string; awaitingExtra?: ExtraQuestion } | undefined {
   if (!data.serviceType) {
     return {
+      field: "serviceType",
       prompt:
         "What kind of service do you need? For example: plumber, electrician, hairdresser, accountant, tutor, or anything along those lines.",
     };
@@ -1361,6 +1364,7 @@ function getNextMissingPrompt(
   if (!data.location) {
     const lastLocation = getValidLastLocation(pastBookings);
     return {
+      field: "location",
       prompt: lastLocation
         ? `Is this for ${lastLocation} again, or somewhere else? Reply 'same' to reuse it, or tell me the new location — dropping a pin 📍 and mentioning a nearby landmark also works and helps our provider find you (both optional).`
         : "Which area or location is this for? You can also drop a pin 📍 and mention a nearby landmark to help our provider find you — both optional.",
@@ -1369,6 +1373,7 @@ function getNextMissingPrompt(
 
   if (!data.timingMode) {
     return {
+      field: "timing",
       prompt:
         "When would you like this done — a specific date, or is it something you need as soon as possible? Either works, just let me know.",
     };
@@ -1376,17 +1381,19 @@ function getNextMissingPrompt(
 
   const extraQueue = (data.extraQueue as ExtraQuestion[] | undefined) ?? [];
   if (extraQueue.length > 0) {
-    return { prompt: extraQueue[0].question, awaitingExtra: extraQueue[0] };
+    return { field: "extra", prompt: extraQueue[0].question, awaitingExtra: extraQueue[0] };
   }
 
   if (!data.description) {
     return {
+      field: "description",
       prompt: "Tell me a bit more about what you need done. You're welcome to send a photo or video too if that helps explain it.",
     };
   }
 
   if (!data.specialInstructionsAsked) {
     return {
+      field: "specialInstructions",
       prompt:
         "Is there anything specific you'd like our artisan to pay attention to? For example preferred timing, access instructions, or anything to be careful of. Reply with details, or just say 'no' if there isn't anything.",
     };
@@ -1438,8 +1445,21 @@ async function advanceBookingCollection(
       recentMessages,
       referral: await resolveLinkReferral(text),
     }));
-  const isPureQuestion = routed.intent === "question" && !pendingExtra;
+  // Bug (found via live testing): this used to be
+  // `routed.intent === "question" && !pendingExtra`, which made
+  // isPureQuestion FALSE whenever a category follow-up was pending —
+  // exactly backwards, since that's precisely when a question shouldn't
+  // get swallowed as the literal answer to the pending follow-up. Confirmed
+  // live: "i mentioned that 30 guests.. Can i get for Ho?" got stored
+  // verbatim as the answer to "How many people is this catering for?".
+  const isPureQuestion = routed.intent === "question";
   const questionAck = routed.intent === "question" ? routed.reply : undefined;
+
+  // What was actually being asked before this turn's updates — used below
+  // both to decide what a bare "no" is declining (specialInstructions
+  // specifically, not e.g. a service-type correction) and available for
+  // any other field-specific handling that needs to know the prior prompt.
+  const priorField = getNextMissingPrompt(session.data, pastBookings)?.field;
 
   const nonAnswerNote = isNonAnswer(text)
     ? "Sorry, I don't have that noted from earlier in our chat — could you just tell me directly?"
@@ -1461,7 +1481,10 @@ async function advanceBookingCollection(
 
   const updates: Record<string, unknown> = {};
 
-  // --- service type ---
+  // --- service type --- (first value wins deliberately: changing service
+  // type mid-flow would invalidate an already-built category follow-up
+  // queue, so this one field is not correctable the way the others below
+  // are — a genuine change of service is rare enough to just say "agent")
   if (extracted.serviceType && !session.data.serviceType) {
     const resolved = await resolveServiceType(extracted.serviceType);
     if (!resolved.supported) {
@@ -1477,10 +1500,14 @@ async function advanceBookingCollection(
     updates.extraAnswers = [];
   }
 
-  // --- location ---
-  if (extracted.location && !session.data.location) {
+  // --- location --- (correctable: a clear new extraction always wins,
+  // since the extractor is already told not to re-extract something
+  // already known unless the customer is clearly changing it — this is
+  // what lets "I want to move it to Ho" actually update a location that
+  // was already set to "Kumasi", instead of being silently discarded)
+  if (extracted.location) {
     updates.location = extracted.location;
-  } else if (!session.data.location && !extracted.location) {
+  } else if (!session.data.location) {
     const lastLocation = getValidLastLocation(pastBookings);
     const trimmedLower = text.trim().toLowerCase();
     const wantsSameLocation =
@@ -1496,12 +1523,17 @@ async function advanceBookingCollection(
     }
   }
 
-  // --- timing ---
-  if (!session.data.timingMode) {
+  // --- timing --- (correctable, but only when the extractor actually
+  // found a timing phrase in THIS message — if timing's already set and
+  // nothing timing-related was said, there's nothing to re-interpret, so
+  // this doesn't fall back to running interpretDate on unrelated raw text
+  // the way the first-time case below does)
+  if (extracted.timingPhrase || !session.data.timingMode) {
     const timingSource = extracted.timingPhrase ?? text;
     const lowerTiming = timingSource.toLowerCase();
     if (NO_PREFERENCE_PHRASES.some((p) => lowerTiming.includes(p)) || INSTANT_PHRASES.some((p) => lowerTiming.includes(p))) {
       updates.timingMode = "asap";
+      updates.dateWanted = undefined;
     } else if (timingSource.trim()) {
       const dateAttempt = await interpretDate(timingSource, new Date());
       if (dateAttempt.status === "valid") {
@@ -1518,22 +1550,45 @@ async function advanceBookingCollection(
     }
   }
 
-  // --- description ---
-  if (extracted.description && !session.data.description) {
+  // --- description --- (correctable, same reasoning as location)
+  if (extracted.description) {
     updates.description = extracted.description;
   }
 
-  // --- special instructions (only ever set from something volunteered
-  // unprompted here — the explicit ask-once happens via
-  // getNextMissingPrompt/specialInstructionsAsked below) ---
+  // --- special instructions ---
   if (extracted.specialInstructions) {
+    // A real extracted answer always wins, correctable like the others.
     updates.specialInstructions = extracted.specialInstructions;
     updates.specialInstructionsAsked = true;
+  } else if (priorField === "specialInstructions" && !session.data.specialInstructionsAsked) {
+    // Bug (found via live testing): specialInstructionsAsked was ONLY
+    // ever set as a side effect of the extractor returning a value — but
+    // the extractor is explicitly told never to extract a bare "no"/
+    // "nothing" as special instructions (correctly — that's not an
+    // instruction). Result: declining produced no state change at all,
+    // and the identical question repeated forever. Confirmed live: "no"
+    // three times in a row, same question back every time. This was
+    // specifically being asked last turn (priorField check, so a "no"
+    // answering something else entirely — e.g. correcting a location —
+    // doesn't get misread as declining special instructions), so treat a
+    // skip word as answering it, and anything else as the instructions
+    // themselves verbatim (the extractor is conservative about this
+    // field; a plain reply to a direct question shouldn't be lost just
+    // because it didn't parse into a neat separate field).
+    const SKIP_WORDS = ["no", "none", "nothing", "n/a", "nope", "not really", "nothing specific"];
+    const lowerText = text.trim().toLowerCase();
+    const isSkip = SKIP_WORDS.some((w) => lowerText === w || lowerText.startsWith(`${w} `) || lowerText.includes(w));
+    if (isSkip) {
+      updates.specialInstructionsAsked = true;
+    } else if (text.trim() && !isPureQuestion) {
+      updates.specialInstructions = text.trim();
+      updates.specialInstructionsAsked = true;
+    }
   }
 
-  // --- recurring / budget volunteered unprompted ---
-  if (extracted.recurring && !session.data.recurring) updates.recurring = extracted.recurring;
-  if (extracted.budget && !session.data.budget) {
+  // --- recurring / budget --- (correctable, same reasoning as location)
+  if (extracted.recurring) updates.recurring = extracted.recurring;
+  if (extracted.budget) {
     const lowerBudget = extracted.budget.toLowerCase();
     if (!BUDGET_SKIP_WORDS.some((w) => lowerBudget.includes(w))) updates.budget = extracted.budget;
   }
