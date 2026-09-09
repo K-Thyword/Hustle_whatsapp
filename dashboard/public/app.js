@@ -26,6 +26,124 @@ function statusBadge(status, isOpen) {
   return `<span class="badge ${isOpen ? "badge-open" : "badge-closed"}">${esc(status)}</span>`;
 }
 
+// --- Country detection (Contacts tab grouping) ---
+// Phone numbers here are digits-only with no "+" (WhatsApp's own format,
+// e.g. "233201516235"). NANP ("+1") is the awkward case — that single
+// calling code covers the US, Canada, and over a dozen Caribbean nations,
+// distinguished only by the 3-digit area code right after the "1" — so
+// it's resolved separately, before falling through to the general
+// calling-code table below.
+const NANP_AREA_CODES = {
+  242: ["BS", "Bahamas"], 246: ["BB", "Barbados"], 264: ["AI", "Anguilla"],
+  268: ["AG", "Antigua and Barbuda"], 284: ["VG", "British Virgin Islands"],
+  340: ["VI", "US Virgin Islands"], 345: ["KY", "Cayman Islands"],
+  441: ["BM", "Bermuda"], 473: ["GD", "Grenada"], 649: ["TC", "Turks and Caicos"],
+  658: ["JM", "Jamaica"], 664: ["MS", "Montserrat"], 670: ["MP", "Northern Mariana Islands"],
+  671: ["GU", "Guam"], 684: ["AS", "American Samoa"], 721: ["SX", "Sint Maarten"],
+  758: ["LC", "Saint Lucia"], 767: ["DM", "Dominica"], 784: ["VC", "Saint Vincent and the Grenadines"],
+  787: ["PR", "Puerto Rico"], 809: ["DO", "Dominican Republic"], 829: ["DO", "Dominican Republic"],
+  849: ["DO", "Dominican Republic"], 868: ["TT", "Trinidad and Tobago"], 869: ["KN", "Saint Kitts and Nevis"],
+  876: ["JM", "Jamaica"], 939: ["PR", "Puerto Rico"],
+};
+
+// [calling code, ISO alpha-2, name] — sorted longest-prefix-first below so
+// a 3-digit code is always checked before a shorter one that happens to be
+// its own prefix (e.g. "233" Ghana before any 2-digit code).
+const CALLING_CODES = [
+  ["20", "EG", "Egypt"], ["211", "SS", "South Sudan"], ["212", "MA", "Morocco"],
+  ["213", "DZ", "Algeria"], ["216", "TN", "Tunisia"], ["218", "LY", "Libya"],
+  ["220", "GM", "Gambia"], ["221", "SN", "Senegal"], ["222", "MR", "Mauritania"],
+  ["223", "ML", "Mali"], ["224", "GN", "Guinea"], ["225", "CI", "Ivory Coast"],
+  ["226", "BF", "Burkina Faso"], ["227", "NE", "Niger"], ["228", "TG", "Togo"],
+  ["229", "BJ", "Benin"], ["230", "MU", "Mauritius"], ["231", "LR", "Liberia"],
+  ["232", "SL", "Sierra Leone"], ["233", "GH", "Ghana"], ["234", "NG", "Nigeria"],
+  ["235", "TD", "Chad"], ["236", "CF", "Central African Republic"], ["237", "CM", "Cameroon"],
+  ["238", "CV", "Cape Verde"], ["239", "ST", "Sao Tome and Principe"], ["240", "GQ", "Equatorial Guinea"],
+  ["241", "GA", "Gabon"], ["242", "CG", "Republic of Congo"], ["243", "CD", "DR Congo"],
+  ["244", "AO", "Angola"], ["245", "GW", "Guinea-Bissau"], ["246", "IO", "British Indian Ocean Territory"],
+  ["248", "SC", "Seychelles"], ["249", "SD", "Sudan"], ["250", "RW", "Rwanda"],
+  ["251", "ET", "Ethiopia"], ["252", "SO", "Somalia"], ["253", "DJ", "Djibouti"],
+  ["254", "KE", "Kenya"], ["255", "TZ", "Tanzania"], ["256", "UG", "Uganda"],
+  ["257", "BI", "Burundi"], ["258", "MZ", "Mozambique"], ["260", "ZM", "Zambia"],
+  ["261", "MG", "Madagascar"], ["263", "ZW", "Zimbabwe"], ["264", "NA", "Namibia"],
+  ["265", "MW", "Malawi"], ["266", "LS", "Lesotho"], ["267", "BW", "Botswana"],
+  ["268", "SZ", "Eswatini"], ["269", "KM", "Comoros"], ["27", "ZA", "South Africa"],
+  ["290", "SH", "Saint Helena"], ["291", "ER", "Eritrea"],
+  ["30", "GR", "Greece"], ["31", "NL", "Netherlands"], ["32", "BE", "Belgium"],
+  ["33", "FR", "France"], ["34", "ES", "Spain"], ["350", "GI", "Gibraltar"],
+  ["351", "PT", "Portugal"], ["352", "LU", "Luxembourg"], ["353", "IE", "Ireland"],
+  ["354", "IS", "Iceland"], ["355", "AL", "Albania"], ["356", "MT", "Malta"],
+  ["357", "CY", "Cyprus"], ["358", "FI", "Finland"], ["359", "BG", "Bulgaria"],
+  ["36", "HU", "Hungary"], ["370", "LT", "Lithuania"], ["371", "LV", "Latvia"],
+  ["372", "EE", "Estonia"], ["373", "MD", "Moldova"], ["374", "AM", "Armenia"],
+  ["375", "BY", "Belarus"], ["376", "AD", "Andorra"], ["377", "MC", "Monaco"],
+  ["378", "SM", "San Marino"], ["380", "UA", "Ukraine"], ["381", "RS", "Serbia"],
+  ["382", "ME", "Montenegro"], ["383", "XK", "Kosovo"], ["385", "HR", "Croatia"],
+  ["386", "SI", "Slovenia"], ["387", "BA", "Bosnia and Herzegovina"], ["389", "MK", "North Macedonia"],
+  ["39", "IT", "Italy"], ["40", "RO", "Romania"], ["41", "CH", "Switzerland"],
+  ["420", "CZ", "Czechia"], ["421", "SK", "Slovakia"], ["423", "LI", "Liechtenstein"],
+  ["43", "AT", "Austria"], ["44", "GB", "United Kingdom"], ["45", "DK", "Denmark"],
+  ["46", "SE", "Sweden"], ["47", "NO", "Norway"], ["48", "PL", "Poland"],
+  ["49", "DE", "Germany"], ["500", "FK", "Falkland Islands"], ["501", "BZ", "Belize"],
+  ["502", "GT", "Guatemala"], ["503", "SV", "El Salvador"], ["504", "HN", "Honduras"],
+  ["505", "NI", "Nicaragua"], ["506", "CR", "Costa Rica"], ["507", "PA", "Panama"],
+  ["508", "PM", "Saint Pierre and Miquelon"], ["509", "HT", "Haiti"], ["51", "PE", "Peru"],
+  ["52", "MX", "Mexico"], ["53", "CU", "Cuba"], ["54", "AR", "Argentina"],
+  ["55", "BR", "Brazil"], ["56", "CL", "Chile"], ["57", "CO", "Colombia"],
+  ["58", "VE", "Venezuela"], ["590", "GP", "Guadeloupe"], ["591", "BO", "Bolivia"],
+  ["592", "GY", "Guyana"], ["593", "EC", "Ecuador"], ["594", "GF", "French Guiana"],
+  ["595", "PY", "Paraguay"], ["596", "MQ", "Martinique"], ["597", "SR", "Suriname"],
+  ["598", "UY", "Uruguay"], ["599", "CW", "Curacao"], ["60", "MY", "Malaysia"],
+  ["61", "AU", "Australia"], ["62", "ID", "Indonesia"], ["63", "PH", "Philippines"],
+  ["64", "NZ", "New Zealand"], ["65", "SG", "Singapore"], ["66", "TH", "Thailand"],
+  ["670", "TL", "East Timor"], ["673", "BN", "Brunei"], ["674", "NR", "Nauru"],
+  ["675", "PG", "Papua New Guinea"], ["676", "TO", "Tonga"], ["677", "SB", "Solomon Islands"],
+  ["678", "VU", "Vanuatu"], ["679", "FJ", "Fiji"], ["680", "PW", "Palau"],
+  ["681", "WF", "Wallis and Futuna"], ["682", "CK", "Cook Islands"], ["683", "NU", "Niue"],
+  ["685", "WS", "Samoa"], ["686", "KI", "Kiribati"], ["687", "NC", "New Caledonia"],
+  ["688", "TV", "Tuvalu"], ["689", "PF", "French Polynesia"], ["690", "TK", "Tokelau"],
+  ["691", "FM", "Micronesia"], ["692", "MH", "Marshall Islands"], ["81", "JP", "Japan"],
+  ["82", "KR", "South Korea"], ["84", "VN", "Vietnam"], ["850", "KP", "North Korea"],
+  ["852", "HK", "Hong Kong"], ["853", "MO", "Macau"], ["855", "KH", "Cambodia"],
+  ["856", "LA", "Laos"], ["86", "CN", "China"], ["880", "BD", "Bangladesh"],
+  ["886", "TW", "Taiwan"], ["90", "TR", "Turkey"], ["91", "IN", "India"],
+  ["92", "PK", "Pakistan"], ["93", "AF", "Afghanistan"], ["94", "LK", "Sri Lanka"],
+  ["95", "MM", "Myanmar"], ["960", "MV", "Maldives"], ["961", "LB", "Lebanon"],
+  ["962", "JO", "Jordan"], ["963", "SY", "Syria"], ["964", "IQ", "Iraq"],
+  ["965", "KW", "Kuwait"], ["966", "SA", "Saudi Arabia"], ["967", "YE", "Yemen"],
+  ["968", "OM", "Oman"], ["970", "PS", "Palestine"], ["971", "AE", "United Arab Emirates"],
+  ["972", "IL", "Israel"], ["973", "BH", "Bahrain"], ["974", "QA", "Qatar"],
+  ["975", "BT", "Bhutan"], ["976", "MN", "Mongolia"], ["977", "NP", "Nepal"],
+  ["98", "IR", "Iran"], ["992", "TJ", "Tajikistan"], ["993", "TM", "Turkmenistan"],
+  ["994", "AZ", "Azerbaijan"], ["995", "GE", "Georgia"], ["996", "KG", "Kyrgyzstan"],
+  ["998", "UZ", "Uzbekistan"], ["7", "RU", "Russia/Kazakhstan"],
+];
+CALLING_CODES.sort((a, b) => b[0].length - a[0].length);
+
+// Regional-indicator flag emoji, computed from an ISO alpha-2 code rather
+// than hand-listed per country — two Unicode codepoints offset from the
+// letters, so it stays correct for every entry above with zero upkeep.
+function flagEmoji(alpha2) {
+  if (!alpha2 || alpha2.length !== 2) return "🌍";
+  return String.fromCodePoint(...[...alpha2.toUpperCase()].map((c) => 0x1f1e6 + (c.charCodeAt(0) - 65)));
+}
+
+// Returns { alpha2, name } for a digits-only phone number — "Unknown" (no
+// flag) if nothing in the table matches, rather than guessing.
+function detectCountry(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.startsWith("1") && digits.length >= 4) {
+    const areaCode = digits.slice(1, 4);
+    const nanp = NANP_AREA_CODES[areaCode];
+    if (nanp) return { alpha2: nanp[0], name: nanp[1] };
+    return { alpha2: "US", name: "USA/Canada" };
+  }
+  for (const [code, alpha2, name] of CALLING_CODES) {
+    if (digits.startsWith(code)) return { alpha2, name };
+  }
+  return { alpha2: "", name: "Unknown" };
+}
+
 // --- Export: CSV / PDF, shared by every tab that offers a download ---
 
 function downloadBlob(filename, blob) {
@@ -444,7 +562,7 @@ async function renderChats() {
         (c) => `<div class="conv-item" data-phone="${esc(c.phone)}">
           <div class="conv-phone">${esc(c.phone)} ${unreadBadge(c.phone)}</div>
           <div class="conv-preview">${esc(c.lastMessage)}</div>
-          <div class="msg-time">${fmtTime(c.lastTimestamp)} · ${c.messageCount} msgs</div>
+          <div class="msg-time">${fmtTime(c.lastTimestamp)} · ${c.messageCount} msgs${c.unreadCount ? ` · ${c.unreadCount} new` : ""}</div>
         </div>`
       )
       .join("");
@@ -542,23 +660,95 @@ async function renderChats() {
 // reuses /api/conversations, which is already grouped/deduped by phone (a
 // repeat contact days later lands back in the same entry, it never creates
 // a second one), just sorted and displayed differently than the Chats list.
+// Every unique number that has messaged the bot, grouped by country —
+// Ghana first, Bahamas second (the two priority markets), then every other
+// detected country alphabetically, each still clearly labeled rather than
+// lumped into one catch-all. Reuses /api/conversations, which already
+// carries unreadCount (readState.ts) alongside the existing total
+// messageCount, so both a "total" and a "new" figure show per contact.
+const CONTACT_COUNTRY_PRIORITY = ["Ghana", "Bahamas"];
+
 async function renderContacts() {
-  contentEl.innerHTML = `<h1>Contacts</h1><p class="muted">Every unique number that has messaged the bot — no duplicates. Click a column to sort, or search below.</p><div id="contactsDT"></div>`;
+  contentEl.innerHTML = `<h1>Contacts</h1><p class="muted">Every unique number that has messaged the bot, grouped by country.</p>
+    <div class="filters">
+      <input type="search" id="contactSearch" placeholder="Search phone number..." style="flex:1" />
+      <button class="refresh" id="contactsExportCsv">Export CSV</button>
+      <button class="refresh" id="contactsExportPdf">Export PDF</button>
+    </div>
+    <div id="contactsGroups"></div>`;
+
   const convs = await api("/conversations");
-  renderDataTable(document.getElementById("contactsDT"), {
-    columns: [
-      { key: "phone", label: "Phone" },
-      { key: "firstTimestamp", label: "First contacted", format: fmtTime },
-      { key: "lastTimestamp", label: "Last contacted", format: fmtTime },
-      { key: "messageCount", label: "Messages" },
-    ],
-    rows: convs,
-    searchPlaceholder: "Search phone number...",
-    exportFilenameBase: "hustleapp-contacts",
-    pdfTitle: "Hustleapp Contacts",
-    emptyText: "No contacts logged yet.",
-    defaultSortKey: "lastTimestamp",
-  });
+  const withCountry = convs.map((c) => ({ ...c, country: detectCountry(c.phone) }));
+  const groupsEl = document.getElementById("contactsGroups");
+
+  function contactRow(c) {
+    return `<tr>
+      <td>${esc(c.phone)}</td>
+      <td>${fmtTime(c.firstTimestamp)}</td>
+      <td>${fmtTime(c.lastTimestamp)}</td>
+      <td>${c.messageCount}</td>
+      <td>${c.unreadCount ? `<span class="unread-badge">${c.unreadCount}</span>` : "—"}</td>
+    </tr>`;
+  }
+
+  function render() {
+    const q = document.getElementById("contactSearch").value.trim().toLowerCase();
+    const filtered = q ? withCountry.filter((c) => c.phone.toLowerCase().includes(q)) : withCountry;
+
+    if (!filtered.length) {
+      groupsEl.innerHTML = `<p class="muted">No contacts match.</p>`;
+      bindExport([]);
+      return;
+    }
+
+    const byCountry = new Map();
+    for (const c of filtered) {
+      if (!byCountry.has(c.country.name)) byCountry.set(c.country.name, []);
+      byCountry.get(c.country.name).push(c);
+    }
+
+    const otherNames = [...byCountry.keys()]
+      .filter((n) => !CONTACT_COUNTRY_PRIORITY.includes(n))
+      .sort((a, b) => a.localeCompare(b));
+    const orderedNames = [...CONTACT_COUNTRY_PRIORITY.filter((n) => byCountry.has(n)), ...otherNames];
+
+    groupsEl.innerHTML = orderedNames
+      .map((name) => {
+        const rows = byCountry.get(name).sort((a, b) => (a.lastTimestamp < b.lastTimestamp ? 1 : -1));
+        const flag = rows[0].country.alpha2 ? flagEmoji(rows[0].country.alpha2) : "🌍";
+        return `<div class="card" style="margin-bottom:16px">
+          <h2 style="margin-top:0">${flag} ${esc(name)} <span class="muted" style="font-weight:400">(${rows.length})</span></h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Phone</th><th>First contacted</th><th>Last contacted</th><th>Messages</th><th>New</th></tr></thead>
+            <tbody>${rows.map(contactRow).join("")}</tbody>
+          </table></div>
+        </div>`;
+      })
+      .join("");
+
+    bindExport(orderedNames.flatMap((name) => byCountry.get(name)));
+  }
+
+  function bindExport(orderedRows) {
+    document.getElementById("contactsExportCsv").onclick = () => {
+      exportCsv(
+        "hustleapp-contacts.csv",
+        ["Phone", "Country", "First contacted", "Last contacted", "Messages", "New messages"],
+        orderedRows.map((c) => [c.phone, c.country.name, c.firstTimestamp, c.lastTimestamp, c.messageCount, c.unreadCount])
+      );
+    };
+    document.getElementById("contactsExportPdf").onclick = () => {
+      exportPdf(
+        "hustleapp-contacts.pdf",
+        "Hustleapp Contacts",
+        ["Phone", "Country", "First contacted", "Last contacted", "Messages", "New messages"],
+        orderedRows.map((c) => [c.phone, c.country.name, c.firstTimestamp, c.lastTimestamp, c.messageCount, c.unreadCount])
+      );
+    };
+  }
+
+  document.getElementById("contactSearch").addEventListener("input", render);
+  render();
 }
 
 // --- Tab: Agents ---
