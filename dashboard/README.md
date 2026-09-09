@@ -1,6 +1,6 @@
 # Hustleapp Dashboard
 
-A read-only ops dashboard over the same Google Sheet the WhatsApp bot logs to. Deployed as its own Railway service, completely separate from the bot's process — a bug or slow request here can never affect the live customer-facing bot.
+An ops dashboard over the same Google Sheet the WhatsApp bot logs to. Deployed as its own Railway service, completely separate from the bot's process — a bug or slow request here can never affect the live customer-facing bot. It's read-only against the Sheet (never writes a row there); the one thing it does persist is which conversations you've already read (see "Read state" below), kept in its own Redis namespace.
 
 Six tabs:
 
@@ -38,8 +38,15 @@ Visit `http://localhost:3001`.
 | `AGENT_NOTIFY_NUMBERS` | Optional — same as above. **Same value** as the bot service's env var (comma-separated, digits only, no `+`). |
 | `WEEKLY_DIGEST_TEMPLATE_NAME` | Optional, defaults to `hustle_weekly_digest`. Must exist and be **approved** in Meta Business Manager first — see below. |
 | `WEEKLY_DIGEST_TEMPLATE_LANGUAGE` | Optional, defaults to `en_US`. Must exactly match the language you pick when creating the template in Meta. |
+| `REDIS_URL` | Optional but recommended. **Same value** as the bot service's Redis connection string — in Railway, add this variable and use "Shared Variable" to reference the bot service's `REDIS_URL` rather than retyping it. Without it, which chats you've read resets on every redeploy of this service (falls back to in-memory only) — see "Read state" below. |
 
-Everything except the WhatsApp send is **read from the same Google Sheet the bot already writes to** — nothing new to set up in Google Cloud, just copy values across.
+Everything except the WhatsApp send and the read-state tracking is **read from the same Google Sheet the bot already writes to** — nothing new to set up in Google Cloud, just copy values across.
+
+### Read state (Chats tab unread counts)
+
+Which conversations you've opened is tracked server-side in Redis (the same instance the bot uses, under a separate `dashboard-chat-seen:` key prefix — it never reads or writes anything the bot owns). This used to live in browser localStorage; that turned out not to survive private windows, "clear on close" browser settings, or just opening the dashboard from a different device, so a chat you'd already read could silently show as unread again. Tracking it server-side means "read" is a real, shared fact — any browser, any day, any teammate on the shared login sees the same state.
+
+If `REDIS_URL` isn't set, this degrades to an in-memory map (same conservative-fallback pattern used everywhere else in this app) — everything still works, "read" just won't survive a redeploy of this service.
 
 ### Setting up the weekly WhatsApp send (optional)
 
@@ -58,7 +65,7 @@ The digest is sent as a WhatsApp **template** message (not a plain message) spec
 
 1. In your existing Railway project (where the bot already runs), click **+ New** → **GitHub Repo** → select the same `hustleapp-whatsapp` repo again. Railway will create a second, independent service from the same repo.
 2. On that new service's **Settings** tab, set **Root Directory** to `dashboard`. This tells Railway to build/run only this subfolder, ignoring the bot's code entirely.
-3. On the **Variables** tab, add all seven variables from the table above (copy the four shared ones straight from the bot service's Variables tab).
+3. On the **Variables** tab, add the variables from the table above (copy the shared ones straight from the bot service's Variables tab — for `REDIS_URL` specifically, use Railway's "Shared Variable" reference instead of copy-pasting, so both services always point at the same instance).
 4. Railway will auto-detect `npm run build` and `npm start` from `package.json`. First deploy takes a minute or two.
 5. Once deployed, Railway gives this service its own public URL (separate from the bot's). Open it, log in with `ADMIN_DASHBOARD_PASSWORD`, and you're in.
 

@@ -1,8 +1,8 @@
 const contentEl = document.getElementById("tab-content");
 let currentChart = null;
 
-async function api(path) {
-  const res = await fetch(`/api${path}`);
+async function api(path, options) {
+  const res = await fetch(`/api${path}`, options);
   if (res.status === 401) {
     window.location.href = "/login.html";
     throw new Error("not authenticated");
@@ -24,41 +24,6 @@ function fmtTime(iso) {
 function statusBadge(status, isOpen) {
   if (status === "cancelled") return `<span class="badge badge-cancelled">cancelled</span>`;
   return `<span class="badge ${isOpen ? "badge-open" : "badge-closed"}">${esc(status)}</span>`;
-}
-
-// --- Unread tracking (per-browser, not per-agent — this dashboard has one
-// shared login for everyone, so "unread" can only mean "unread on this
-// device." A phone that's never been opened on this browser counts every
-// customer message as unread; opening its thread marks it caught up, and
-// only new customer messages after that point count from then on. ---
-const LAST_SEEN_KEY = "hustle_dashboard_last_seen";
-
-function loadLastSeenMap() {
-  try {
-    return JSON.parse(localStorage.getItem(LAST_SEEN_KEY) || "{}");
-  } catch {
-    return {};
-  }
-}
-
-function markPhoneSeen(phone) {
-  const map = loadLastSeenMap();
-  map[phone] = new Date().toISOString();
-  localStorage.setItem(LAST_SEEN_KEY, JSON.stringify(map));
-}
-
-// Counts customer (not bot) messages per phone with a timestamp after that
-// phone's last-seen mark, defaulting to "never seen" (epoch) so a
-// never-opened conversation shows its full customer message count.
-function computeUnreadCounts(lines) {
-  const lastSeen = loadLastSeenMap();
-  const counts = {};
-  for (const l of lines) {
-    if (l.direction !== "customer") continue;
-    const seenAt = lastSeen[l.phone] || "";
-    if (l.timestamp > seenAt) counts[l.phone] = (counts[l.phone] || 0) + 1;
-  }
-  return counts;
 }
 
 // --- Export: CSV / PDF, shared by every tab that offers a download ---
@@ -435,6 +400,10 @@ async function renderChats() {
 
   const convList = document.getElementById("convList");
   const thread = document.getElementById("thread");
+  // unreadCount now comes straight from the server (see api.ts's
+  // /conversations, backed by readState.ts) — this is just a local cache of
+  // the last response, kept so refreshUnreadBadges() can re-render a badge
+  // instantly after marking a phone seen, without a full re-fetch.
   let unreadCounts = {};
   let allLines = [];
 
@@ -464,7 +433,8 @@ async function renderChats() {
   async function loadConversations() {
     const [convs, lines] = await Promise.all([api("/conversations"), api("/transcripts")]);
     allLines = lines;
-    unreadCounts = computeUnreadCounts(lines);
+    unreadCounts = {};
+    for (const c of convs) if (c.unreadCount) unreadCounts[c.phone] = c.unreadCount;
     if (!convs.length) {
       convList.innerHTML = `<p class="muted" style="padding:12px">No conversations logged yet.</p>`;
       return;
@@ -530,7 +500,12 @@ async function renderChats() {
         lines.map((l) => [l.timestamp, l.direction, l.text])
       );
     });
-    markPhoneSeen(phone);
+    // Fire-and-forget: don't block rendering the thread on this, and a
+    // failure here shouldn't stop the agent from reading messages they
+    // already fetched — worst case the badge just doesn't clear this time.
+    api(`/conversations/${encodeURIComponent(phone)}/seen`, { method: "POST" }).catch((err) =>
+      console.error("Failed to mark conversation seen:", err)
+    );
     delete unreadCounts[phone];
     refreshUnreadBadges();
   }

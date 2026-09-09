@@ -12,6 +12,7 @@ import {
 } from "./sheetsData";
 import { generateWeeklyDigest } from "./digest";
 import { sendDigestToAgents, whatsappConfigured } from "./whatsapp";
+import { markSeen, getAllLastSeen } from "./readState";
 
 export const api = Router();
 
@@ -45,18 +46,37 @@ api.get("/alerts", async (_req: Request, res: Response) => {
 });
 
 // --- Chats / Transcripts tab ---
+
+// Each conversation plus how many of the customer's messages have arrived
+// since it was last opened in the dashboard (see readState.ts) — computed
+// here rather than client-side so "seen" is a real, shared, persisted fact
+// instead of a per-browser guess that resets whenever a browser clears its
+// storage.
 api.get("/conversations", async (_req: Request, res: Response) => {
-  res.json(await getConversations());
+  const [convs, lines, lastSeen] = await Promise.all([getConversations(), getTranscriptLines(), getAllLastSeen()]);
+  const enriched = convs.map((c) => {
+    const seenAt = lastSeen[c.phone] || "";
+    const unreadCount = lines.filter((l) => l.phone === c.phone && l.direction === "customer" && l.timestamp > seenAt).length;
+    return { ...c, unreadCount };
+  });
+  res.json(enriched);
 });
 
 api.get("/conversations/:phone", async (req: Request, res: Response) => {
   res.json(await getTranscriptForPhone(req.params.phone));
 });
 
-// Every raw transcript line, unfiltered — the Chats tab uses this once per
-// load to compute unread counts client-side (see app.js), since "unread" is
-// inherently per-browser here (no per-agent accounts) rather than something
-// this stateless, read-only service can track server-side.
+// Marks a conversation as read as of right now — called when its thread is
+// opened. The only write this otherwise read-only dashboard makes, and it
+// never touches the Google Sheet; it's a separate, dashboard-owned bit of
+// state (see readState.ts).
+api.post("/conversations/:phone/seen", async (req: Request, res: Response) => {
+  await markSeen(req.params.phone);
+  res.json({ ok: true });
+});
+
+// Every raw transcript line, unfiltered — used by the Chats tab's "export
+// all" buttons.
 api.get("/transcripts", async (_req: Request, res: Response) => {
   res.json(await getTranscriptLines());
 });
