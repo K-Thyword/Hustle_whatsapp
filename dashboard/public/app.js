@@ -26,6 +26,29 @@ function statusBadge(status, isOpen) {
   return `<span class="badge ${isOpen ? "badge-open" : "badge-closed"}">${esc(status)}</span>`;
 }
 
+// --- Chats nav badge — total unread across every conversation, shown on
+// the sidebar itself so new messages are visible from any tab, not just
+// while the Chats tab happens to be open. ---
+function updateChatsNavBadge(total) {
+  const el = document.getElementById("chatsNavBadge");
+  if (!el) return;
+  el.textContent = total ? String(total) : "";
+  el.classList.toggle("hidden", !total);
+}
+
+// Full fetch + recompute — used on page load and on a standing interval so
+// the badge stays current even while looking at a different tab. When the
+// Chats tab is open, loadConversations()/loadThread() below update it more
+// cheaply from data already in hand instead of calling this again.
+async function refreshChatsNavBadge() {
+  try {
+    const convs = await api("/conversations");
+    updateChatsNavBadge(convs.reduce((sum, c) => sum + (c.unreadCount || 0), 0));
+  } catch (err) {
+    console.error("Failed to refresh chats nav badge:", err);
+  }
+}
+
 // --- Country detection (Contacts tab grouping) ---
 // Phone numbers here are digits-only with no "+" (WhatsApp's own format,
 // e.g. "233201516235"). NANP ("+1") is the awkward case — that single
@@ -553,6 +576,7 @@ async function renderChats() {
     allLines = lines;
     unreadCounts = {};
     for (const c of convs) if (c.unreadCount) unreadCounts[c.phone] = c.unreadCount;
+    updateChatsNavBadge(Object.values(unreadCounts).reduce((sum, n) => sum + n, 0));
     if (!convs.length) {
       convList.innerHTML = `<p class="muted" style="padding:12px">No conversations logged yet.</p>`;
       return;
@@ -626,6 +650,7 @@ async function renderChats() {
     );
     delete unreadCounts[phone];
     refreshUnreadBadges();
+    updateChatsNavBadge(Object.values(unreadCounts).reduce((sum, n) => sum + n, 0));
   }
 
   let searchTimer;
@@ -666,7 +691,7 @@ async function renderChats() {
 // lumped into one catch-all. Reuses /api/conversations, which already
 // carries unreadCount (readState.ts) alongside the existing total
 // messageCount, so both a "total" and a "new" figure show per contact.
-const CONTACT_COUNTRY_PRIORITY = ["Ghana", "Bahamas"];
+const CONTACT_COUNTRY_PRIORITY = ["Ghana", "Bahamas", "Nigeria"];
 
 async function renderContacts() {
   contentEl.innerHTML = `<h1>Contacts</h1><p class="muted">Every unique number that has messaged the bot, grouped by country.</p>
@@ -879,6 +904,10 @@ setInterval(() => {
   }
 }, 45000);
 
+// Independent of AUTO_REFRESH_TABS/currentTab — the nav badge should stay
+// current no matter which tab is open, not just while Chats is.
+setInterval(refreshChatsNavBadge, 45000);
+
 (async function init() {
   try {
     const status = await api("/status");
@@ -888,4 +917,5 @@ setInterval(() => {
     return;
   }
   switchTab("overview");
+  refreshChatsNavBadge();
 })();
