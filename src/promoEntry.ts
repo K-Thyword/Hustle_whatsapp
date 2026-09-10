@@ -1,17 +1,24 @@
-// "Hustle @1" promo entry pipeline — the bot's side of
-// docs/prd/0001-hustle-at-1-entry-system.md. A customer sends a screenshot
-// while the promo is live; one Claude vision call decides whether it's a
-// promo entry and, if so, which category and what identity text is visible
-// on it (see §3 of the PRD for why identity extraction — not phone number —
-// is the primary matching key). If it is an entry, the screenshot bytes get
-// uploaded to this promo's own Supabase project (a SEPARATE database from
-// the main Hustleapp app — see supabase.ts) and logged as `pending`; an
-// admin reviews and approves it later (not built yet — see PRD phasing).
+// "Hustle @1" promo entry pipeline — writes into the REAL, already-built
+// Supabase project ("Hustle DBAnnex", mxaqgkdbyswksacqmyiv) and its
+// `entrants`/`submissions`/`point_rules` schema, used by the existing
+// promos.hustleapp.io admin webapp (admin.html) and public promo page
+// (promo.html). This is a rewrite of an earlier version that invented its
+// own parallel schema before that real project was discovered — see
+// docs/prd/0001-hustle-at-1-entry-system.md for the correction history.
 //
-// Deliberately mirrors imageAnalyzer.ts's conservative-fallback shape:
-// every function here degrades to "treat this as a normal image" rather
-// than throwing, so a classifier or Supabase hiccup never breaks the
-// booking flow a customer might otherwise be in the middle of.
+// Division of responsibility, matching the real admin webapp exactly:
+// this bot ONLY ever writes to `entrants` (creating one, once, per new
+// phone) and `submissions` (status: 'pending'). It never touches
+// `point_events` — turning an approved submission into actual points is
+// exclusively the admin's manual action in admin.html's approveSubmission,
+// same as before this bot existed. Nothing here bypasses that review step.
+//
+// Identity model (per Tee, 2026-09-10): a screenshot's visible name/email
+// gets extracted and stored as an ADMIN-VISIBLE HINT (entrants.provider_
+// name / .provider_email — never treated as verified), while the actual
+// public leaderboard identity is a username the customer chooses for
+// themselves, asked once per phone and enforced unique (case-insensitive,
+// per promo) at the database level.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { downloadWhatsAppMedia } from "./whatsappMedia";
@@ -21,48 +28,56 @@ const hasRealKey =
   process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== "from-console.anthropic.com";
 const anthropic = hasRealKey ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
-export type PromoCategory =
+// The 13 action_type values from point_rules that a screenshot can actually
+// prove. Deliberately excludes two real rows that exist in the same table:
+// "opt_in_broadcast" (the bot should award this directly when a customer
+// opts into the WhatsApp broadcast list — no screenshot involved) and
+// "manual_adjustment" (admin-only, by definition never bot-submitted).
+export type PromoActionType =
   | "signup"
-  | "profile_complete"
-  | "social_follow"
-  | "content_post"
-  | "share"
-  | "like_comment"
-  | "booking";
+  | "complete_profile"
+  | "follow_instagram"
+  | "follow_facebook"
+  | "follow_tiktok"
+  | "follow_x"
+  | "follow_youtube"
+  | "like_post"
+  | "comment_post"
+  | "post_hashtag_content"
+  | "share_anniversary"
+  | "tag_hustlers_comment"
+  | "booking_completed";
 
-const PROMO_CATEGORIES: PromoCategory[] = [
+const PROMO_ACTION_TYPES: PromoActionType[] = [
   "signup",
-  "profile_complete",
-  "social_follow",
-  "content_post",
-  "share",
-  "like_comment",
-  "booking",
+  "complete_profile",
+  "follow_instagram",
+  "follow_facebook",
+  "follow_tiktok",
+  "follow_x",
+  "follow_youtube",
+  "like_post",
+  "comment_post",
+  "post_hashtag_content",
+  "share_anniversary",
+  "tag_hustlers_comment",
+  "booking_completed",
 ];
 
-const VALID_DETAILS: Partial<Record<PromoCategory, string[]>> = {
-  social_follow: ["instagram", "facebook", "tiktok", "x", "youtube"],
-  like_comment: ["like", "comment"],
-};
-
-// Chosen conservatively: a false negative (a real entry gets treated as a
-// normal photo) just falls back to the existing description flow — the
-// customer can resend, or the promo's own care line still works — while a
-// false positive (a random photo silently logged as a "pending" entry)
-// pollutes the review queue and could look like an accepted claim before a
-// human ever looks at it. Cheap to raise/lower later once real submissions
-// show how the classifier actually performs (ai_raw_response is kept on
-// every row specifically to make that tuning possible).
+// Same reasoning as before: a false negative just falls back to the normal
+// image-description flow (cheap); a false positive pollutes the admin
+// queue with a claim that was never really made. ai_raw_response is kept
+// on every submission specifically so this can be tuned once real
+// submissions show how the classifier actually performs.
 const CONFIDENCE_THRESHOLD = 0.55;
 
 interface RawClassification {
   isPromoEntry: boolean;
-  category: string | null;
-  categoryDetail: string | null;
+  actionType: string | null;
+  targetRef: string | null;
   confidence: number;
   extractedName: string | null;
   extractedEmail: string | null;
-  bookingReference: string | null;
   description: string;
 }
 
@@ -74,22 +89,24 @@ function normalizeMimeType(mimeType: string): "image/jpeg" | "image/png" | "imag
 const CLASSIFY_PROMPT = `You're screening WhatsApp screenshots for Hustleapp's "Hustle @1" anniversary promo. Registered Hustlers (service providers) earn points by doing one of these things and sending a screenshot as proof:
 
 - "signup": a screenshot showing they just created a Hustleapp Hustler account (e.g. a welcome/registration-success screen).
-- "profile_complete": their Hustleapp profile shown as complete (e.g. a "100%"/"profile complete" screen) — these typically show their own name AND email.
-- "social_follow": proof they follow one of Hustleapp's social accounts (Instagram, Facebook, TikTok, X, YouTube) — e.g. "Following" shown on Hustleapp's account page, or Hustleapp appearing in their own following list. Set categoryDetail to whichever platform: "instagram" | "facebook" | "tiktok" | "x" | "youtube".
-- "content_post": a post THEY made on social media, tagged #HustleAppTurns1.
-- "share": proof they shared Hustleapp's anniversary announcement post.
-- "like_comment": proof they liked or commented on one of Hustleapp's social posts. Set categoryDetail to "like" or "comment".
-- "booking": a completed AND PAID booking/job on the Hustleapp platform (e.g. a payment confirmation or "job complete" screen).
+- "complete_profile": their Hustleapp profile shown as complete (e.g. a "100%"/"profile complete" screen) — these typically show their own name AND email.
+- "follow_instagram" / "follow_facebook" / "follow_tiktok" / "follow_x" / "follow_youtube": proof they follow HustleApp's account on that SPECIFIC platform — e.g. "Following" shown on Hustleapp's page, or Hustleapp appearing in their own following list. Pick the exact platform, don't guess if unclear.
+- "like_post": proof they liked one of HustleApp's social posts.
+- "comment_post": proof they commented on one of HustleApp's social posts. If a post URL/permalink is visible, put it in targetRef.
+- "post_hashtag_content": a post THEY made on social media, tagged #HustleAppTurns1.
+- "share_anniversary": proof they shared HustleApp's anniversary announcement post, tagged @hustleapp.
+- "tag_hustlers_comment": proof they tagged 3 other hustlers in the comments of an anniversary post.
+- "booking_completed": a completed AND PAID booking/job on the Hustleapp platform (e.g. a payment confirmation or "job complete" screen).
 
-If the image doesn't clearly match one of these — a random photo, an unrelated screenshot, a job-site photo, anything ambiguous — set isPromoEntry to false and category to null.
+If the image doesn't clearly match one of these — a random photo, an unrelated screenshot, a job-site photo, anything ambiguous — set isPromoEntry to false and actionType to null.
 
 Also extract, only when actually legible in the image (never guess or infer):
 - extractedName: a personal name that plausibly belongs to whoever took this screenshot (e.g. in a profile header, a "Welcome, X" banner, or as a comment/post author).
 - extractedEmail: an email address, if visible.
-- bookingReference: a booking/job/order reference or ID, ONLY relevant for category "booking".
+- targetRef: a post URL, permalink, or other reference identifying the SPECIFIC post involved (relevant mainly for comment_post/like_post/share_anniversary) — null if nothing like that is visible.
 
 Respond with strict JSON only, no markdown formatting, matching exactly:
-{"isPromoEntry": boolean, "category": string|null, "categoryDetail": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "bookingReference": string|null, "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
+{"isPromoEntry": boolean, "actionType": string|null, "targetRef": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
 
 async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string): Promise<RawClassification | undefined> {
   if (!anthropic) return undefined;
@@ -130,14 +147,12 @@ async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string)
     if (typeof parsed.isPromoEntry !== "boolean" || typeof parsed.description !== "string") return undefined;
     return {
       isPromoEntry: parsed.isPromoEntry,
-      category: typeof parsed.category === "string" ? parsed.category : null,
-      categoryDetail: typeof parsed.categoryDetail === "string" ? parsed.categoryDetail : null,
+      actionType: typeof parsed.actionType === "string" ? parsed.actionType : null,
+      targetRef: typeof parsed.targetRef === "string" && parsed.targetRef.trim() ? parsed.targetRef.trim() : null,
       confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
       extractedName: typeof parsed.extractedName === "string" && parsed.extractedName.trim() ? parsed.extractedName.trim() : null,
       extractedEmail:
         typeof parsed.extractedEmail === "string" && parsed.extractedEmail.trim() ? parsed.extractedEmail.trim() : null,
-      bookingReference:
-        typeof parsed.bookingReference === "string" && parsed.bookingReference.trim() ? parsed.bookingReference.trim() : null,
       description: parsed.description.trim(),
     };
   } catch (err) {
@@ -146,66 +161,115 @@ async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string)
   }
 }
 
-interface SubmitterRow {
-  id: string;
-  whatsapp_phone: string;
-  claimed_name: string | null;
-  claimed_email: string | null;
+// Pulled out as a pure function (no network calls) so the accept/reject
+// decision can be unit-tested with synthetic classifier output. Returns
+// null for anything that should fall back to the normal image-description
+// flow: not flagged as an entry, an unrecognized action_type (a model
+// hallucination, or drift between this code and point_rules), or below
+// CONFIDENCE_THRESHOLD.
+export function validateClassification(
+  result: Pick<RawClassification, "isPromoEntry" | "actionType" | "confidence">
+): { actionType: PromoActionType } | null {
+  if (!result.isPromoEntry) return null;
+  if (!result.actionType || !PROMO_ACTION_TYPES.includes(result.actionType as PromoActionType)) return null;
+  if (result.confidence < CONFIDENCE_THRESHOLD) return null;
+  return { actionType: result.actionType as PromoActionType };
 }
 
-async function upsertSubmitter(
-  whatsappPhone: string,
-  extractedName: string | null,
-  extractedEmail: string | null
-): Promise<SubmitterRow | undefined> {
+// Username rules are intentionally light — length sanity only. Nothing
+// stops an admin renaming an entrant later (admin.html already supports
+// this), so the bot doesn't need to be the last line of defense on content.
+export function validateUsername(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.length < 2 || trimmed.length > 24) return null;
+  return trimmed;
+}
+
+interface PromoRow {
+  id: string;
+}
+
+let cachedPromo: { id: string; cachedAt: number } | null = null;
+const PROMO_CACHE_MS = 5 * 60 * 1000;
+
+async function getCurrentPromoId(): Promise<string | undefined> {
+  if (cachedPromo && Date.now() - cachedPromo.cachedAt < PROMO_CACHE_MS) return cachedPromo.id;
   const supabase = getSupabase();
   if (!supabase) return undefined;
-
-  const { data: existing, error: selectErr } = await supabase
-    .from("submitters")
-    .select("*")
-    .eq("whatsapp_phone", whatsappPhone)
-    .maybeSingle();
-  if (selectErr) {
-    console.error("[Promo entry] Failed to look up submitter:", selectErr);
+  const { data, error } = await supabase.from("promos").select("id").eq("is_current", true).maybeSingle();
+  if (error || !data) {
+    console.error("[Promo entry] Failed to look up current promo:", error);
     return undefined;
   }
+  const row = data as PromoRow;
+  cachedPromo = { id: row.id, cachedAt: Date.now() };
+  return row.id;
+}
 
-  if (existing) {
-    const patch: Partial<SubmitterRow> = {};
-    if (!existing.claimed_name && extractedName) patch.claimed_name = extractedName;
-    if (!existing.claimed_email && extractedEmail) patch.claimed_email = extractedEmail;
-    if (Object.keys(patch).length === 0) return existing as SubmitterRow;
+interface PointRuleRow {
+  action_type: string;
+  label: string;
+  points: number;
+  active: boolean;
+}
 
-    const { data: updated, error: updateErr } = await supabase
-      .from("submitters")
-      .update(patch)
-      .eq("id", existing.id)
-      .select()
-      .single();
-    if (updateErr) {
-      console.error("[Promo entry] Failed to update submitter:", updateErr);
-      return existing as SubmitterRow;
+let cachedRules: { map: Map<string, PointRuleRow>; cachedAt: number } | null = null;
+
+async function getPointRule(actionType: PromoActionType, promoId: string): Promise<PointRuleRow | undefined> {
+  const supabase = getSupabase();
+  if (!supabase) return undefined;
+  if (!cachedRules || Date.now() - cachedRules.cachedAt >= PROMO_CACHE_MS) {
+    const { data, error } = await supabase.from("point_rules").select("action_type, label, points, active").eq("promo_id", promoId);
+    if (error || !data) {
+      console.error("[Promo entry] Failed to load point_rules:", error);
+      return undefined;
     }
-    return updated as SubmitterRow;
+    cachedRules = { map: new Map((data as PointRuleRow[]).map((r) => [r.action_type, r])), cachedAt: Date.now() };
   }
+  return cachedRules.map.get(actionType);
+}
 
-  const { data: created, error: insertErr } = await supabase
-    .from("submitters")
-    .insert({ whatsapp_phone: whatsappPhone, claimed_name: extractedName, claimed_email: extractedEmail })
-    .select()
-    .single();
-  if (insertErr) {
-    console.error("[Promo entry] Failed to create submitter:", insertErr);
+interface EntrantRow {
+  id: string;
+  whatsapp_number: string;
+  leaderboard_username: string;
+  provider_name: string | null;
+  provider_email: string | null;
+}
+
+async function findEntrantByPhone(whatsappPhone: string, promoId: string): Promise<EntrantRow | undefined> {
+  const supabase = getSupabase();
+  if (!supabase) return undefined;
+  const { data, error } = await supabase
+    .from("entrants")
+    .select("id, whatsapp_number, leaderboard_username, provider_name, provider_email")
+    .eq("whatsapp_number", whatsappPhone)
+    .eq("promo_id", promoId)
+    .maybeSingle();
+  if (error) {
+    console.error("[Promo entry] Failed to look up entrant:", error);
     return undefined;
   }
-  return created as SubmitterRow;
+  return (data as EntrantRow) ?? undefined;
+}
+
+// Backfills provider_name/provider_email only if not already set — same
+// "don't overwrite what we already have" rule as the earlier design, just
+// against the real columns.
+async function backfillEntrantIdentity(entrant: EntrantRow, name: string | null, email: string | null): Promise<void> {
+  const supabase = getSupabase();
+  if (!supabase) return;
+  const patch: Partial<Pick<EntrantRow, "provider_name" | "provider_email">> = {};
+  if (!entrant.provider_name && name) patch.provider_name = name;
+  if (!entrant.provider_email && email) patch.provider_email = email;
+  if (Object.keys(patch).length === 0) return;
+  const { error } = await supabase.from("entrants").update(patch).eq("id", entrant.id);
+  if (error) console.error("[Promo entry] Failed to backfill entrant identity:", error);
 }
 
 async function uploadScreenshot(buffer: ArrayBuffer, mimeType: string, whatsappPhone: string): Promise<string | undefined> {
   const supabase = getSupabase();
   if (!supabase) return undefined;
-
   const ext = mimeType.split("/")[1] || "jpg";
   const path = `${whatsappPhone}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
   const { error } = await supabase.storage.from(PROMO_SCREENSHOT_BUCKET).upload(path, Buffer.from(buffer), {
@@ -219,155 +283,211 @@ async function uploadScreenshot(buffer: ArrayBuffer, mimeType: string, whatsappP
   return path;
 }
 
-export type PromoEntryResult =
-  | {
-      handled: true;
-      category: PromoCategory;
-      categoryDetail: string;
-      needsIdentityFollowup: boolean;
-      entryId: string;
-    }
-  | { handled: false; description?: string };
-
-// Pulled out as its own pure function (no network calls) so the actual
-// decision logic — is this a real, confident, valid-category entry? — can
-// be unit-tested with synthetic classifier output, without needing a real
-// vision call or Supabase project. Returns null for anything that should
-// fall back to the normal image-description flow: not flagged as an entry,
-// an unrecognized category (a model hallucination, or a schema drift
-// between this code and the prompt), or below CONFIDENCE_THRESHOLD.
-export function validateClassification(
-  result: Pick<RawClassification, "isPromoEntry" | "category" | "categoryDetail" | "confidence">
-): { category: PromoCategory; categoryDetail: string } | null {
-  if (!result.isPromoEntry) return null;
-  if (!result.category || !PROMO_CATEGORIES.includes(result.category as PromoCategory)) return null;
-  if (result.confidence < CONFIDENCE_THRESHOLD) return null;
-
-  const category = result.category as PromoCategory;
-  const allowedDetails = VALID_DETAILS[category];
-  const categoryDetail =
-    allowedDetails && result.categoryDetail && allowedDetails.includes(result.categoryDetail)
-      ? result.categoryDetail
-      : "";
-  return { category, categoryDetail };
+// True if this looks like a Postgres unique-violation (code 23505) —
+// used to detect a retried WhatsApp webhook delivery hitting the
+// whatsapp_message_id unique constraint, or a username collision racing
+// past the pre-check against entrants_promo_username_unique.
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: string }).code === "23505";
 }
 
+async function insertSubmission(params: {
+  entrantId: string;
+  whatsappPhone: string;
+  whatsappMessageId: string;
+  screenshotPath: string;
+  actionType: PromoActionType;
+  targetRef: string | null;
+}): Promise<{ status: "logged" } | { status: "duplicate" } | { status: "error" }> {
+  const supabase = getSupabase();
+  if (!supabase) return { status: "error" };
+  const { error } = await supabase.from("submissions").insert({
+    entrant_id: params.entrantId,
+    whatsapp_message_id: params.whatsappMessageId,
+    whatsapp_number: params.whatsappPhone,
+    image_url: params.screenshotPath,
+    claimed_action_type: params.actionType,
+    target_ref: params.targetRef,
+    status: "pending",
+  });
+  if (error) {
+    if (isUniqueViolation(error)) {
+      // Same whatsapp_message_id already logged — a webhook retry, not a
+      // new entry. Silent no-op is correct: the customer already got a
+      // confirmation the first time.
+      return { status: "duplicate" };
+    }
+    console.error("[Promo entry] Failed to insert submission:", error);
+    return { status: "error" };
+  }
+  return { status: "logged" };
+}
+
+export interface PendingSubmission {
+  whatsappMessageId: string;
+  actionType: PromoActionType;
+  targetRef: string | null;
+  screenshotPath: string;
+  extractedName: string | null;
+  extractedEmail: string | null;
+}
+
+export type PromoEntryResult =
+  | { status: "logged"; actionType: PromoActionType; label: string; points: number }
+  | { status: "awaiting_username"; pending: PendingSubmission }
+  | { status: "not_entry"; description?: string }
+  | { status: "duplicate" };
+
 // The single entry point server.ts calls for an inbound image while the
-// promo is live. Downloads once, classifies once, and — only if it looks
-// like a genuine entry above CONFIDENCE_THRESHOLD — persists it. Anything
-// else (low confidence, not an entry, any step failing) returns
-// `handled: false` with whatever description we do have, so the caller
-// falls straight back to the normal "[Image the customer sent: ...]" flow
-// with no special-casing needed on that side.
+// promo is live. Downloads once, classifies once, and only for a
+// confident match does anything further happen. A phone with an existing
+// entrant gets logged immediately; a brand-new phone gets its screenshot
+// uploaded and classification held as "pending" while the bot asks for a
+// leaderboard username (see finalizeUsernameAndSubmission below) — nothing
+// about the vision call needs to run twice for that.
 export async function processPromoScreenshot(
   whatsappPhone: string,
   mediaId: string,
+  whatsappMessageId: string,
   caption?: string
 ): Promise<PromoEntryResult> {
   const supabase = getSupabase();
-  if (!supabase) return { handled: false };
+  if (!supabase) return { status: "not_entry" };
+
+  const promoId = await getCurrentPromoId();
+  if (!promoId) return { status: "not_entry" };
 
   const downloaded = await downloadWhatsAppMedia(mediaId);
-  if (!downloaded) return { handled: false };
+  if (!downloaded) return { status: "not_entry" };
 
   const result = await classify(downloaded.buffer, downloaded.mimeType, caption);
-  if (!result) return { handled: false };
+  if (!result) return { status: "not_entry" };
 
   const validated = validateClassification(result);
-  if (!validated) return { handled: false, description: result.description };
-  const { category, categoryDetail } = validated;
+  if (!validated) return { status: "not_entry", description: result.description };
+  const { actionType } = validated;
+
+  const rule = await getPointRule(actionType, promoId);
+  if (!rule || !rule.active) return { status: "not_entry", description: result.description };
 
   const screenshotPath = await uploadScreenshot(downloaded.buffer, downloaded.mimeType, whatsappPhone);
-  if (!screenshotPath) return { handled: false, description: result.description };
+  if (!screenshotPath) return { status: "not_entry", description: result.description };
 
-  const submitter = await upsertSubmitter(whatsappPhone, result.extractedName, result.extractedEmail);
-  if (!submitter) return { handled: false, description: result.description };
+  const entrant = await findEntrantByPhone(whatsappPhone, promoId);
 
-  const { data: entry, error: insertErr } = await supabase
-    .from("promo_entries")
-    .insert({
-      submitter_id: submitter.id,
-      category,
-      category_detail: categoryDetail,
-      screenshot_path: screenshotPath,
-      ai_suggested_category: category,
-      ai_suggested_category_detail: categoryDetail,
-      ai_confidence: result.confidence,
-      ai_extracted_name: result.extractedName,
-      ai_extracted_email: result.extractedEmail,
-      ai_raw_response: result,
-      booking_reference: result.bookingReference,
-      status: "pending",
-    })
-    .select()
-    .single();
-
-  if (insertErr || !entry) {
-    console.error("[Promo entry] Failed to log entry:", insertErr);
-    return { handled: false, description: result.description };
+  if (!entrant) {
+    return {
+      status: "awaiting_username",
+      pending: {
+        whatsappMessageId,
+        actionType,
+        targetRef: result.targetRef,
+        screenshotPath,
+        extractedName: result.extractedName,
+        extractedEmail: result.extractedEmail,
+      },
+    };
   }
 
-  console.log(`[Promo entry] Logged ${category}${categoryDetail ? `/${categoryDetail}` : ""} entry for ${whatsappPhone} (${entry.id})`);
+  await backfillEntrantIdentity(entrant, result.extractedName, result.extractedEmail);
 
-  return {
-    handled: true,
-    category,
-    categoryDetail,
-    needsIdentityFollowup: !submitter.claimed_name && !submitter.claimed_email,
-    entryId: entry.id,
-  };
+  const insertResult = await insertSubmission({
+    entrantId: entrant.id,
+    whatsappPhone,
+    whatsappMessageId,
+    screenshotPath,
+    actionType,
+    targetRef: result.targetRef,
+  });
+
+  if (insertResult.status === "duplicate") return { status: "duplicate" };
+  if (insertResult.status === "error") return { status: "not_entry", description: result.description };
+
+  console.log(`[Promo entry] Logged ${actionType} submission for ${whatsappPhone} (entrant ${entrant.id})`);
+  return { status: "logged", actionType, label: rule.label, points: rule.points };
 }
 
-// Called when a customer replies to the bot's "what name/email did you
-// sign up with?" follow-up (see server.ts's awaitingPromoIdentityFor
-// check). Best-effort split: anything that looks like an email is pulled
-// out, whatever's left is treated as the name — deliberately simple rather
-// than trying to be clever, since an admin reviews every entry anyway and
-// can make sense of a slightly messy reply either way.
-export function parseIdentityReply(reply: string): { name?: string; email?: string } {
-  const emailMatch = reply.match(/[^\s@]+@[^\s@]+\.[^\s@]+/);
-  const email = emailMatch ? emailMatch[0] : undefined;
-  const name = reply
-    .replace(email ?? "", "")
-    .replace(/[,;]+/g, " ")
-    .trim();
-  return { name: name || undefined, email };
-}
+export type FinalizeUsernameResult =
+  | { status: "logged"; actionType: PromoActionType; label: string; points: number }
+  | { status: "taken" }
+  | { status: "invalid" }
+  | { status: "duplicate" }
+  | { status: "error" };
 
-export async function recordPromoIdentityReply(whatsappPhone: string, entryId: string, reply: string): Promise<void> {
+// Called once a customer replies with their chosen leaderboard username to
+// the bot's follow-up question (see server.ts's awaitingLeaderboardUsername
+// check). Creates the entrant, then the held submission, in that order —
+// the unique index on (promo_id, lower(leaderboard_username)) is the real
+// backstop against a race between the pre-check and the insert, not just
+// the pre-check itself.
+export async function finalizeUsernameAndSubmission(
+  whatsappPhone: string,
+  pending: PendingSubmission,
+  rawUsername: string
+): Promise<FinalizeUsernameResult> {
   const supabase = getSupabase();
-  if (!supabase) return;
+  if (!supabase) return { status: "error" };
 
-  const { name, email } = parseIdentityReply(reply);
+  const username = validateUsername(rawUsername);
+  if (!username) return { status: "invalid" };
 
-  const patch: Partial<Pick<SubmitterRow, "claimed_name" | "claimed_email">> = {};
-  if (name) patch.claimed_name = name;
-  if (email) patch.claimed_email = email;
-  if (Object.keys(patch).length === 0) return;
+  const promoId = await getCurrentPromoId();
+  if (!promoId) return { status: "error" };
 
-  const { error: submitterErr } = await supabase.from("submitters").update(patch).eq("whatsapp_phone", whatsappPhone);
-  if (submitterErr) console.error("[Promo entry] Failed to save identity reply on submitter:", submitterErr);
+  const { data: existingUsername, error: usernameErr } = await supabase
+    .from("entrants")
+    .select("id")
+    .eq("promo_id", promoId)
+    .ilike("leaderboard_username", username)
+    .maybeSingle();
+  if (usernameErr) {
+    console.error("[Promo entry] Username availability check failed:", usernameErr);
+    return { status: "error" };
+  }
+  if (existingUsername) return { status: "taken" };
 
-  const entryPatch: Record<string, string> = {};
-  if (name) entryPatch.ai_extracted_name = name;
-  if (email) entryPatch.ai_extracted_email = email;
-  const { error: entryErr } = await supabase.from("promo_entries").update(entryPatch).eq("id", entryId);
-  if (entryErr) console.error("[Promo entry] Failed to save identity reply on entry:", entryErr);
+  const { data: created, error: createErr } = await supabase
+    .from("entrants")
+    .insert({
+      whatsapp_number: whatsappPhone,
+      leaderboard_username: username,
+      provider_name: pending.extractedName,
+      provider_email: pending.extractedEmail,
+      status: "pending_verification",
+      promo_id: promoId,
+    })
+    .select("id")
+    .single();
+
+  if (createErr) {
+    if (isUniqueViolation(createErr)) return { status: "taken" };
+    console.error("[Promo entry] Failed to create entrant:", createErr);
+    return { status: "error" };
+  }
+
+  const rule = await getPointRule(pending.actionType, promoId);
+  if (!rule) return { status: "error" };
+
+  const insertResult = await insertSubmission({
+    entrantId: created.id,
+    whatsappPhone,
+    whatsappMessageId: pending.whatsappMessageId,
+    screenshotPath: pending.screenshotPath,
+    actionType: pending.actionType,
+    targetRef: pending.targetRef,
+  });
+
+  if (insertResult.status === "duplicate") return { status: "duplicate" };
+  if (insertResult.status === "error") return { status: "error" };
+
+  console.log(`[Promo entry] Created entrant ${created.id} (${username}) and logged ${pending.actionType} for ${whatsappPhone}`);
+  return { status: "logged", actionType: pending.actionType, label: rule.label, points: rule.points };
 }
 
-const CATEGORY_LABELS: Record<PromoCategory, string> = {
-  signup: "signing up",
-  profile_complete: "completing your profile",
-  social_follow: "following us",
-  content_post: "your #HustleAppTurns1 post",
-  share: "sharing our anniversary post",
-  like_comment: "engaging with our post",
-  booking: "your completed booking",
-};
+export function buildPromoEntryConfirmation(label: string, points: number): string {
+  return `Got it — logged your entry for "${label}" (+${points} points) in the Hustle @1 promo! 🎉 Our team will review it and confirm soon.`;
+}
 
-export function buildPromoEntryConfirmation(result: Extract<PromoEntryResult, { handled: true }>): string {
-  const label = CATEGORY_LABELS[result.category];
-  const base = `Got it — logged your entry for ${label} in the Hustle @1 promo! 🎉 Our team will review it and confirm your points soon.`;
-  if (!result.needsIdentityFollowup) return base;
-  return `${base}\n\nOne thing — I couldn't quite make out your name/email on that screenshot. Could you reply with the name and email you registered as a Hustler with, so we can match this to your account? (Or reply "skip" and send it later.)`;
+export function buildUsernamePrompt(): string {
+  return "One more thing — what username would you like to appear as on the public leaderboard? Pick something unique (2–24 characters).";
 }

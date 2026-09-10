@@ -1,9 +1,19 @@
-// Client for the "Hustle @1" promo's OWN, standalone Supabase project — a
-// separate database from the main Hustleapp app (which this bot has no
-// access to; see appApi.ts's mocked functions and docs/prd/0001-hustle-at-1
-// -entry-system.md §2 for why). This module exists purely to talk to that
-// promo database (submitters, promo_entries, category_points — see the
-// migration in supabase/migrations/0001_promo_entries.sql).
+// Client for the REAL "Hustle @1" promo Supabase project ("Hustle
+// DBAnnex", project ref mxaqgkdbyswksacqmyiv) — the same project already
+// used by the live promos.hustleapp.io admin webapp (admin.html) and
+// public promo page (promo.html). This is a SEPARATE database from the
+// main Hustleapp app (which this bot still has no access to; see
+// appApi.ts's mocked functions) — it holds promo-specific data only
+// (entrants, submissions, point_rules, weekly_pools), never real Hustler
+// account records.
+//
+// An earlier version of this file pointed at a different, invented
+// standalone project this bot would have created itself. That was wrong —
+// the real project already existed, built via a separate chat/webapp
+// project, and was found by connecting the Supabase MCP connector and
+// inspecting it directly. See docs/prd/0001-hustle-at-1-entry-system.md
+// for the correction history. Don't recreate tables here; this bot only
+// ever reads/writes the schema that's already live.
 //
 // Same conservative-fallback pattern as every other optional integration in
 // this app (Redis, Google Sheets, Instagram sync): if SUPABASE_URL or
@@ -12,10 +22,11 @@
 // crashing — a customer's screenshot just gets the normal image-description
 // treatment instead of being logged as an entry.
 //
-// Deliberately uses the SERVICE ROLE key, not the anon key — this service
-// is a trusted backend (never exposed to a browser), and the RLS policies
-// in the migration are intentionally empty (locked down to service-role-only
-// access), so the anon key would be able to do nothing useful here anyway.
+// Deliberately uses the SERVICE ROLE key, not the anon key (the webapp uses
+// the publishable/anon key client-side, which is fine there since RLS
+// restricts anon to SELECT-only on a few tables — this bot needs to INSERT
+// into entrants/submissions, which the real RLS policies restrict to
+// admins/service-role only, so the anon key would not work here anyway).
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
@@ -44,7 +55,7 @@ export function getSupabase(): SupabaseClient | null {
   return client;
 }
 
-// Name matches the bucket created in the migration — kept as a named export
-// (rather than a string literal repeated in promoEntry.ts) so renaming the
-// bucket is a one-line change, not a grep-and-replace.
-export const PROMO_SCREENSHOT_BUCKET = "promo-screenshots";
+// Matches the real bucket already created by/for the promos.hustleapp.io
+// webapp (see admin.html's renderProof, which reads signed URLs from this
+// same bucket) — kept as a named export so a rename stays a one-line change.
+export const PROMO_SCREENSHOT_BUCKET = "submission-proofs";

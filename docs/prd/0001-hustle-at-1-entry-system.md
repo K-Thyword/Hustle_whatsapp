@@ -1,8 +1,93 @@
 # PRD: WhatsApp-based entry system for the "Hustle @1" promo
 
-Status: Draft — for review, not yet built.
+Status: Built (phase 1) against the REAL schema — see §0 below before reading
+anything past it; most of §2–§9 describes a schema that turned out to be wrong
+and was never deployed.
 Related: `src/promoInfo.ts` (promo copy shown to customers today), official rules at
 http://promos.hustleapp.io/promo/hustle-at-1
+
+## 0. Correction (2026-09-10, later the same day)
+
+Everything from §2 onward was written and partly built (a standalone Supabase
+project, `submitters`/`promo_entries`/`category_points` tables, AI-driven
+name/email extraction for identity) BEFORE discovering that a real system
+already existed: a Supabase project ("Hustle DBAnnex", ref
+`mxaqgkdbyswksacqmyiv`) plus a full admin webapp at promos.hustleapp.io
+(`admin.html`, `promo.html`, `index.html`), built in a separate chat/session.
+That invented schema was thrown out and never used in production — this
+section documents what's actually real; §2–§9 are kept below only for the
+reasoning trail (the fraud/identity discussion still mostly applies, just
+mapped onto different table/column names).
+
+**The real schema** (already live before this bot touched it):
+- `promos` — supports multiple promos over time; `is_current` flags the
+  active one. "Hustle @1" (`slug: hustle-at-1`) is seeded and current.
+- `entrants` — one row per (promo, WhatsApp phone number) — enforced by a
+  unique index that already existed (`entrants_promo_whatsapp_key`) before
+  this bot added anything. Has `leaderboard_username` (self-chosen, now
+  enforced unique case-insensitively per promo — see below),
+  `provider_name`/`provider_email` (added by this bot's migration — see
+  below), and a `status` lifecycle (`pending_verification` → `active` /
+  `disqualified`).
+- `submissions` — one row per screenshot claim (`claimed_action_type`,
+  `image_url` pointing into the `submission-proofs` Storage bucket,
+  `whatsapp_message_id` UNIQUE for webhook-retry idempotency, `entry_source`
+  defaulting to `'bot'` — this system was already designed expecting a bot
+  to write here). `status`: `pending` / `approved` / `rejected` / `duplicate`.
+- `point_rules` — 15 real `action_type` rows (not the 7-bucket taxonomy
+  invented below), keyed by `(promo_id, action_type)`, with real point
+  values, `weekly_cap`/`per_post_cap`, and `active` flags.
+- `point_events` — the actual points ledger, created ONLY by an admin
+  approving a submission in `admin.html` (`sb.from('point_events').insert(...)`
+  right next to `submissions.status = 'approved'`). This bot never writes
+  here — same "admin reviews and approves" boundary as always intended, just
+  confirmed by reading the real approval code instead of assuming it.
+- `weekly_pools` / `leaderboard_weekly` / `leaderboard_grand` — confirms the
+  promo is a real points leaderboard ("highest points wins, full stop — no
+  random drawing" per `promo.html`'s own copy), not a raffle. An earlier,
+  separate planning chat ("Promo raffle tracking system") had explored a
+  random-draw mechanic, but that's not what got built — no actual conflict.
+- `admins` / `admin_activity_log` — webapp admin auth + audit trail.
+
+**What changed in this bot as a result** (`src/promoEntry.ts`, `src/supabase.ts`,
+`src/server.ts`):
+- Writes into `entrants`/`submissions` directly — no separate bot-owned
+  schema.
+- Classifier taxonomy rewritten to the real 13 screenshot-eligible
+  `action_type` values (`signup`, `complete_profile`, `follow_instagram`,
+  `follow_facebook`, `follow_tiktok`, `follow_x`, `follow_youtube`,
+  `like_post`, `comment_post`, `post_hashtag_content`, `share_anniversary`,
+  `tag_hustlers_comment`, `booking_completed`) — excludes `opt_in_broadcast`
+  (not screenshot-based; should hook into the bot's existing marketing
+  opt-in flow directly, not built yet) and `manual_adjustment` (admin-only).
+- Identity model changed per Tee: a screenshot's visible name/email is
+  extracted and stored as an ADMIN-VISIBLE HINT only
+  (`entrants.provider_name` / the newly-added `entrants.provider_email`),
+  never treated as verified. The actual public leaderboard identity is a
+  username the customer picks themselves, asked once per phone (only when
+  no entrant exists yet for that number) and enforced unique — this bot's
+  migration added `entrants_promo_username_unique` (case-insensitive, since
+  the pre-existing `entrants_promo_username_key` was case-sensitive and
+  would have let "Ama" and "ama" collide as different entrants).
+- `whatsapp_message_id` is threaded from the inbound WhatsApp webhook's own
+  `message.id` through to the `submissions` insert, so a retried webhook
+  delivery hits the unique constraint and no-ops instead of double-logging.
+
+**Migrations applied directly via the Supabase MCP connector** (no local
+migration files — `list_migrations` showed none tracked before this, so
+there's no existing convention to follow):
+1. `entrants_provider_email_and_uniqueness` — added `provider_email`, the
+   case-insensitive username index, and (redundantly, since one already
+   existed) a phone-uniqueness index.
+2. `drop_redundant_phone_unique_index` — removed that redundant index once
+   `entrants_promo_whatsapp_key` was found to already cover it.
+
+---
+
+**Everything below this line describes the invented, never-deployed schema
+and is kept only for the parts of the reasoning that still apply (fraud
+flagging, why email beats name as a matching key, why booking is the
+highest-risk category). Table/column names below do NOT match reality.**
 
 ## 1. Problem
 

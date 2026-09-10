@@ -26,7 +26,13 @@ import { resolvePostedLink } from "./postLinkResolver";
 import { describeImage } from "./imageAnalyzer";
 import { getPromoPhase } from "./promoInfo";
 import { getSupabase } from "./supabase";
-import { processPromoScreenshot, recordPromoIdentityReply, buildPromoEntryConfirmation } from "./promoEntry";
+import {
+  processPromoScreenshot,
+  finalizeUsernameAndSubmission,
+  buildPromoEntryConfirmation,
+  buildUsernamePrompt,
+  PendingSubmission,
+} from "./promoEntry";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1183,13 +1189,34 @@ app.post("/webhook", async (req: Request, res: Response) => {
     // latency/cost outside the promo window, and still only one call
     // during it. Agent numbers are excluded since their images are booking
     // attachments/live-chat media, never promo submissions.
-    if (getPromoPhase() === "live" && getSupabase() && !AGENT_NOTIFY_NUMBERS.includes(from)) {
-      const promoResult = await processPromoScreenshot(from, message.image.id, caption || undefined);
-      if (promoResult.handled) {
-        await sendMessage(from, buildPromoEntryConfirmation(promoResult));
-        if (promoResult.needsIdentityFollowup) {
-          await updateSession(from, { data: { awaitingPromoIdentityFor: promoResult.entryId } });
-        }
+    const promoReady = getPromoPhase() === "live" && getSupabase() && !AGENT_NOTIFY_NUMBERS.includes(from);
+    if (promoReady) {
+      // A phone already mid-way through choosing a leaderboard username
+      // (see the awaitingLeaderboardUsername text handler below) shouldn't
+      // have a second screenshot silently reclassified out from under
+      // that — ask them to finish first rather than losing track of which
+      // submission the username they're about to give belongs to.
+      const currentSession = await getSession(from);
+      if (currentSession.data.awaitingLeaderboardUsername) {
+        await sendMessage(from, "Let's finish choosing your leaderboard username first — what would you like it to be?");
+        return;
+      }
+
+      const promoResult = await processPromoScreenshot(from, message.image.id, message.id, caption || undefined);
+      if (promoResult.status === "logged") {
+        await sendMessage(from, buildPromoEntryConfirmation(promoResult.label, promoResult.points));
+        return;
+      }
+      if (promoResult.status === "awaiting_username") {
+        await updateSession(from, { data: { awaitingLeaderboardUsername: promoResult.pending } });
+        await sendMessage(from, buildUsernamePrompt());
+        return;
+      }
+      if (promoResult.status === "duplicate") {
+        // Same WhatsApp message already processed (a webhook retry) — the
+        // customer already got their confirmation the first time, so this
+        // is a silent no-op rather than a second message or a fall-through
+        // that would misfile a promo screenshot as a booking attachment.
         return;
       }
       text = promoResult.description
@@ -1801,31 +1828,52 @@ async function handleMessage(
     return;
   }
 
-  // We asked this phone for the name/email they registered as a Hustler
-  // with, because their last promo-entry screenshot didn't have anything
-  // legible on it (see promoEntry.ts / the image branch above) — treat
-  // this next message as that answer, from whatever stage they're
-  // otherwise in, the same way awaitingReminderOffer/pendingReminderText
-  // below short-circuit for their own flows. A bare "skip" lets them defer
-  // without getting stuck answering it before they can do anything else.
-  if (session.data.awaitingPromoIdentityFor) {
-    const entryId = session.data.awaitingPromoIdentityFor as string;
-    if (/^(skip|later|not now|no)$/i.test(text.trim())) {
-      await updateSession(phone, { data: { awaitingPromoIdentityFor: undefined } });
-      await sendMessage(phone, "No worries — send it over whenever you're ready and I'll add it to your entry.");
+  // We're waiting on this phone to choose a leaderboard username for a
+  // promo entry (see promoEntry.ts / the image branch above) — their
+  // screenshot classified fine, but it's their first-ever entry, so
+  // there's no entrant record yet to log it against. Treat this next
+  // message as that answer, from whatever stage they're otherwise in, the
+  // same way awaitingReminderOffer/pendingReminderText below short-circuit
+  // for their own flows. "cancel" drops this specific pending entry rather
+  // than leaving it hanging indefinitely — the screenshot is already
+  // uploaded, so nothing is lost if they resend later.
+  if (session.data.awaitingLeaderboardUsername) {
+    const pending = session.data.awaitingLeaderboardUsername as PendingSubmission;
+    if (/^(cancel|never ?mind)$/i.test(text.trim())) {
+      await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
+      await sendMessage(phone, "No problem — send the screenshot again whenever you're ready to pick a username.");
       return;
     }
     if (text.trim() && !media) {
-      await recordPromoIdentityReply(phone, entryId, text.trim());
-      await updateSession(phone, { data: { awaitingPromoIdentityFor: undefined } });
-      await sendMessage(phone, "Got it, thanks — that's noted on your entry. 🎉");
+      const usernameResult = await finalizeUsernameAndSubmission(phone, pending, text.trim());
+      if (usernameResult.status === "logged") {
+        await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
+        await sendMessage(phone, buildPromoEntryConfirmation(usernameResult.label, usernameResult.points));
+        return;
+      }
+      if (usernameResult.status === "taken") {
+        await sendMessage(phone, "That username's already taken — try a different one?");
+        return; // stay awaiting, same pending submission
+      }
+      if (usernameResult.status === "invalid") {
+        await sendMessage(phone, "That needs to be 2–24 characters — what would you like to use?");
+        return;
+      }
+      if (usernameResult.status === "duplicate") {
+        // Same WhatsApp message already processed (a retry of THIS reply
+        // itself) — already logged, so just clear the flag silently.
+        await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
+        return;
+      }
+      // "error" — something failed on the Supabase side. Don't silently
+      // drop the pending state; let them try the same answer again.
+      await sendMessage(phone, "Sorry, something went wrong saving that — mind trying again in a moment?");
       return;
     }
     // A bare attachment with no text, or an empty message, isn't a usable
-    // answer — fall through rather than looping on it silently; whatever
-    // handles this message normally (e.g. another promo screenshot) still
-    // runs, and we're still marked as awaiting, so a real answer later
-    // still gets picked up.
+    // answer — fall through rather than looping on it silently; the image
+    // branch above already redirects a second screenshot back to this
+    // same question, so we're still marked as awaiting either way.
   }
 
   // A customer explicitly stepping away mid-booking — see DECLINE_PHRASES
