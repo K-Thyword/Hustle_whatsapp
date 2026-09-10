@@ -1,10 +1,13 @@
 // The "Hustle @1" anniversary promo (Sep 1 – Nov 30, 2026) — unlike
 // everything in businessInfo.ts, this is genuinely time-bound content, so
 // it can't just be a static string appended forever. getPromoSection()
-// only returns the promo details while the promo is actually live; once
-// PROMO_END passes it returns an empty string automatically, so the bot
-// stops mentioning/offering it with no follow-up code change needed on
-// Nov 30 — nothing else has to remember to come back and remove this.
+// switches between three phases (upcoming / live / expired) based on the
+// clock, so the bot NEVER loses the ability to talk about the promo — it
+// just tells the truth about its status. Before Sep 1 it says the promo
+// hasn't started; during the window it gives full entry/points details;
+// after Nov 30 it says the promo has ended and entries are closed. No
+// follow-up code change is needed when the window opens or closes —
+// nothing else has to remember to come back and update this.
 //
 // Full official rules: http://promos.hustleapp.io/promo/hustle-at-1
 // (the bot's summary below is a conversational digest, not the legal
@@ -13,7 +16,7 @@
 const PROMO_START = new Date("2026-09-01T00:00:00Z");
 const PROMO_END = new Date("2026-11-30T23:59:59Z");
 
-const PROMO_DETAILS = `
+const PROMO_LIVE = `
 Current promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
 - Live now through November 30, 2026. Free to enter. Earn points, win weekly
   and grand prizes.
@@ -46,7 +49,37 @@ Current promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
   http://promos.hustleapp.io/promo/hustle-at-1
 `.trim();
 
+const PROMO_UPCOMING = `
+Upcoming promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
+- Hasn't started yet. It's scheduled to run September 1 – November 30,
+  2026, for registered Hustlers (service providers) — free to enter, earn
+  points, win weekly and grand prizes.
+- It is NOT open for entries yet. If someone asks to enter or sign up for
+  it now, tell them it hasn't launched yet rather than walking them
+  through entry steps — don't invent an early-entry process.
+- Full official rules (and confirmation of the exact launch date) will be
+  at http://promos.hustleapp.io/promo/hustle-at-1 — point them there, or
+  say "agent" connects them with a human for anything more specific.
+`.trim();
+
+const PROMO_EXPIRED = `
+Past promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
+- This ran September 1 – November 30, 2026 and has now ENDED. It is CLOSED
+  — no new entries, no more points, nothing left to opt into.
+- If someone asks how to enter, sign up, or earn points for it now, tell
+  them plainly that the promo already ran and has wrapped up — don't walk
+  them through the old entry steps as if they still apply.
+- Don't guess whether winners/prizes have been announced or what they
+  were unless told otherwise here — point them to
+  http://promos.hustleapp.io/promo/hustle-at-1 or say "agent" for a human
+  to check.
+- If they ask about a new/future promo, say you don't have details on one
+  yet and offer "agent" for a human — don't imply this one is still
+  running or invent a new one.
+`.trim();
+
 export function getPromoSection(now: Date = new Date()): string {
-  if (now < PROMO_START || now > PROMO_END) return "";
-  return `\n${PROMO_DETAILS}\n`;
+  if (now < PROMO_START) return `\n${PROMO_UPCOMING}\n`;
+  if (now > PROMO_END) return `\n${PROMO_EXPIRED}\n`;
+  return `\n${PROMO_LIVE}\n`;
 }
