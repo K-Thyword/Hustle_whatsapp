@@ -88,8 +88,8 @@ function normalizeMimeType(mimeType: string): "image/jpeg" | "image/png" | "imag
 
 const CLASSIFY_PROMPT = `You're screening WhatsApp screenshots for Hustleapp's "Hustle @1" anniversary promo. Registered Hustlers (service providers) earn points by doing one of these things and sending a screenshot as proof:
 
-- "signup": a screenshot showing they just created a Hustleapp Hustler account (e.g. a welcome/registration-success screen).
-- "complete_profile": their Hustleapp profile shown as complete (e.g. a "100%"/"profile complete" screen) — these typically show their own name AND email.
+- "signup": proof they've created a Hustleapp Hustler account. This includes a welcome/registration-success screen, but MOST COMMONLY it's a screenshot of the app's own Account Settings / provider dashboard screen — things like an "Available to work" toggle, Working Hours, Account verification status, Business Details, etc. Reaching this screen at all is proof the account exists. Do NOT require the profile to be complete or verification to say "Verified" — an account verification status of "Pending" is completely normal and still counts as a valid signup screenshot. A brand-new Hustler's profile isn't expected to be complete yet, so don't hold that against this action type.
+- "complete_profile": specifically their Hustleapp profile shown as 100% / fully complete (a distinct, later milestone from signup above) — these typically show their own name AND email alongside an explicit completion indicator. Don't confuse this with the general Account Settings screen described under "signup" — that one counts as signup even when incomplete.
 - "follow_instagram" / "follow_facebook" / "follow_tiktok" / "follow_x" / "follow_youtube": proof they follow HustleApp's account on that SPECIFIC platform — e.g. "Following" shown on Hustleapp's page, or Hustleapp appearing in their own following list. Pick the exact platform, don't guess if unclear.
 - "like_post": proof they liked one of HustleApp's social posts.
 - "comment_post": proof they commented on one of HustleApp's social posts. If a post URL/permalink is visible, put it in targetRef.
