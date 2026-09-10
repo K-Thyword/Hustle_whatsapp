@@ -33,6 +33,7 @@ import {
   buildUsernamePrompt,
   PendingSubmission,
 } from "./promoEntry";
+import { getPromoStanding, buildPromoStandingReply, isAskingAboutOwnPromoStanding } from "./promoLeaderboard";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1829,6 +1830,27 @@ async function handleMessage(
     } else {
       await sendMedia(phone, item.attachment);
     }
+  }
+
+  // A customer asking about their OWN promo points/rank — something the
+  // static promo FAQ text can never answer, since it has no notion of who's
+  // asking. Works from any stage, same reasoning as STOP below: this can
+  // come up at any point in a conversation, not just right after entering.
+  // Confirmed via live testing this was previously falling through to a
+  // "we don't have live tracking, say agent" answer that was both wrong
+  // (we do have the data — it's the same Supabase project the entry system
+  // already writes to) and, worse, kept dragging on into a leftover
+  // "collecting_booking" nag (see the collecting_booking fix above).
+  if (isAskingAboutOwnPromoStanding(text)) {
+    const phase = getPromoPhase();
+    if ((phase === "live" || phase === "expired") && getSupabase()) {
+      const standing = await getPromoStanding(phone);
+      await sendMessage(phone, buildPromoStandingReply(standing, phase === "live"));
+      return;
+    }
+    // Promo hasn't started yet, or Supabase isn't configured — fall
+    // through to the normal question-answering flow below, which uses
+    // getPromoSection()'s phase-appropriate copy instead of a live lookup.
   }
 
   // STOP / unsubscribe — exact match, works from any stage, always takes

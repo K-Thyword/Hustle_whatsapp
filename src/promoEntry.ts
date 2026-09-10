@@ -192,7 +192,10 @@ interface PromoRow {
 let cachedPromo: { id: string; cachedAt: number } | null = null;
 const PROMO_CACHE_MS = 5 * 60 * 1000;
 
-async function getCurrentPromoId(): Promise<string | undefined> {
+// Exported for promoLeaderboard.ts — same cached lookup, no reason to
+// duplicate it just because the leaderboard-standing feature lives in a
+// separate file from entry-logging.
+export async function getCurrentPromoId(): Promise<string | undefined> {
   if (cachedPromo && Date.now() - cachedPromo.cachedAt < PROMO_CACHE_MS) return cachedPromo.id;
   const supabase = getSupabase();
   if (!supabase) return undefined;
@@ -237,7 +240,12 @@ interface EntrantRow {
   provider_email: string | null;
 }
 
-async function findEntrantByPhone(whatsappPhone: string, promoId: string): Promise<EntrantRow | undefined> {
+// Exported for promoLeaderboard.ts — it needs to distinguish "never
+// entered" from "entered but not yet on the leaderboard view" (pending
+// review), which means looking the entrant up directly rather than only
+// through leaderboard_grand (which only lists entrants with an approved
+// point_event at all).
+export async function findEntrantByPhone(whatsappPhone: string, promoId: string): Promise<EntrantRow | undefined> {
   const supabase = getSupabase();
   if (!supabase) return undefined;
   const { data, error } = await supabase
