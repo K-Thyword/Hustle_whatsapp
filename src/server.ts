@@ -24,6 +24,9 @@ import { logRequestEvent, logAlert, logTranscriptLine, logReferral, MessageRefer
 import { startSocialPostSyncScheduler, syncSocialPosts } from "./socialPostSync";
 import { resolvePostedLink } from "./postLinkResolver";
 import { describeImage } from "./imageAnalyzer";
+import { getPromoPhase } from "./promoInfo";
+import { getSupabase } from "./supabase";
+import { processPromoScreenshot, recordPromoIdentityReply, buildPromoEntryConfirmation } from "./promoEntry";
 import {
   createQuoteRequest,
   getQuoteRequest,
@@ -1170,18 +1173,45 @@ app.post("/webhook", async (req: Request, res: Response) => {
   if (message.type === "image" && message.image?.id) {
     media = { id: message.image.id, type: "image" };
     const caption = (message.image.caption ?? "").trim();
-    // Best-effort: describe the image (see imageAnalyzer.ts) so a customer
-    // asking about a screenshot of one of our posts gets a real answer
-    // instead of the bot only seeing an empty/generic caption. Folded into
-    // `text` the same way transcribeVoiceNote folds speech into text below
-    // — everything downstream just sees text, media is still forwarded to
-    // agents as-is regardless of whether this succeeds.
-    const description = await describeImage(message.image.id, caption || undefined);
-    text = description
-      ? caption
-        ? `${caption}\n\n[Image the customer sent: ${description}]`
-        : `[Image the customer sent: ${description}]`
-      : caption;
+
+    // While the "Hustle @1" promo is live (and Supabase is actually
+    // configured — see supabase.ts), every image from a real customer
+    // number gets checked first for whether it's a promo-entry screenshot.
+    // One vision call does both jobs (see promoEntry.ts): classify+log the
+    // entry if it looks like one, or return a plain description to fall
+    // back to the normal flow below if it doesn't — so this adds no extra
+    // latency/cost outside the promo window, and still only one call
+    // during it. Agent numbers are excluded since their images are booking
+    // attachments/live-chat media, never promo submissions.
+    if (getPromoPhase() === "live" && getSupabase() && !AGENT_NOTIFY_NUMBERS.includes(from)) {
+      const promoResult = await processPromoScreenshot(from, message.image.id, caption || undefined);
+      if (promoResult.handled) {
+        await sendMessage(from, buildPromoEntryConfirmation(promoResult));
+        if (promoResult.needsIdentityFollowup) {
+          await updateSession(from, { data: { awaitingPromoIdentityFor: promoResult.entryId } });
+        }
+        return;
+      }
+      text = promoResult.description
+        ? caption
+          ? `${caption}\n\n[Image the customer sent: ${promoResult.description}]`
+          : `[Image the customer sent: ${promoResult.description}]`
+        : caption;
+    } else {
+      // Best-effort: describe the image (see imageAnalyzer.ts) so a
+      // customer asking about a screenshot of one of our posts gets a real
+      // answer instead of the bot only seeing an empty/generic caption.
+      // Folded into `text` the same way transcribeVoiceNote folds speech
+      // into text below — everything downstream just sees text, media is
+      // still forwarded to agents as-is regardless of whether this
+      // succeeds.
+      const description = await describeImage(message.image.id, caption || undefined);
+      text = description
+        ? caption
+          ? `${caption}\n\n[Image the customer sent: ${description}]`
+          : `[Image the customer sent: ${description}]`
+        : caption;
+    }
   } else if (message.type === "video" && message.video?.id) {
     media = { id: message.video.id, type: "video" };
     text = (message.video.caption ?? "").trim();
@@ -1769,6 +1799,33 @@ async function handleMessage(
       "You're unsubscribed from Hustleapp promos and check-ins. You can still book anytime — just message us here."
     );
     return;
+  }
+
+  // We asked this phone for the name/email they registered as a Hustler
+  // with, because their last promo-entry screenshot didn't have anything
+  // legible on it (see promoEntry.ts / the image branch above) — treat
+  // this next message as that answer, from whatever stage they're
+  // otherwise in, the same way awaitingReminderOffer/pendingReminderText
+  // below short-circuit for their own flows. A bare "skip" lets them defer
+  // without getting stuck answering it before they can do anything else.
+  if (session.data.awaitingPromoIdentityFor) {
+    const entryId = session.data.awaitingPromoIdentityFor as string;
+    if (/^(skip|later|not now|no)$/i.test(text.trim())) {
+      await updateSession(phone, { data: { awaitingPromoIdentityFor: undefined } });
+      await sendMessage(phone, "No worries — send it over whenever you're ready and I'll add it to your entry.");
+      return;
+    }
+    if (text.trim() && !media) {
+      await recordPromoIdentityReply(phone, entryId, text.trim());
+      await updateSession(phone, { data: { awaitingPromoIdentityFor: undefined } });
+      await sendMessage(phone, "Got it, thanks — that's noted on your entry. 🎉");
+      return;
+    }
+    // A bare attachment with no text, or an empty message, isn't a usable
+    // answer — fall through rather than looping on it silently; whatever
+    // handles this message normally (e.g. another promo screenshot) still
+    // runs, and we're still marked as awaiting, so a real answer later
+    // still gets picked up.
   }
 
   // A customer explicitly stepping away mid-booking — see DECLINE_PHRASES

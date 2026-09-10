@@ -78,8 +78,21 @@ Past promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
   running or invent a new one.
 `.trim();
 
+export type PromoPhase = "upcoming" | "live" | "expired";
+
+// Shared with the entry-submission pipeline (see promoEntry.ts) so it only
+// ever attempts to classify/log a screenshot as a promo entry while the
+// promo is actually live — same clock, same boundaries, one source of
+// truth instead of two places independently comparing dates.
+export function getPromoPhase(now: Date = new Date()): PromoPhase {
+  if (now < PROMO_START) return "upcoming";
+  if (now > PROMO_END) return "expired";
+  return "live";
+}
+
 export function getPromoSection(now: Date = new Date()): string {
-  if (now < PROMO_START) return `\n${PROMO_UPCOMING}\n`;
-  if (now > PROMO_END) return `\n${PROMO_EXPIRED}\n`;
+  const phase = getPromoPhase(now);
+  if (phase === "upcoming") return `\n${PROMO_UPCOMING}\n`;
+  if (phase === "expired") return `\n${PROMO_EXPIRED}\n`;
   return `\n${PROMO_LIVE}\n`;
 }
