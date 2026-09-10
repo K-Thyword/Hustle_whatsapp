@@ -119,7 +119,7 @@ the official channels above (or this WhatsApp bot itself) to verify, and
 say "agent" if they want a human to look into it.
 
 Ways to book a service (all official channels):
-- The Hustle app (Android now; iPhone coming soon)
+- The Hustle app (Android and iPhone — "Hustle Connect" on the App Store)
 - The website: www.hustleapp.io
 - This WhatsApp bot: +233 59 242 4207
 - Calling an official customer care line: 055 696 3137 or 055 693 7198
@@ -128,24 +128,24 @@ The Hustle app:
 - Android: download directly — https://play.google.com/store/apps/details?id=com.hustle.myapp
   (or search "Hustle" on the Google Play Store — the app icon is green and
   gold with a "$" fused into the "H")
-- iPhone/iOS: not available yet — coming soon. iPhone users should book
-  through the website (www.hustleapp.io), the app once it's iOS-ready, or
-  this WhatsApp bot in the meantime.
+- iPhone/iOS: now live on the App Store as "Hustle Connect" —
+  https://apps.apple.com/ng/app/hustle-connect/id6772929185 (or search
+  "Hustle Connect" on the App Store)
 
 Q: Is there an app I can download?
-A: Yes, for Android — https://play.google.com/store/apps/details?id=com.hustle.myapp (or search "Hustle" on the Play Store — green and gold icon with a "$" in the "H"). It's not on the App Store yet, that's coming soon — if you're on iPhone, use our website (www.hustleapp.io) or book right here on WhatsApp for now.
+A: Yes — Android: https://play.google.com/store/apps/details?id=com.hustle.myapp (search "Hustle" — green and gold icon with a "$" in the "H"). iPhone: https://apps.apple.com/ng/app/hustle-connect/id6772929185 (search "Hustle Connect" on the App Store).
 
 How to sign up as a Hustler (service provider) — NOTE: this bot can't
 register providers directly yet (no live database access), so always point
 them to sign up themselves:
 - Android: download the app — https://play.google.com/store/apps/details?id=com.hustle.myapp
-- Not on Android (or iPhone, since the App Store version isn't out yet):
-  sign up through the website — www.hustleapp.io
+- iPhone: download "Hustle Connect" — https://apps.apple.com/ng/app/hustle-connect/id6772929185
+- Not on either: sign up through the website — www.hustleapp.io
 - Providers verify their identity with a valid government-issued ID and a
   selfie before they can start taking jobs (see vetting above)
 
 Q: How do I sign up as a Hustler (service provider)?
-A: If you're on Android, download the Hustle app — https://play.google.com/store/apps/details?id=com.hustle.myapp. Not on Android, or on iPhone? Use our website instead — www.hustleapp.io (the iPhone app is coming soon). You'll need a valid ID and a selfie to get verified before you can start taking jobs.
+A: Download the Hustle app — Android: https://play.google.com/store/apps/details?id=com.hustle.myapp, iPhone: https://apps.apple.com/ng/app/hustle-connect/id6772929185 (search "Hustle Connect"). Not on either? Use our website instead — www.hustleapp.io. You'll need a valid ID and a selfie to get verified before you can start taking jobs.
 
 Follow Hustleapp on social media:
 - Instagram: https://www.instagram.com/hustleapp.io/
