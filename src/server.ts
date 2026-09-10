@@ -1693,6 +1693,22 @@ async function advanceBookingCollection(
   const prefix = [questionAck, nonAnswerNote, vagueNote, ack].filter(Boolean).join("\n\n");
   const next = getNextMissingPrompt(session.data, pastBookings);
 
+  // Bug (found via live testing): a pure question answered while
+  // "collecting_booking" but with NOTHING collected yet (next.field is
+  // still serviceType, the very first slot, and this turn extracted
+  // nothing either) means this customer never actually started a booking —
+  // the stage only got here from an earlier misclassified message. Piling
+  // "What kind of service do you need?" onto the answer every single turn
+  // is exactly the unsolicited-booking-pitch problem raised before, just
+  // via a stuck stage instead of the AI's own reply. Answer the question
+  // and drop back to "greeting" so a real future booking still works
+  // cleanly, instead of nagging indefinitely.
+  if (isPureQuestion && next?.field === "serviceType" && Object.keys(updates).length === 0 && !pendingExtra) {
+    await sendMessage(phone, prefix || "Not sure I caught that — could you rephrase?");
+    await updateSession(phone, { stage: "greeting" });
+    return;
+  }
+
   if (!next) {
     const confirmPrompt = `Here's what I've got:\n${buildBookingSummary(session.data)}\n\nDoes that look right? Reply 'yes' to send it off, or 'no' if you'd like to start over.`;
     await sendMessage(phone, prefix ? `${prefix}\n\n${confirmPrompt}` : confirmPrompt);
