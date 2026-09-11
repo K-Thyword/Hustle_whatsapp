@@ -57,6 +57,7 @@ const anthropic = hasRealKey ? new Anthropic({ apiKey: process.env.ANTHROPIC_API
 export type PromoActionType =
   | "signup"
   | "complete_profile"
+  | "list_services"
   | "follow_instagram"
   | "follow_facebook"
   | "follow_tiktok"
@@ -72,6 +73,7 @@ export type PromoActionType =
 const PROMO_ACTION_TYPES: PromoActionType[] = [
   "signup",
   "complete_profile",
+  "list_services",
   "follow_instagram",
   "follow_facebook",
   "follow_tiktok",
@@ -103,6 +105,7 @@ interface RawClassification {
   tamperSuspected: boolean;
   tamperReason: string | null;
   profileVerificationCompleted: boolean;
+  screenshotSource: "hustleapp_app" | "social_media" | "unclear";
   description: string;
 }
 
@@ -171,6 +174,7 @@ const CLASSIFY_PROMPT = `You're screening WhatsApp screenshots for Hustleapp's "
 
 - "signup": proof they've created a Hustleapp Hustler account. This includes a welcome/registration-success screen, but MOST COMMONLY it's a screenshot of the app's own Account Settings / provider dashboard screen — things like an "Available to work" toggle, Working Hours, Account verification status, Business Details, etc. Reaching this screen at all is proof the account exists. Do NOT require the profile to be complete or verification to say "Verified" — an account verification status of "Pending" is completely normal and still counts as a valid signup screenshot. A brand-new Hustler's profile isn't expected to be complete yet, so don't hold that against this action type.
 - "complete_profile": specifically their Hustleapp profile shown as 100% / fully complete (a distinct, later milestone from signup above) — these typically show their own name AND email alongside an explicit completion indicator. Don't confuse this with the general Account Settings screen described under "signup" — that one counts as signup even when incomplete. (You don't need to separately pick this action type for the Account Settings screen specifically — see profileVerificationCompleted below, which covers that case.)
+- "list_services": a screenshot of the Hustler's own "Services" page in the app — the list of services THEY offer as a provider (e.g. service names, categories, or prices they've added to their profile), not a customer browsing other providers' services. Reaching this screen with at least one service listed counts, even if it's not a long list.
 - "follow_instagram" / "follow_facebook" / "follow_tiktok" / "follow_x" / "follow_youtube": proof they follow HustleApp's account on that SPECIFIC platform — e.g. "Following" shown on Hustleapp's page, or Hustleapp appearing in their own following list. Pick the exact platform, don't guess if unclear.
 - "like_post": proof they liked one of HustleApp's social posts.
 - "comment_post": proof they commented on one of HustleApp's social posts. If a post URL/permalink is visible, put it in targetRef.
@@ -179,7 +183,12 @@ const CLASSIFY_PROMPT = `You're screening WhatsApp screenshots for Hustleapp's "
 - "tag_hustlers_comment": proof they tagged 3 other hustlers in the comments of an anniversary post.
 - "booking_completed": a completed AND PAID booking/job on the Hustleapp platform (e.g. a payment confirmation or "job complete" screen).
 
-If the image doesn't clearly match one of these — a random photo, an unrelated screenshot, a job-site photo, anything ambiguous — set isPromoEntry to false and actionType to null.
+If the image doesn't clearly match one of these, set isPromoEntry to false and actionType to null — but still fill in screenshotSource honestly (see below), since even an unmatched screenshot might still be from our app or our socials and worth a follow-up question rather than being silently ignored.
+
+Always assess screenshotSource, regardless of isPromoEntry:
+- "hustleapp_app": this is a screenshot of the Hustleapp app itself (its UI, branding, or a Hustleapp-specific screen), even if you can't tell which specific action above it proves.
+- "social_media": this is a screenshot of Instagram, Facebook, TikTok, X, or YouTube — HustleApp's page/post or otherwise — even if you can't tell which specific action above it proves.
+- "unclear": neither of the above plausibly applies — a random photo, an unrelated screenshot, a job-site photo, some other unrelated app, etc.
 
 Also extract, only when actually legible in the image (never guess or infer):
 - extractedName: a personal name that plausibly belongs to whoever took this screenshot (e.g. in a profile header, a "Welcome, X" banner, or as a comment/post author).
@@ -193,7 +202,7 @@ Also assess, honestly and conservatively:
 - profileVerificationCompleted: ONLY relevant when actionType is "signup" via the Account Settings screen (see above) — set true if the "Account verification information" row on that exact screen visibly reads "Completed" (green, next to a shield icon). Set false if it reads "Pending", anything else, isn't present, or isn't clearly legible — never guess. This one screenshot proves BOTH signup AND profile completion when true, so getting this wrong either awards or withholds real points; when in doubt, false.
 
 Respond with strict JSON only, no markdown formatting, matching exactly:
-{"isPromoEntry": boolean, "actionType": string|null, "targetRef": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "platform": string|null, "tamperSuspected": boolean, "tamperReason": string|null, "profileVerificationCompleted": boolean, "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
+{"isPromoEntry": boolean, "actionType": string|null, "targetRef": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "platform": string|null, "tamperSuspected": boolean, "tamperReason": string|null, "profileVerificationCompleted": boolean, "screenshotSource": "hustleapp_app"|"social_media"|"unclear", "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
 
 async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string): Promise<RawClassification | undefined> {
   if (!anthropic) return undefined;
@@ -245,6 +254,10 @@ async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string)
       tamperReason:
         typeof parsed.tamperReason === "string" && parsed.tamperReason.trim() ? parsed.tamperReason.trim() : null,
       profileVerificationCompleted: parsed.profileVerificationCompleted === true,
+      screenshotSource:
+        parsed.screenshotSource === "hustleapp_app" || parsed.screenshotSource === "social_media"
+          ? parsed.screenshotSource
+          : "unclear",
       description: parsed.description.trim(),
     };
   } catch (err) {
@@ -489,6 +502,7 @@ function isUniqueViolation(error: unknown): boolean {
 const ONE_TIME_ACTION_TYPES = new Set<PromoActionType>([
   "signup",
   "complete_profile",
+  "list_services",
   "follow_instagram",
   "follow_facebook",
   "follow_tiktok",
@@ -707,19 +721,176 @@ export type PromoEntryResult =
   | { status: "logged"; actionType: PromoActionType; label: string; points: number; flags?: EntryFlags; bonus?: { label: string; points: number } }
   | { status: "awaiting_username"; pending: PendingSubmission }
   | { status: "awaiting_social_handle"; pending: PendingSocialSubmission }
+  | { status: "awaiting_clarification"; pending: PendingClarification }
   | { status: "not_entry"; description?: string }
   | { status: "duplicate" }
   | { status: "already_claimed"; label: string; flags?: EntryFlags; bonus?: { label: string; points: number } };
 
+// Held while waiting on a customer's answer to "what is this screenshot
+// for?" — the screenshot's already uploaded (see the awaiting_clarification
+// branch below) so nothing's lost if they take a while to reply, or resend
+// instead. Deliberately minimal compared to PendingSubmission/
+// PendingSocialSubmission: at this point we don't yet know actionType,
+// platform, or any extracted identity — finalizeClarificationAndSubmission
+// re-runs the vision classifier with the customer's own words folded in as
+// context, then hands off to the exact same continueWithActionType logic
+// every other confident classification uses.
+export interface PendingClarification {
+  whatsappPhone: string;
+  whatsappMessageId: string;
+  screenshotPath: string;
+  caption?: string;
+}
+
+// Everything that happens once we're confident about an actionType — shared
+// by processPromoScreenshot's normal path and finalizeClarificationAndSubmission's
+// path (a screenshot that only became a confident classification after the
+// customer clarified what it was). Kept as one function specifically so
+// entrant lookup/creation, one-time-claim checks, and the first-time
+// social-handle ask never have two copies that could quietly drift apart.
+async function continueWithActionType(params: {
+  whatsappPhone: string;
+  whatsappMessageId: string;
+  actionType: PromoActionType;
+  targetRef: string | null;
+  screenshotPath: string;
+  extractedName: string | null;
+  extractedEmail: string | null;
+  tamperSuspected: boolean;
+  tamperReason: string | null;
+  profileVerificationCompleted: boolean;
+  promoId: string;
+  imageBuffer: ArrayBuffer;
+  classifierPlatform?: string | null;
+}): Promise<PromoEntryResult> {
+  const rule = await getPointRule(params.actionType, params.promoId);
+  if (!rule || !rule.active) return { status: "not_entry" };
+
+  const imageHash = await computeImageHash(params.imageBuffer);
+  const imageReuseOfSubmissionId = imageHash ? await findSimilarSubmissionImage(params.promoId, imageHash) : undefined;
+  const platform = resolvePlatform(params.actionType, params.classifierPlatform ?? null);
+
+  const entrant = await findEntrantByPhone(params.whatsappPhone, params.promoId);
+
+  if (!entrant) {
+    const identityCollisions = await checkIdentityCollision(params.promoId, undefined, params.extractedName, params.extractedEmail);
+    return {
+      status: "awaiting_username",
+      pending: {
+        whatsappMessageId: params.whatsappMessageId,
+        actionType: params.actionType,
+        targetRef: params.targetRef,
+        screenshotPath: params.screenshotPath,
+        extractedName: params.extractedName,
+        extractedEmail: params.extractedEmail,
+        platform,
+        imageHash,
+        imageReuseOfSubmissionId,
+        tamperSuspected: params.tamperSuspected,
+        tamperReason: params.tamperReason,
+        identityCollisions,
+        profileVerificationCompleted: params.profileVerificationCompleted,
+      },
+    };
+  }
+
+  const backfillPatch = await backfillEntrantIdentity(entrant, params.extractedName, params.extractedEmail);
+  const identityCollisions =
+    backfillPatch.provider_name || backfillPatch.provider_email
+      ? await checkIdentityCollision(params.promoId, entrant.id, backfillPatch.provider_name ?? null, backfillPatch.provider_email ?? null)
+      : [];
+
+  const existingClaimId = await findExistingOneTimeClaim(entrant.id, params.actionType);
+
+  let socialHandle: string | undefined;
+  if (platform) {
+    socialHandle = await getStoredSocialHandle(entrant.id, platform);
+    if (!socialHandle && !existingClaimId) {
+      // First-ever action on this platform for this entrant, and it's not
+      // already a flagged duplicate — worth asking before logging.
+      return {
+        status: "awaiting_social_handle",
+        pending: {
+          entrantId: entrant.id,
+          whatsappPhone: params.whatsappPhone,
+          whatsappMessageId: params.whatsappMessageId,
+          actionType: params.actionType,
+          targetRef: params.targetRef,
+          screenshotPath: params.screenshotPath,
+          platform,
+          imageHash,
+          imageReuseOfSubmissionId,
+          tamperSuspected: params.tamperSuspected,
+          tamperReason: params.tamperReason,
+          identityCollisions,
+        },
+      };
+    }
+  }
+
+  const insertResult = await insertSubmission({
+    entrantId: entrant.id,
+    whatsappPhone: params.whatsappPhone,
+    whatsappMessageId: params.whatsappMessageId,
+    screenshotPath: params.screenshotPath,
+    actionType: params.actionType,
+    targetRef: params.targetRef,
+    duplicateOfSubmissionId: existingClaimId,
+    socialHandle,
+    imageHash,
+    flaggedImageReuseOf: imageReuseOfSubmissionId,
+    tamperSuspected: params.tamperSuspected,
+    tamperReason: params.tamperReason,
+  });
+
+  if (insertResult.status === "duplicate") return { status: "duplicate" };
+  if (insertResult.status === "error") return { status: "not_entry" };
+
+  const flags = buildEntryFlags(
+    params.actionType,
+    { tamperSuspected: params.tamperSuspected, tamperReason: params.tamperReason },
+    imageReuseOfSubmissionId,
+    identityCollisions
+  );
+
+  // Same screenshot, a second thing to check: a signup screenshot whose
+  // "Account verification information" already reads "Completed" is also
+  // valid proof of complete_profile — award both from the one image. Runs
+  // whether this signup claim is fresh OR a repeat (an entrant might first
+  // send this while still "Pending", then resend later once it flips to
+  // "Completed" — that resend should still earn the bonus even though
+  // signup itself was already claimed).
+  const bonus =
+    params.actionType === "signup" && params.profileVerificationCompleted
+      ? await maybeAwardBonusCompleteProfile({
+          entrantId: entrant.id,
+          whatsappPhone: params.whatsappPhone,
+          whatsappMessageId: params.whatsappMessageId,
+          screenshotPath: params.screenshotPath,
+          promoId: params.promoId,
+          imageHash,
+        })
+      : undefined;
+
+  if (insertResult.status === "already_claimed") {
+    console.log(`[Promo entry] Flagged repeat ${params.actionType} claim from ${params.whatsappPhone} (entrant ${entrant.id}) as duplicate`);
+    return { status: "already_claimed", label: rule.label, flags, bonus };
+  }
+
+  console.log(`[Promo entry] Logged ${params.actionType} submission for ${params.whatsappPhone} (entrant ${entrant.id})`);
+  return { status: "logged", actionType: params.actionType, label: rule.label, points: rule.points, flags, bonus };
+}
+
 // The single entry point server.ts calls for an inbound image while the
-// promo is live. Downloads once, classifies once, and only for a
-// confident match does anything further happen. A phone with an existing
-// entrant gets logged immediately (unless it's their first-ever action on
-// a given social platform, in which case the account name gets asked for
-// first); a brand-new phone gets its screenshot uploaded and
-// classification held as "pending" while the bot asks for a leaderboard
-// username first (see finalizeUsernameAndSubmission below) — nothing
-// about the vision call needs to run twice for any of this.
+// promo is live. Downloads once, classifies once. A confident match hands
+// off to continueWithActionType above (logged immediately, or held pending
+// a leaderboard username / social handle first). Per Tee (2026-09-11):
+// every screenshot from now until the promo ends gets checked against our
+// app/socials — an unconfident match that still looks like it's FROM our
+// app or our own social pages (screenshotSource) gets a clarifying
+// question instead of silently falling back to the generic
+// image-description flow; only a screenshot that looks unrelated to either
+// falls back as before.
 export async function processPromoScreenshot(
   whatsappPhone: string,
   mediaId: string,
@@ -739,123 +910,107 @@ export async function processPromoScreenshot(
   if (!result) return { status: "not_entry" };
 
   const validated = validateClassification(result);
-  if (!validated) return { status: "not_entry", description: result.description };
-  const { actionType } = validated;
+  if (!validated) {
+    if (result.screenshotSource === "unclear") {
+      return { status: "not_entry", description: result.description };
+    }
+    const screenshotPath = await uploadScreenshot(downloaded.buffer, downloaded.mimeType, whatsappPhone);
+    if (!screenshotPath) return { status: "not_entry", description: result.description };
+    return {
+      status: "awaiting_clarification",
+      pending: { whatsappPhone, whatsappMessageId, screenshotPath, caption },
+    };
+  }
 
-  const rule = await getPointRule(actionType, promoId);
+  const rule = await getPointRule(validated.actionType, promoId);
   if (!rule || !rule.active) return { status: "not_entry", description: result.description };
 
   const screenshotPath = await uploadScreenshot(downloaded.buffer, downloaded.mimeType, whatsappPhone);
   if (!screenshotPath) return { status: "not_entry", description: result.description };
 
-  const imageHash = await computeImageHash(downloaded.buffer);
-  const imageReuseOfSubmissionId = imageHash ? await findSimilarSubmissionImage(promoId, imageHash) : undefined;
-  const platform = resolvePlatform(actionType, result.platform);
-
-  const entrant = await findEntrantByPhone(whatsappPhone, promoId);
-
-  if (!entrant) {
-    const identityCollisions = await checkIdentityCollision(promoId, undefined, result.extractedName, result.extractedEmail);
-    return {
-      status: "awaiting_username",
-      pending: {
-        whatsappMessageId,
-        actionType,
-        targetRef: result.targetRef,
-        screenshotPath,
-        extractedName: result.extractedName,
-        extractedEmail: result.extractedEmail,
-        platform,
-        imageHash,
-        imageReuseOfSubmissionId,
-        tamperSuspected: result.tamperSuspected,
-        tamperReason: result.tamperReason,
-        identityCollisions,
-        profileVerificationCompleted: result.profileVerificationCompleted,
-      },
-    };
-  }
-
-  const backfillPatch = await backfillEntrantIdentity(entrant, result.extractedName, result.extractedEmail);
-  const identityCollisions =
-    backfillPatch.provider_name || backfillPatch.provider_email
-      ? await checkIdentityCollision(promoId, entrant.id, backfillPatch.provider_name ?? null, backfillPatch.provider_email ?? null)
-      : [];
-
-  const existingClaimId = await findExistingOneTimeClaim(entrant.id, actionType);
-
-  let socialHandle: string | undefined;
-  if (platform) {
-    socialHandle = await getStoredSocialHandle(entrant.id, platform);
-    if (!socialHandle && !existingClaimId) {
-      // First-ever action on this platform for this entrant, and it's not
-      // already a flagged duplicate — worth asking before logging.
-      return {
-        status: "awaiting_social_handle",
-        pending: {
-          entrantId: entrant.id,
-          whatsappPhone,
-          whatsappMessageId,
-          actionType,
-          targetRef: result.targetRef,
-          screenshotPath,
-          platform,
-          imageHash,
-          imageReuseOfSubmissionId,
-          tamperSuspected: result.tamperSuspected,
-          tamperReason: result.tamperReason,
-          identityCollisions,
-        },
-      };
-    }
-  }
-
-  const insertResult = await insertSubmission({
-    entrantId: entrant.id,
+  return continueWithActionType({
     whatsappPhone,
     whatsappMessageId,
-    screenshotPath,
-    actionType,
+    actionType: validated.actionType,
     targetRef: result.targetRef,
-    duplicateOfSubmissionId: existingClaimId,
-    socialHandle,
-    imageHash,
-    flaggedImageReuseOf: imageReuseOfSubmissionId,
+    screenshotPath,
+    extractedName: result.extractedName,
+    extractedEmail: result.extractedEmail,
     tamperSuspected: result.tamperSuspected,
     tamperReason: result.tamperReason,
+    profileVerificationCompleted: result.profileVerificationCompleted,
+    promoId,
+    imageBuffer: downloaded.buffer,
+    classifierPlatform: result.platform,
   });
+}
 
-  if (insertResult.status === "duplicate") return { status: "duplicate" };
-  if (insertResult.status === "error") return { status: "not_entry", description: result.description };
-
-  const flags = buildEntryFlags(actionType, result, imageReuseOfSubmissionId, identityCollisions);
-
-  // Same screenshot, a second thing to check: a signup screenshot whose
-  // "Account verification information" already reads "Completed" is also
-  // valid proof of complete_profile — award both from the one image. Runs
-  // whether this signup claim is fresh OR a repeat (an entrant might first
-  // send this while still "Pending", then resend later once it flips to
-  // "Completed" — that resend should still earn the bonus even though
-  // signup itself was already claimed).
-  const bonus =
-    actionType === "signup" && result.profileVerificationCompleted
-      ? await maybeAwardBonusCompleteProfile({
-          entrantId: entrant.id,
-          whatsappPhone,
-          whatsappMessageId,
-          screenshotPath,
-          promoId,
-          imageHash,
-        })
-      : undefined;
-
-  if (insertResult.status === "already_claimed") {
-    console.log(`[Promo entry] Flagged repeat ${actionType} claim from ${whatsappPhone} (entrant ${entrant.id}) as duplicate`);
-    return { status: "already_claimed", label: rule.label, flags, bonus };
+// Re-downloads an already-uploaded screenshot from the private Supabase
+// bucket — needed when finishing a clarification, since the customer's
+// answer arrives as a separate WhatsApp message and the original in-memory
+// image buffer from processPromoScreenshot is long gone by then.
+async function downloadStoredScreenshot(path: string): Promise<{ buffer: ArrayBuffer; mimeType: string } | undefined> {
+  const supabase = getSupabase();
+  if (!supabase) return undefined;
+  const { data, error } = await supabase.storage.from(PROMO_SCREENSHOT_BUCKET).download(path);
+  if (error || !data) {
+    console.error("[Promo entry] Failed to download stored screenshot for re-classification:", error);
+    return undefined;
   }
+  const buffer = await data.arrayBuffer();
+  const ext = path.split(".").pop()?.toLowerCase();
+  const mimeType =
+    ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
+  return { buffer, mimeType };
+}
 
-  console.log(`[Promo entry] Logged ${actionType} submission for ${whatsappPhone} (entrant ${entrant.id})`);
-  return { status: "logged", actionType, label: rule.label, points: rule.points, flags, bonus };
+// Called once a customer answers the bot's "what is this screenshot for?"
+// question (see buildClarificationPrompt / server.ts's awaitingPromoClarification
+// check). Re-runs the same vision classifier against the same image, with
+// the customer's own words folded in as extra context — the most reliable
+// way to resolve the ambiguity, since it lets the model actually look at
+// the image again in light of what the customer says it is, rather than
+// this code guessing from keywords alone. Falls through to not_entry
+// (still can't tell, or the customer said it isn't promo-related) if that
+// still doesn't produce a confident match.
+export async function finalizeClarificationAndSubmission(
+  pending: PendingClarification,
+  rawReply: string
+): Promise<PromoEntryResult> {
+  const supabase = getSupabase();
+  if (!supabase) return { status: "not_entry" };
+
+  const promoId = await getCurrentPromoId();
+  if (!promoId) return { status: "not_entry" };
+
+  const downloaded = await downloadStoredScreenshot(pending.screenshotPath);
+  if (!downloaded) return { status: "not_entry" };
+
+  const clarifiedCaption = `${pending.caption ? pending.caption + " " : ""}[The sender was asked what this screenshot is for the Hustle @1 promo, and replied: "${rawReply.trim()}"]`;
+  const result = await classify(downloaded.buffer, downloaded.mimeType, clarifiedCaption);
+  if (!result) return { status: "not_entry" };
+
+  const validated = validateClassification(result);
+  if (!validated) return { status: "not_entry", description: result.description };
+
+  const rule = await getPointRule(validated.actionType, promoId);
+  if (!rule || !rule.active) return { status: "not_entry", description: result.description };
+
+  return continueWithActionType({
+    whatsappPhone: pending.whatsappPhone,
+    whatsappMessageId: pending.whatsappMessageId,
+    actionType: validated.actionType,
+    targetRef: result.targetRef,
+    screenshotPath: pending.screenshotPath,
+    extractedName: result.extractedName,
+    extractedEmail: result.extractedEmail,
+    tamperSuspected: result.tamperSuspected,
+    tamperReason: result.tamperReason,
+    profileVerificationCompleted: result.profileVerificationCompleted,
+    promoId,
+    imageBuffer: downloaded.buffer,
+    classifierPlatform: result.platform,
+  });
 }
 
 export type FinalizeUsernameResult =
@@ -1065,6 +1220,22 @@ export function buildUsernamePrompt(): string {
 
 export function buildSocialHandlePrompt(platform: SocialPlatform): string {
   return `Quick one — what's the ${PLATFORM_LABELS[platform]} account/profile name you used for this? We'll log it so our team can double check, and you won't need to give it again for future ${PLATFORM_LABELS[platform]} entries.`;
+}
+
+export function buildClarificationPrompt(): string {
+  return (
+    'This looks like it might be from the Hustleapp app or one of our social pages, but I\'m not sure exactly what it\'s showing — could you tell me what this is for the Hustle @1 promo? For example: "signed up", "completed my profile", "listed my services", "a completed booking", or which social page (Instagram/Facebook/TikTok/X/YouTube) and what you did there (followed, liked, commented, shared). Reply "not related" if this isn\'t for the promo.'
+  );
+}
+
+// Sent when finalizeClarificationAndSubmission still couldn't pin down a
+// confident action after the customer's own explanation — either they said
+// it isn't promo-related, or the second look still wasn't clear enough.
+// Either way it's an honest "we're not logging this one" rather than a
+// silent drop, since the customer was explicitly asked and deserves a
+// real answer back.
+export function buildClarificationDeclinedReply(): string {
+  return 'No worries — I won\'t log that one for the promo. If you think it should count, just say "agent" and a person will take a look.';
 }
 
 // --- Approval notifications ---

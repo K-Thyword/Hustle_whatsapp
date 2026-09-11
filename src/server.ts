@@ -32,15 +32,19 @@ import {
   processPromoScreenshot,
   finalizeUsernameAndSubmission,
   finalizeSocialHandleAndSubmission,
+  finalizeClarificationAndSubmission,
   buildPromoEntryConfirmation,
   buildUsernamePrompt,
   buildAlreadyClaimedReply,
   buildSocialHandlePrompt,
+  buildClarificationPrompt,
+  buildClarificationDeclinedReply,
   getUnnotifiedApprovedSubmissions,
   markApprovalNotified,
   buildApprovalNotification,
   PendingSubmission,
   PendingSocialSubmission,
+  PendingClarification,
   EntryFlags,
 } from "./promoEntry";
 import { getPromoStanding, buildPromoStandingReply, isAskingAboutOwnPromoStanding } from "./promoLeaderboard";
@@ -1384,6 +1388,10 @@ app.post("/webhook", async (req: Request, res: Response) => {
         await sendMessage(from, `Let's finish that last one first — what's the account/profile name you used on ${pendingPlatform}?`);
         return;
       }
+      if (currentSession.data.awaitingPromoClarification) {
+        await sendMessage(from, "Let's finish with that last screenshot first — what was it for the Hustle @1 promo?");
+        return;
+      }
 
       const promoResult = await processPromoScreenshot(from, message.image.id, message.id, caption || undefined);
       if (promoResult.status === "logged") {
@@ -1399,6 +1407,16 @@ app.post("/webhook", async (req: Request, res: Response) => {
       if (promoResult.status === "awaiting_social_handle") {
         await updateSession(from, { data: { awaitingSocialHandle: promoResult.pending } });
         await sendMessage(from, buildSocialHandlePrompt(promoResult.pending.platform));
+        return;
+      }
+      if (promoResult.status === "awaiting_clarification") {
+        // Looks like it's from our app or our own social pages, but the
+        // classifier couldn't confidently tell what it's proving — ask
+        // rather than silently falling back to the generic
+        // image-description flow below (see promoEntry.ts's
+        // screenshotSource field, per Tee 2026-09-11).
+        await updateSession(from, { data: { awaitingPromoClarification: promoResult.pending } });
+        await sendMessage(from, buildClarificationPrompt());
         return;
       }
       if (promoResult.status === "already_claimed") {
@@ -2156,6 +2174,61 @@ async function handleMessage(
       // "error" — something failed on the Supabase side. Don't silently
       // drop the pending state; let them try the same answer again.
       await sendMessage(phone, "Sorry, something went wrong saving that — mind trying again in a moment?");
+      return;
+    }
+    // A bare attachment with no text, or an empty message, isn't a usable
+    // answer — fall through rather than looping on it silently; the image
+    // branch above already redirects a second screenshot back to this
+    // same question, so we're still marked as awaiting either way.
+  }
+
+  // Mirror of the two blocks above, for the third pending promo question:
+  // "what is this screenshot for?" (see promoEntry.ts's
+  // finalizeClarificationAndSubmission and buildClarificationPrompt). Same
+  // "cancel" escape hatch; the screenshot is already uploaded, so nothing
+  // is lost if they resend instead.
+  if (session.data.awaitingPromoClarification) {
+    const pending = session.data.awaitingPromoClarification as PendingClarification;
+    if (/^(cancel|never ?mind)$/i.test(text.trim())) {
+      await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
+      await sendMessage(phone, "No problem — send the screenshot again whenever you'd like it checked.");
+      return;
+    }
+    if (text.trim() && !media) {
+      const clarifyResult = await finalizeClarificationAndSubmission(pending, text.trim());
+      if (clarifyResult.status === "logged") {
+        await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
+        await sendMessage(phone, buildPromoEntryConfirmation(clarifyResult.label, clarifyResult.points, clarifyResult.bonus));
+        await notifyAgentsAboutEntryFlags(phone, clarifyResult.label, clarifyResult.flags);
+        return;
+      }
+      if (clarifyResult.status === "awaiting_username") {
+        await updateSession(phone, {
+          data: { awaitingPromoClarification: undefined, awaitingLeaderboardUsername: clarifyResult.pending },
+        });
+        await sendMessage(phone, buildUsernamePrompt());
+        return;
+      }
+      if (clarifyResult.status === "awaiting_social_handle") {
+        await updateSession(phone, {
+          data: { awaitingPromoClarification: undefined, awaitingSocialHandle: clarifyResult.pending },
+        });
+        await sendMessage(phone, buildSocialHandlePrompt(clarifyResult.pending.platform));
+        return;
+      }
+      if (clarifyResult.status === "already_claimed") {
+        await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
+        await sendMessage(phone, buildAlreadyClaimedReply(clarifyResult.label, clarifyResult.bonus));
+        return;
+      }
+      if (clarifyResult.status === "duplicate") {
+        await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
+        return;
+      }
+      // "not_entry" — still couldn't confidently tell, or the customer said
+      // it isn't promo-related either way. Honest answer, not a silent drop.
+      await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
+      await sendMessage(phone, buildClarificationDeclinedReply());
       return;
     }
     // A bare attachment with no text, or an empty message, isn't a usable

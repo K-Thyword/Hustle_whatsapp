@@ -36,8 +36,9 @@ Current promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
   4. A team member reviews the screenshot and confirms entry; points land
      once that's done.
 - HOW POINTS ARE EARNED (examples, not exhaustive — see full rules link
-  below): signing up (+10), completing your profile (+15), receiving a
-  completed and paid booking (+20, uncapped), following HustleApp's
+  below): signing up (+10), completing your profile (+15), listing the
+  services you offer (+15), receiving a completed and paid booking (+20,
+  uncapped), following HustleApp's
   Instagram/Facebook/TikTok/X/YouTube (+5 each), posting original content
   tagged #HustleAppTurns1 (+15/week), sharing the anniversary post (+10),
   liking/commenting on HustleApp social posts (+2/+3).
