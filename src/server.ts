@@ -707,13 +707,34 @@ async function transferLiveChat(agentPhone: string, phone: string, chat: LiveCha
 }
 
 async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
-  const chat = await getLiveChat(phone);
-  if (!chat) {
-    await sendMessage(agentPhone, `No active conversation found for ${phone} — they may not have an open escalation right now.`);
-    return;
-  }
-
   const action = rest.trim().toLowerCase();
+  let chat = await getLiveChat(phone);
+
+  if (!chat) {
+    // No existing escalation — the customer never said "agent" or anything
+    // else that trips ESCALATION_TRIGGERS. Only "claim" is allowed to
+    // start one from scratch here: an agent watching the dashboard who
+    // spots someone struggling (see recordFriction's struggle alert above,
+    // which already tells agents to reply "<phone>: claim" — this is what
+    // makes that instruction actually work rather than dead-ending on "no
+    // active conversation") should be able to step in proactively, not
+    // only react to an explicit request. Every other action
+    // (unclaim/end/transfer/a plain message) still requires a real,
+    // already-open conversation, so those keep failing loudly rather than
+    // silently starting one.
+    if (action !== "claim") {
+      await sendMessage(
+        agentPhone,
+        `No active conversation found for ${phone} — they may not have an open escalation right now. Reply "${phone}: claim" to start one and step in.`
+      );
+      return;
+    }
+    chat = await startLiveChat(phone);
+    // Pulls the bot out of its normal automated flow for this customer,
+    // same as what happens when THEY trigger escalation themselves — so it
+    // doesn't keep answering on top of the agent once this starts.
+    await updateSession(phone, { stage: "escalated" });
+  }
 
   if (action === "claim") {
     if (chat.claimedBy && chat.claimedBy !== agentPhone) {
