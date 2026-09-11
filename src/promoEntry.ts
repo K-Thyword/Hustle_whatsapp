@@ -973,3 +973,78 @@ export function buildUsernamePrompt(): string {
 export function buildSocialHandlePrompt(platform: SocialPlatform): string {
   return `Quick one — what's the ${PLATFORM_LABELS[platform]} account/profile name you used for this? We'll log it so our team can double check, and you won't need to give it again for future ${PLATFORM_LABELS[platform]} entries.`;
 }
+
+// --- Approval notifications ---
+// admin.html's approveSubmission (a separate app, outside this repo) is
+// the only thing that ever flips submissions.status to 'approved' — this
+// bot never does. So rather than hooking into that action directly, a
+// sweep (see server.ts's startPromoApprovalNotifySweep) polls for
+// newly-approved submissions the customer hasn't been told about yet, using
+// approval_notified_at as the "already told them" marker. Per Tee
+// (2026-09-11): send a WhatsApp confirmation plus the leaderboard link the
+// moment a submission is approved, instead of the customer only finding
+// out if they think to ask "what's my score?".
+
+export interface ApprovedSubmissionForNotify {
+  submissionId: string;
+  whatsappPhone: string;
+  actionType: PromoActionType;
+  label: string;
+  points: number;
+}
+
+interface UnnotifiedSubmissionRow {
+  id: string;
+  whatsapp_number: string;
+  claimed_action_type: string | null;
+}
+
+export async function getUnnotifiedApprovedSubmissions(): Promise<ApprovedSubmissionForNotify[]> {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const promoId = await getCurrentPromoId();
+  if (!promoId) return [];
+
+  const { data, error } = await supabase
+    .from("submissions")
+    .select("id, whatsapp_number, claimed_action_type")
+    .eq("promo_id", promoId)
+    .eq("status", "approved")
+    .is("approval_notified_at", null);
+
+  if (error) {
+    console.error("[Promo entry] Failed to load newly-approved submissions:", error);
+    return [];
+  }
+
+  const results: ApprovedSubmissionForNotify[] = [];
+  for (const row of (data ?? []) as UnnotifiedSubmissionRow[]) {
+    // Shouldn't happen (every submission claims an action type on the way
+    // in), but skip rather than crash the sweep over one odd row.
+    if (!row.claimed_action_type) continue;
+    const rule = await getPointRule(row.claimed_action_type as PromoActionType, promoId);
+    if (!rule) continue;
+    results.push({
+      submissionId: row.id,
+      whatsappPhone: row.whatsapp_number,
+      actionType: row.claimed_action_type as PromoActionType,
+      label: rule.label,
+      points: rule.points,
+    });
+  }
+  return results;
+}
+
+export async function markApprovalNotified(submissionId: string): Promise<void> {
+  const supabase = getSupabase();
+  if (!supabase) return;
+  const { error } = await supabase
+    .from("submissions")
+    .update({ approval_notified_at: new Date().toISOString() })
+    .eq("id", submissionId);
+  if (error) console.error("[Promo entry] Failed to mark approval notified:", error);
+}
+
+export function buildApprovalNotification(label: string, points: number): string {
+  return `Great news — your "${label}" entry (+${points} points) for the Hustle @1 promo has been approved! 🎉 Check your standing on the leaderboard anytime: http://promos.hustleapp.io/promo/hustle-at-1`;
+}

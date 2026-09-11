@@ -13,6 +13,7 @@ import {
 import { generateWeeklyDigest } from "./digest";
 import { sendDigestToAgents, whatsappConfigured } from "./whatsapp";
 import { markSeen, getAllLastSeen } from "./readState";
+import { getAllContactProfiles } from "./contactDirectory";
 
 export const api = Router();
 
@@ -51,13 +52,23 @@ api.get("/alerts", async (_req: Request, res: Response) => {
 // since it was last opened in the dashboard (see readState.ts) — computed
 // here rather than client-side so "seen" is a real, shared, persisted fact
 // instead of a per-browser guess that resets whenever a browser clears its
-// storage.
+// storage. Also enriched with a displayName when we have one on file (see
+// contactDirectory.ts) — matters most for a phone/BSUID customer who's
+// hidden their real number behind a WhatsApp username, since that ID alone
+// gives an agent nothing to recognize them by.
 api.get("/conversations", async (_req: Request, res: Response) => {
-  const [convs, lines, lastSeen] = await Promise.all([getConversations(), getTranscriptLines(), getAllLastSeen()]);
+  const [convs, lines, lastSeen, contactProfiles] = await Promise.all([
+    getConversations(),
+    getTranscriptLines(),
+    getAllLastSeen(),
+    getAllContactProfiles(),
+  ]);
   const enriched = convs.map((c) => {
     const seenAt = lastSeen[c.phone] || "";
     const unreadCount = lines.filter((l) => l.phone === c.phone && l.direction === "customer" && l.timestamp > seenAt).length;
-    return { ...c, unreadCount };
+    const profile = contactProfiles[c.phone];
+    const displayName = profile?.name || profile?.username;
+    return { ...c, unreadCount, displayName };
   });
   res.json(enriched);
 });

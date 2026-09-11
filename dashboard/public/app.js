@@ -551,6 +551,12 @@ async function renderChats() {
   // instantly after marking a phone seen, without a full re-fetch.
   let unreadCounts = {};
   let allLines = [];
+  // phone/BSUID -> WhatsApp display name or username (see api.ts's
+  // /conversations, backed by dashboard/src/contactDirectory.ts). Mainly
+  // for customers identified by a BSUID instead of a phone number — their
+  // real number is never available to us, so this is the only
+  // human-readable way to recognize them.
+  let displayNames = {};
 
   function unreadBadge(phone) {
     const n = unreadCounts[phone];
@@ -575,11 +581,20 @@ async function renderChats() {
     );
   });
 
+  function conversationLabel(phone) {
+    const name = displayNames[phone];
+    return name ? `${esc(name)} <span class="muted">(${esc(phone)})</span>` : esc(phone);
+  }
+
   async function loadConversations() {
     const [convs, lines] = await Promise.all([api("/conversations"), api("/transcripts")]);
     allLines = lines;
     unreadCounts = {};
-    for (const c of convs) if (c.unreadCount) unreadCounts[c.phone] = c.unreadCount;
+    displayNames = {};
+    for (const c of convs) {
+      if (c.unreadCount) unreadCounts[c.phone] = c.unreadCount;
+      if (c.displayName) displayNames[c.phone] = c.displayName;
+    }
     updateChatsNavBadge(Object.keys(unreadCounts).length);
     if (!convs.length) {
       convList.innerHTML = `<p class="muted" style="padding:12px">No conversations logged yet.</p>`;
@@ -588,7 +603,7 @@ async function renderChats() {
     convList.innerHTML = convs
       .map(
         (c) => `<div class="conv-item" data-phone="${esc(c.phone)}">
-          <div class="conv-phone">${esc(c.phone)} ${unreadBadge(c.phone)}</div>
+          <div class="conv-phone">${conversationLabel(c.phone)} ${unreadBadge(c.phone)}</div>
           <div class="conv-preview">${esc(c.lastMessage)}</div>
           <div class="msg-time">${fmtTime(c.lastTimestamp)} · ${c.messageCount} msgs${c.unreadCount ? ` · ${c.unreadCount} new` : ""}</div>
         </div>`
@@ -620,9 +635,12 @@ async function renderChats() {
   async function loadThread(phone) {
     thread.innerHTML = `<p class="muted">Loading…</p>`;
     const lines = await api(`/conversations/${encodeURIComponent(phone)}`);
-    const exportBar = `<div style="display:flex; justify-content:flex-end; gap:8px; margin-bottom:10px">
-      <button class="refresh" id="threadExportCsv">Export CSV</button>
-      <button class="refresh" id="threadExportPdf">Export PDF</button>
+    const headerBar = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px">
+      <div style="font-weight:600">${conversationLabel(phone)}</div>
+      <div style="display:flex; gap:8px">
+        <button class="refresh" id="threadExportCsv">Export CSV</button>
+        <button class="refresh" id="threadExportPdf">Export PDF</button>
+      </div>
     </div>`;
     const messages = lines
       .map(
@@ -634,7 +652,7 @@ async function renderChats() {
         </div>`
       )
       .join("");
-    thread.innerHTML = exportBar + messages;
+    thread.innerHTML = headerBar + messages;
     document.getElementById("threadExportCsv").addEventListener("click", () => {
       exportCsv(`hustleapp-chat-${phone}.csv`, ["Timestamp", "Direction", "Message"], lines.map((l) => [l.timestamp, l.direction, l.text]));
     });

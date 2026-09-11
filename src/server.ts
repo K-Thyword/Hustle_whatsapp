@@ -27,6 +27,7 @@ import { resolvePostedLink } from "./postLinkResolver";
 import { describeImage } from "./imageAnalyzer";
 import { getPromoPhase } from "./promoInfo";
 import { getSupabase } from "./supabase";
+import { saveContactProfile } from "./contactDirectory";
 import {
   processPromoScreenshot,
   finalizeUsernameAndSubmission,
@@ -35,6 +36,9 @@ import {
   buildUsernamePrompt,
   buildAlreadyClaimedReply,
   buildSocialHandlePrompt,
+  getUnnotifiedApprovedSubmissions,
+  markApprovalNotified,
+  buildApprovalNotification,
   PendingSubmission,
   PendingSocialSubmission,
   EntryFlags,
@@ -1309,6 +1313,16 @@ app.post("/webhook", async (req: Request, res: Response) => {
     // than wasting an API call on an empty recipient.
     console.error("Inbound webhook message has no usable phone number or BSUID — raw payload:", JSON.stringify(req.body));
     return;
+  }
+
+  // Whatever WhatsApp itself knows this customer as — their own set
+  // display name, and/or their username if they have one — captured for
+  // every customer (see contactDirectory.ts). Matters most for a BSUID
+  // customer, since their real phone number is never available to us at
+  // all; this is the only human-readable way to recognize them later.
+  const inboundProfile = change?.contacts?.[0]?.profile;
+  if (inboundProfile?.name || inboundProfile?.username) {
+    await saveContactProfile(from, { name: inboundProfile.name, username: inboundProfile.username });
   }
 
   let text: string = message.text?.body?.trim() ?? "";
@@ -2907,6 +2921,26 @@ function startReminderSweep() {
   }, SWEEP_INTERVAL_MS);
 }
 
+// Tells a Hustle @1 entrant the moment their submission is approved,
+// instead of them only finding out if they think to ask "what's my
+// score?". admin.html (a separate app — see promoEntry.ts) is the only
+// thing that ever approves a submission, so there's no in-process event to
+// hook — this polls Supabase instead, same shape as the sweeps above.
+// Runs regardless of promo phase (upcoming/live/expired): an admin
+// catching up on a review backlog after the promo's end date still owes
+// that customer a confirmation.
+function startPromoApprovalNotifySweep() {
+  setInterval(() => {
+    (async () => {
+      if (!getSupabase()) return;
+      for (const approval of await getUnnotifiedApprovedSubmissions()) {
+        await sendMessage(approval.whatsappPhone, buildApprovalNotification(approval.label, approval.points));
+        await markApprovalNotified(approval.submissionId);
+      }
+    })().catch((err) => console.error("Promo approval-notify sweep failed:", err));
+  }, SWEEP_INTERVAL_MS);
+}
+
 // --- 5. Outbound sender ---
 
 // A WhatsApp Business-Scoped User ID (BSUID) — assigned to a customer who's
@@ -3076,4 +3110,5 @@ app.listen(PORT, () => {
   startWinBackSweep();
   startReminderSweep();
   startSocialPostSyncScheduler();
+  startPromoApprovalNotifySweep();
 });
