@@ -1387,7 +1387,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
 
       const promoResult = await processPromoScreenshot(from, message.image.id, message.id, caption || undefined);
       if (promoResult.status === "logged") {
-        await sendMessage(from, buildPromoEntryConfirmation(promoResult.label, promoResult.points));
+        await sendMessage(from, buildPromoEntryConfirmation(promoResult.label, promoResult.points, promoResult.bonus));
         await notifyAgentsAboutEntryFlags(from, promoResult.label, promoResult.flags);
         return;
       }
@@ -1407,7 +1407,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
         // the DB as status='duplicate' for admin's awareness (see
         // findExistingOneTimeClaim in promoEntry.ts) rather than a fresh
         // item competing for approval a second time.
-        await sendMessage(from, buildAlreadyClaimedReply(promoResult.label));
+        await sendMessage(from, buildAlreadyClaimedReply(promoResult.label, promoResult.bonus));
         return;
       }
       if (promoResult.status === "duplicate") {
@@ -2083,7 +2083,7 @@ async function handleMessage(
       const usernameResult = await finalizeUsernameAndSubmission(phone, pending, text.trim());
       if (usernameResult.status === "logged") {
         await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
-        await sendMessage(phone, buildPromoEntryConfirmation(usernameResult.label, usernameResult.points));
+        await sendMessage(phone, buildPromoEntryConfirmation(usernameResult.label, usernameResult.points, usernameResult.bonus));
         await notifyAgentsAboutEntryFlags(phone, usernameResult.label, usernameResult.flags);
         return;
       }
@@ -2959,8 +2959,20 @@ function startPromoApprovalNotifySweep() {
   setInterval(() => {
     (async () => {
       if (!getSupabase()) return;
+      const promoIsLive = getPromoPhase() === "live";
       for (const approval of await getUnnotifiedApprovedSubmissions()) {
-        await sendMessage(approval.whatsappPhone, buildApprovalNotification(approval.label, approval.points));
+        // Per Tee: fold the entrant's actual current standing into the
+        // approval message itself, not just a link telling them to go look
+        // — reuses the exact same rank/points sentence the "what's my
+        // score?" reply uses (see promoLeaderboard.ts) rather than a
+        // second copy of that formatting. Only appended for the normal
+        // "ranked" case; the other statuses (a Supabase hiccup, or — in
+        // theory — a submission this stale sweep already fell behind on)
+        // would read oddly stapled onto a just-approved message, so those
+        // just get the plain approval + link instead.
+        const standing = await getPromoStanding(approval.whatsappPhone);
+        const standingSentence = standing.status === "ranked" ? buildPromoStandingReply(standing, promoIsLive) : undefined;
+        await sendMessage(approval.whatsappPhone, buildApprovalNotification(approval.label, approval.points, standingSentence));
         await markApprovalNotified(approval.submissionId);
       }
     })().catch((err) => console.error("Promo approval-notify sweep failed:", err));

@@ -102,6 +102,7 @@ interface RawClassification {
   platform: string | null;
   tamperSuspected: boolean;
   tamperReason: string | null;
+  profileVerificationCompleted: boolean;
   description: string;
 }
 
@@ -169,7 +170,7 @@ function normalizeMimeType(mimeType: string): "image/jpeg" | "image/png" | "imag
 const CLASSIFY_PROMPT = `You're screening WhatsApp screenshots for Hustleapp's "Hustle @1" anniversary promo. Registered Hustlers (service providers) earn points by doing one of these things and sending a screenshot as proof:
 
 - "signup": proof they've created a Hustleapp Hustler account. This includes a welcome/registration-success screen, but MOST COMMONLY it's a screenshot of the app's own Account Settings / provider dashboard screen — things like an "Available to work" toggle, Working Hours, Account verification status, Business Details, etc. Reaching this screen at all is proof the account exists. Do NOT require the profile to be complete or verification to say "Verified" — an account verification status of "Pending" is completely normal and still counts as a valid signup screenshot. A brand-new Hustler's profile isn't expected to be complete yet, so don't hold that against this action type.
-- "complete_profile": specifically their Hustleapp profile shown as 100% / fully complete (a distinct, later milestone from signup above) — these typically show their own name AND email alongside an explicit completion indicator. Don't confuse this with the general Account Settings screen described under "signup" — that one counts as signup even when incomplete.
+- "complete_profile": specifically their Hustleapp profile shown as 100% / fully complete (a distinct, later milestone from signup above) — these typically show their own name AND email alongside an explicit completion indicator. Don't confuse this with the general Account Settings screen described under "signup" — that one counts as signup even when incomplete. (You don't need to separately pick this action type for the Account Settings screen specifically — see profileVerificationCompleted below, which covers that case.)
 - "follow_instagram" / "follow_facebook" / "follow_tiktok" / "follow_x" / "follow_youtube": proof they follow HustleApp's account on that SPECIFIC platform — e.g. "Following" shown on Hustleapp's page, or Hustleapp appearing in their own following list. Pick the exact platform, don't guess if unclear.
 - "like_post": proof they liked one of HustleApp's social posts.
 - "comment_post": proof they commented on one of HustleApp's social posts. If a post URL/permalink is visible, put it in targetRef.
@@ -189,9 +190,10 @@ Also extract, only when actually legible in the image (never guess or infer):
 Also assess, honestly and conservatively:
 - tamperSuspected: true only if you see clear, concrete signs of digital editing — mismatched fonts, misaligned/duplicated UI elements, inconsistent lighting or pixel artifacts around text, a screenshot-of-a-screenshot moiré pattern, or a resolution/aspect-ratio that doesn't match the claimed app's real UI. Do NOT set this true just because something is merely hard to read, oddly cropped, or a normal photo of a phone screen (glare, an angled photo, a slightly blurry photo, or a boring crop are all normal, not tampering) — false accusations of editing are worse than missing real ones, since a real person will actually see and read this.
 - tamperReason: one short plain sentence explaining why, only if tamperSuspected is true — otherwise null.
+- profileVerificationCompleted: ONLY relevant when actionType is "signup" via the Account Settings screen (see above) — set true if the "Account verification information" row on that exact screen visibly reads "Completed" (green, next to a shield icon). Set false if it reads "Pending", anything else, isn't present, or isn't clearly legible — never guess. This one screenshot proves BOTH signup AND profile completion when true, so getting this wrong either awards or withholds real points; when in doubt, false.
 
 Respond with strict JSON only, no markdown formatting, matching exactly:
-{"isPromoEntry": boolean, "actionType": string|null, "targetRef": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "platform": string|null, "tamperSuspected": boolean, "tamperReason": string|null, "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
+{"isPromoEntry": boolean, "actionType": string|null, "targetRef": string|null, "confidence": number (0-1), "extractedName": string|null, "extractedEmail": string|null, "platform": string|null, "tamperSuspected": boolean, "tamperReason": string|null, "profileVerificationCompleted": boolean, "description": string (always fill this in — 1 short plain-English sentence describing the image, used as a fallback if this isn't treated as a promo entry)}`;
 
 async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string): Promise<RawClassification | undefined> {
   if (!anthropic) return undefined;
@@ -242,6 +244,7 @@ async function classify(buffer: ArrayBuffer, mimeType: string, caption?: string)
       tamperSuspected: parsed.tamperSuspected === true,
       tamperReason:
         typeof parsed.tamperReason === "string" && parsed.tamperReason.trim() ? parsed.tamperReason.trim() : null,
+      profileVerificationCompleted: parsed.profileVerificationCompleted === true,
       description: parsed.description.trim(),
     };
   } catch (err) {
@@ -622,6 +625,49 @@ function buildEntryFlags(
   return Object.keys(flags).length > 0 ? flags : undefined;
 }
 
+// A signup screenshot's "Account verification information" row sometimes
+// already reads "Completed" rather than "Pending" — when it does, that SAME
+// screenshot is also valid proof of complete_profile (a separate,
+// higher-value milestone), so this awards both from the one image instead
+// of making the entrant send a second screenshot to prove something
+// already visible in the first. Per Tee (2026-09-11). Always logged as its
+// own 'pending' submission for admin review — never auto-approved just
+// because it rode in on a signup screenshot. Returns undefined if there's
+// nothing to award (already claimed, rule missing/inactive, or the insert
+// failed) — every case a silent no-bonus, never a hard failure of the
+// underlying signup/complete_profile submission it's attached to.
+async function maybeAwardBonusCompleteProfile(params: {
+  entrantId: string;
+  whatsappPhone: string;
+  whatsappMessageId: string;
+  screenshotPath: string;
+  promoId: string;
+  imageHash?: string;
+}): Promise<{ label: string; points: number } | undefined> {
+  const existingClaimId = await findExistingOneTimeClaim(params.entrantId, "complete_profile");
+  if (existingClaimId) return undefined;
+
+  const rule = await getPointRule("complete_profile", params.promoId);
+  if (!rule || !rule.active) return undefined;
+
+  // Distinct synthetic whatsapp_message_id — the real inbound message ID is
+  // already used by the signup submission this rides in on, and that
+  // column is unique.
+  const insertResult = await insertSubmission({
+    entrantId: params.entrantId,
+    whatsappPhone: params.whatsappPhone,
+    whatsappMessageId: `${params.whatsappMessageId}:complete_profile`,
+    screenshotPath: params.screenshotPath,
+    actionType: "complete_profile",
+    targetRef: null,
+    imageHash: params.imageHash,
+  });
+  if (insertResult.status !== "logged") return undefined;
+
+  console.log(`[Promo entry] Also awarded complete_profile bonus for entrant ${params.entrantId} (verified signup screenshot)`);
+  return { label: rule.label, points: rule.points };
+}
+
 export interface PendingSubmission {
   whatsappMessageId: string;
   actionType: PromoActionType;
@@ -635,6 +681,7 @@ export interface PendingSubmission {
   tamperSuspected: boolean;
   tamperReason: string | null;
   identityCollisions: { whatsappNumber: string }[];
+  profileVerificationCompleted: boolean;
 }
 
 // Held while waiting on a customer's answer to "what account/profile name
@@ -657,12 +704,12 @@ export interface PendingSocialSubmission {
 }
 
 export type PromoEntryResult =
-  | { status: "logged"; actionType: PromoActionType; label: string; points: number; flags?: EntryFlags }
+  | { status: "logged"; actionType: PromoActionType; label: string; points: number; flags?: EntryFlags; bonus?: { label: string; points: number } }
   | { status: "awaiting_username"; pending: PendingSubmission }
   | { status: "awaiting_social_handle"; pending: PendingSocialSubmission }
   | { status: "not_entry"; description?: string }
   | { status: "duplicate" }
-  | { status: "already_claimed"; label: string; flags?: EntryFlags };
+  | { status: "already_claimed"; label: string; flags?: EntryFlags; bonus?: { label: string; points: number } };
 
 // The single entry point server.ts calls for an inbound image while the
 // promo is live. Downloads once, classifies once, and only for a
@@ -724,6 +771,7 @@ export async function processPromoScreenshot(
         tamperSuspected: result.tamperSuspected,
         tamperReason: result.tamperReason,
         identityCollisions,
+        profileVerificationCompleted: result.profileVerificationCompleted,
       },
     };
   }
@@ -782,17 +830,36 @@ export async function processPromoScreenshot(
 
   const flags = buildEntryFlags(actionType, result, imageReuseOfSubmissionId, identityCollisions);
 
+  // Same screenshot, a second thing to check: a signup screenshot whose
+  // "Account verification information" already reads "Completed" is also
+  // valid proof of complete_profile — award both from the one image. Runs
+  // whether this signup claim is fresh OR a repeat (an entrant might first
+  // send this while still "Pending", then resend later once it flips to
+  // "Completed" — that resend should still earn the bonus even though
+  // signup itself was already claimed).
+  const bonus =
+    actionType === "signup" && result.profileVerificationCompleted
+      ? await maybeAwardBonusCompleteProfile({
+          entrantId: entrant.id,
+          whatsappPhone,
+          whatsappMessageId,
+          screenshotPath,
+          promoId,
+          imageHash,
+        })
+      : undefined;
+
   if (insertResult.status === "already_claimed") {
     console.log(`[Promo entry] Flagged repeat ${actionType} claim from ${whatsappPhone} (entrant ${entrant.id}) as duplicate`);
-    return { status: "already_claimed", label: rule.label, flags };
+    return { status: "already_claimed", label: rule.label, flags, bonus };
   }
 
   console.log(`[Promo entry] Logged ${actionType} submission for ${whatsappPhone} (entrant ${entrant.id})`);
-  return { status: "logged", actionType, label: rule.label, points: rule.points, flags };
+  return { status: "logged", actionType, label: rule.label, points: rule.points, flags, bonus };
 }
 
 export type FinalizeUsernameResult =
-  | { status: "logged"; actionType: PromoActionType; label: string; points: number; flags?: EntryFlags }
+  | { status: "logged"; actionType: PromoActionType; label: string; points: number; flags?: EntryFlags; bonus?: { label: string; points: number } }
   | { status: "awaiting_social_handle"; pending: PendingSocialSubmission }
   | { status: "taken" }
   | { status: "invalid" }
@@ -895,8 +962,24 @@ export async function finalizeUsernameAndSubmission(
 
   const flags = buildEntryFlags(pending.actionType, pending, pending.imageReuseOfSubmissionId, pending.identityCollisions);
 
+  // Same bonus check as processPromoScreenshot's existing-entrant path —
+  // see maybeAwardBonusCompleteProfile's header comment. A brand-new
+  // entrant can't have an existing complete_profile claim yet, but the
+  // helper's own findExistingOneTimeClaim check covers that regardless.
+  const bonus =
+    pending.actionType === "signup" && pending.profileVerificationCompleted
+      ? await maybeAwardBonusCompleteProfile({
+          entrantId: created.id,
+          whatsappPhone,
+          whatsappMessageId: pending.whatsappMessageId,
+          screenshotPath: pending.screenshotPath,
+          promoId,
+          imageHash: pending.imageHash,
+        })
+      : undefined;
+
   console.log(`[Promo entry] Created entrant ${created.id} (${username}) and logged ${pending.actionType} for ${whatsappPhone}`);
-  return { status: "logged", actionType: pending.actionType, label: rule.label, points: rule.points, flags };
+  return { status: "logged", actionType: pending.actionType, label: rule.label, points: rule.points, flags, bonus };
 }
 
 export type FinalizeSocialHandleResult =
@@ -953,8 +1036,16 @@ export async function finalizeSocialHandleAndSubmission(
   return { status: "logged", actionType: pending.actionType, label: rule.label, points: rule.points, flags };
 }
 
-export function buildPromoEntryConfirmation(label: string, points: number): string {
-  return `Got it — logged your entry for "${label}" (+${points} points) in the Hustle @1 promo! 🎉 Our team will review it and confirm soon.`;
+export function buildPromoEntryConfirmation(
+  label: string,
+  points: number,
+  bonus?: { label: string; points: number }
+): string {
+  if (!bonus) {
+    return `Got it — logged your entry for "${label}" (+${points} points) in the Hustle @1 promo! 🎉 Our team will review it and confirm soon.`;
+  }
+  const total = points + bonus.points;
+  return `Got it — logged your entry for "${label}" (+${points} points)! And since this screenshot also shows your profile as verified, that counts as "${bonus.label}" too (+${bonus.points} points) — that's ${total} points total. 🎉 Our team will review it and confirm soon.`;
 }
 
 // Sent when findExistingOneTimeClaim caught a repeat claim on a one-time
@@ -962,8 +1053,10 @@ export function buildPromoEntryConfirmation(label: string, points: number): stri
 // via the existing Duplicate filter) but not treated as a fresh entry, so
 // the customer needs an honest, non-confusing reply rather than the usual
 // celebratory confirmation.
-export function buildAlreadyClaimedReply(label: string): string {
-  return `Looks like you've already got credit for "${label}" in the Hustle @1 promo — no need to resend that one. If that seems wrong, just say "agent" and we'll take a look.`;
+export function buildAlreadyClaimedReply(label: string, bonus?: { label: string; points: number }): string {
+  const base = `Looks like you've already got credit for "${label}" in the Hustle @1 promo — no need to resend that one.`;
+  if (!bonus) return `${base} If that seems wrong, just say "agent" and we'll take a look.`;
+  return `${base} Good news though — this screenshot also shows your profile as verified, so I've logged "${bonus.label}" (+${bonus.points} points) for you too! 🎉 Our team will review it and confirm soon.`;
 }
 
 export function buildUsernamePrompt(): string {
@@ -1045,6 +1138,15 @@ export async function markApprovalNotified(submissionId: string): Promise<void> 
   if (error) console.error("[Promo entry] Failed to mark approval notified:", error);
 }
 
-export function buildApprovalNotification(label: string, points: number): string {
-  return `Great news — your "${label}" entry (+${points} points) for the Hustle @1 promo has been approved! 🎉 Check your standing on the leaderboard anytime: http://promos.hustleapp.io/promo/hustle-at-1`;
+// standingSentence, when given, is a ready-made sentence from
+// promoLeaderboard.ts's buildPromoStandingReply (e.g. "You're 3rd out of 12
+// on the Hustle @1 leaderboard, with 45 points as \"username\"...") — built
+// there rather than here to avoid a circular import (promoLeaderboard.ts
+// already imports getCurrentPromoId/findEntrantByPhone from this file) and
+// to reuse the exact same rank-formatting logic the "what's my score?"
+// reply uses, instead of a second copy that could drift from it.
+export function buildApprovalNotification(label: string, points: number, standingSentence?: string): string {
+  const base = `Great news — your "${label}" entry (+${points} points) for the Hustle @1 promo has been approved! 🎉`;
+  const standingPart = standingSentence ? ` ${standingSentence}` : "";
+  return `${base}${standingPart} Check the full leaderboard anytime: http://promos.hustleapp.io/promo/hustle-at-1`;
 }
