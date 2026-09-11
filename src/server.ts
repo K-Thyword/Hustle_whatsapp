@@ -30,10 +30,14 @@ import { getSupabase } from "./supabase";
 import {
   processPromoScreenshot,
   finalizeUsernameAndSubmission,
+  finalizeSocialHandleAndSubmission,
   buildPromoEntryConfirmation,
   buildUsernamePrompt,
   buildAlreadyClaimedReply,
+  buildSocialHandlePrompt,
   PendingSubmission,
+  PendingSocialSubmission,
+  EntryFlags,
 } from "./promoEntry";
 import { getPromoStanding, buildPromoStandingReply, isAskingAboutOwnPromoStanding } from "./promoLeaderboard";
 import {
@@ -406,6 +410,42 @@ async function notifyAgents(message: string, summaryLabel: string = "an update")
   for (const number of AGENT_NOTIFY_NUMBERS) {
     await notifyAgentSmart(number, message, summaryLabel);
   }
+}
+
+// Turns a logged promo submission's advisory EntryFlags (see promoEntry.ts)
+// into one human-readable note for admin, or undefined if nothing needs
+// attention. Every one of these is a signal for a human judgment call —
+// never something the bot itself accepts or rejects on.
+function describeEntryFlags(flags: EntryFlags | undefined): string | undefined {
+  if (!flags) return undefined;
+  const parts: string[] = [];
+  if (flags.needsManualBookingConfirmation) {
+    parts.push(
+      "This claims a completed & paid booking — please manually confirm the real booking before approving (screenshot alone isn't enough verification for the highest-value action)."
+    );
+  }
+  if (flags.tamperSuspected) {
+    parts.push(`Possible sign of image editing flagged by the AI: ${flags.tamperReason ?? "no reason given"}.`);
+  }
+  if (flags.imageReuseOfSubmissionId) {
+    parts.push(`This screenshot looks near-identical to an earlier submission (id ${flags.imageReuseOfSubmissionId}) — worth checking both together.`);
+  }
+  if (flags.identityCollisions && flags.identityCollisions.length > 0) {
+    parts.push(
+      `Name/email on this entry also matches another entrant's (${flags.identityCollisions.map((c) => c.whatsappNumber).join(", ")}) — possible multi-accounting.`
+    );
+  }
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+// Fires the notifyAgents ping for a just-logged promo submission, if
+// describeEntryFlags found anything worth a human look. Shared by every
+// place a promo submission can finish logging (a normal screenshot, one
+// that needed a username first, or one that needed a social handle first).
+async function notifyAgentsAboutEntryFlags(phone: string, label: string, flags: EntryFlags | undefined): Promise<void> {
+  const note = describeEntryFlags(flags);
+  if (!note) return;
+  await notifyAgents(`Hustle @1 submission from ${phone} ("${label}") needs a look: ${note}`, "a flagged promo submission");
 }
 
 // One unclear reply, a rejected date, a misread service type — any single
@@ -1261,15 +1301,26 @@ app.post("/webhook", async (req: Request, res: Response) => {
         await sendMessage(from, "Let's finish choosing your leaderboard username first — what would you like it to be?");
         return;
       }
+      if (currentSession.data.awaitingSocialHandle) {
+        const pendingPlatform = (currentSession.data.awaitingSocialHandle as PendingSocialSubmission).platform;
+        await sendMessage(from, `Let's finish that last one first — what's the account/profile name you used on ${pendingPlatform}?`);
+        return;
+      }
 
       const promoResult = await processPromoScreenshot(from, message.image.id, message.id, caption || undefined);
       if (promoResult.status === "logged") {
         await sendMessage(from, buildPromoEntryConfirmation(promoResult.label, promoResult.points));
+        await notifyAgentsAboutEntryFlags(from, promoResult.label, promoResult.flags);
         return;
       }
       if (promoResult.status === "awaiting_username") {
         await updateSession(from, { data: { awaitingLeaderboardUsername: promoResult.pending } });
         await sendMessage(from, buildUsernamePrompt());
+        return;
+      }
+      if (promoResult.status === "awaiting_social_handle") {
+        await updateSession(from, { data: { awaitingSocialHandle: promoResult.pending } });
+        await sendMessage(from, buildSocialHandlePrompt(promoResult.pending.platform));
         return;
       }
       if (promoResult.status === "already_claimed") {
@@ -1955,6 +2006,17 @@ async function handleMessage(
       if (usernameResult.status === "logged") {
         await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
         await sendMessage(phone, buildPromoEntryConfirmation(usernameResult.label, usernameResult.points));
+        await notifyAgentsAboutEntryFlags(phone, usernameResult.label, usernameResult.flags);
+        return;
+      }
+      if (usernameResult.status === "awaiting_social_handle") {
+        // The username's chosen and the entrant now exists, but this
+        // entrant's first-ever action was on a social platform — need the
+        // account name before the submission itself can be logged.
+        await updateSession(phone, {
+          data: { awaitingLeaderboardUsername: undefined, awaitingSocialHandle: usernameResult.pending },
+        });
+        await sendMessage(phone, buildSocialHandlePrompt(usernameResult.pending.platform));
         return;
       }
       if (usernameResult.status === "taken") {
@@ -1969,6 +2031,48 @@ async function handleMessage(
         // Same WhatsApp message already processed (a retry of THIS reply
         // itself) — already logged, so just clear the flag silently.
         await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
+        return;
+      }
+      // "error" — something failed on the Supabase side. Don't silently
+      // drop the pending state; let them try the same answer again.
+      await sendMessage(phone, "Sorry, something went wrong saving that — mind trying again in a moment?");
+      return;
+    }
+    // A bare attachment with no text, or an empty message, isn't a usable
+    // answer — fall through rather than looping on it silently; the image
+    // branch above already redirects a second screenshot back to this
+    // same question, so we're still marked as awaiting either way.
+  }
+
+  // Mirror of the awaitingLeaderboardUsername block above, for the other
+  // pending promo question: which account/profile name an entrant used
+  // for a social action, asked once per (entrant, platform) — see
+  // promoEntry.ts's getStoredSocialHandle/finalizeSocialHandleAndSubmission.
+  // Same "cancel" escape hatch; the screenshot is already uploaded, so
+  // nothing is lost if they resend later instead.
+  if (session.data.awaitingSocialHandle) {
+    const pending = session.data.awaitingSocialHandle as PendingSocialSubmission;
+    if (/^(cancel|never ?mind)$/i.test(text.trim())) {
+      await updateSession(phone, { data: { awaitingSocialHandle: undefined } });
+      await sendMessage(phone, "No problem — send the screenshot again whenever you're ready to give that account name.");
+      return;
+    }
+    if (text.trim() && !media) {
+      const handleResult = await finalizeSocialHandleAndSubmission(pending, text.trim());
+      if (handleResult.status === "logged") {
+        await updateSession(phone, { data: { awaitingSocialHandle: undefined } });
+        await sendMessage(phone, buildPromoEntryConfirmation(handleResult.label, handleResult.points));
+        await notifyAgentsAboutEntryFlags(phone, handleResult.label, handleResult.flags);
+        return;
+      }
+      if (handleResult.status === "invalid") {
+        await sendMessage(phone, "That doesn't look like a usable account name — what would you like to give?");
+        return;
+      }
+      if (handleResult.status === "duplicate") {
+        // Same WhatsApp message already processed (a retry of THIS reply
+        // itself) — already logged, so just clear the flag silently.
+        await updateSession(phone, { data: { awaitingSocialHandle: undefined } });
         return;
       }
       // "error" — something failed on the Supabase side. Don't silently
