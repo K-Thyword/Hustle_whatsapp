@@ -709,6 +709,11 @@ async function transferLiveChat(agentPhone: string, phone: string, chat: LiveCha
 async function handleLiveChatCommand(agentPhone: string, phone: string, rest: string) {
   const action = rest.trim().toLowerCase();
   let chat = await getLiveChat(phone);
+  // Tracks whether THIS call is what started the conversation, so the
+  // customer gets an honest opening line either way: "you asked for us and
+  // here we are" reads oddly to someone who never asked — they need to be
+  // told why an agent is suddenly messaging them instead.
+  let startedProactively = false;
 
   if (!chat) {
     // No existing escalation — the customer never said "agent" or anything
@@ -730,6 +735,7 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
       return;
     }
     chat = await startLiveChat(phone);
+    startedProactively = true;
     // Pulls the bot out of its normal automated flow for this customer,
     // same as what happens when THEY trigger escalation themselves — so it
     // doesn't keep answering on top of the agent once this starts.
@@ -760,11 +766,10 @@ async function handleLiveChatCommand(agentPhone: string, phone: string, rest: st
         "a claim update"
       );
     }
-    await notifyCustomerSmart(
-      phone,
-      `You're now connected with *${getAgentName(agentPhone)}* from our team — go ahead and chat here.`,
-      `a message from ${getAgentName(agentPhone)}`
-    );
+    const customerOpener = startedProactively
+      ? `Hi, this is *${getAgentName(agentPhone)}* from the Hustleapp team. Our system flagged that you might need a hand with something, so I wanted to reach out personally and check in — happy to help with whatever's going on, just let me know here.`
+      : `You're now connected with *${getAgentName(agentPhone)}* from our team — go ahead and chat here.`;
+    await notifyCustomerSmart(phone, customerOpener, `a message from ${getAgentName(agentPhone)}`);
     return;
   }
 
