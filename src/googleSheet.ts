@@ -186,8 +186,21 @@ export async function logAlert(message: string, event: "delivery_failed" | "stru
 // just "Hustleapp" either way.
 export type TranscriptDirection = "customer" | "bot";
 
+// WhatsApp phone numbers arrive as bare digit strings (country code +
+// number, e.g. "233556963137") — never letters, spaces, or punctuation
+// beyond an optional leading "+". The dashboard groups Transcript rows by
+// an exact match on this column (see dashboard/src/sheetsData.ts), so a
+// single malformed value here becomes a permanent, ungroupable phantom
+// "chat" in the UI. Guard at the write site rather than trusting every
+// call site upstream to already hold a validated phone.
+const PHONE_SHAPE_RE = /^\+?\d{7,15}$/;
+
 export async function logTranscriptLine(phone: string, direction: TranscriptDirection, text: string): Promise<void> {
   if (!text) return;
+  if (!PHONE_SHAPE_RE.test(phone)) {
+    console.error(`Refusing to log a transcript line for a non-phone-shaped value: ${JSON.stringify(phone)}`);
+    return;
+  }
   const client = getClient();
   const row = [new Date().toISOString(), phone, direction, text];
 

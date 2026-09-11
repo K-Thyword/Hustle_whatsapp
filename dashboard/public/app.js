@@ -29,11 +29,15 @@ function statusBadge(status, isOpen) {
 // --- Chats nav badge — total unread across every conversation, shown on
 // the sidebar itself so new messages are visible from any tab, not just
 // while the Chats tab happens to be open. ---
-function updateChatsNavBadge(total) {
+// `count` is the number of CONVERSATIONS that have at least one unread
+// message — not a sum of unread messages across all of them. A badge
+// reading "3" means 3 chats need attention, the same way a phone's app
+// icon badge works, regardless of how many messages are piled up in each.
+function updateChatsNavBadge(count) {
   const el = document.getElementById("chatsNavBadge");
   if (!el) return;
-  el.textContent = total ? String(total) : "";
-  el.classList.toggle("hidden", !total);
+  el.textContent = count ? String(count) : "";
+  el.classList.toggle("hidden", !count);
 }
 
 // Full fetch + recompute — used on page load and on a standing interval so
@@ -43,7 +47,7 @@ function updateChatsNavBadge(total) {
 async function refreshChatsNavBadge() {
   try {
     const convs = await api("/conversations");
-    updateChatsNavBadge(convs.reduce((sum, c) => sum + (c.unreadCount || 0), 0));
+    updateChatsNavBadge(convs.filter((c) => c.unreadCount).length);
   } catch (err) {
     console.error("Failed to refresh chats nav badge:", err);
   }
@@ -576,7 +580,7 @@ async function renderChats() {
     allLines = lines;
     unreadCounts = {};
     for (const c of convs) if (c.unreadCount) unreadCounts[c.phone] = c.unreadCount;
-    updateChatsNavBadge(Object.values(unreadCounts).reduce((sum, n) => sum + n, 0));
+    updateChatsNavBadge(Object.keys(unreadCounts).length);
     if (!convs.length) {
       convList.innerHTML = `<p class="muted" style="padding:12px">No conversations logged yet.</p>`;
       return;
@@ -650,7 +654,7 @@ async function renderChats() {
     );
     delete unreadCounts[phone];
     refreshUnreadBadges();
-    updateChatsNavBadge(Object.values(unreadCounts).reduce((sum, n) => sum + n, 0));
+    updateChatsNavBadge(Object.keys(unreadCounts).length);
   }
 
   let searchTimer;

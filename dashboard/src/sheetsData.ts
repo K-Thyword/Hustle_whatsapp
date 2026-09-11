@@ -207,10 +207,17 @@ export interface ConversationSummary {
 // "last seen per phone" state — there's no server-side notion of "read"
 // here, since the dashboard has no per-agent accounts to hang it off of
 // (see auth.ts) and stays deliberately stateless/read-only otherwise.
+// Same shape the bot enforces on write (src/googleSheet.ts) — kept here too
+// so any row already sitting in the sheet from before that validation
+// existed (or typed in by hand) gets filtered out here rather than showing
+// up as an ungroupable, blank phantom "chat" (phone column holding
+// something like a business name instead of a real number).
+const PHONE_SHAPE_RE = /^\+?\d{7,15}$/;
+
 export async function getTranscriptLines(): Promise<TranscriptLine[]> {
   const rows = await fetchTranscriptRows();
   return rows
-    .filter((row) => row.length >= 4)
+    .filter((row) => row.length >= 4 && PHONE_SHAPE_RE.test(row[1]))
     .map((row) => ({
       timestamp: row[0],
       phone: row[1],
