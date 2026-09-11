@@ -28,8 +28,9 @@ Current promotion — "Hustle @1" (HustleApp's 1-year anniversary promo):
 - HOW TO ENTER (an extra step beyond just signing up):
   1. Sign up and complete your Hustler profile in the app (Android or
      iPhone — see "How to sign up as a Hustler" above), if not done already.
-  2. Send a screenshot of your completed profile to 055 693 7198 on
-     WhatsApp (one of the official customer care numbers — not this bot).
+  2. Send a screenshot of your completed profile right here on WhatsApp,
+     to 0592424207 (this bot's number) — it's logged and classified
+     automatically the moment it arrives.
   3. Already signed up before the promo started? Same step — send the
      screenshot to opt in.
   4. A team member reviews the screenshot and confirms entry; points land
