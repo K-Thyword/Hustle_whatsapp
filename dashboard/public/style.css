@@ -184,6 +184,25 @@ button.refresh {
   color: var(--text-muted);
 }
 
+/* Sub-tab switcher within a tab (currently just Contacts / Usernames) —
+   same shape as button.refresh so it doesn't need its own visual language,
+   just an .active state to show which sub-view is showing. */
+button.subtab-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+button.subtab-btn.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+}
+
 /* Mobile: sidebar becomes a horizontally-scrollable top bar instead of a
    left column, tables scroll instead of overflowing the screen, and the
    Chats two-column layout stacks so the thread isn't squeezed to nothing. */

@@ -725,27 +725,56 @@ const CONTACT_COUNTRY_PRIORITY = ["Ghana", "Bahamas", "Nigeria"];
 // instead of being grouped (or mis-grouped) alongside phone contacts.
 const BSUID_RE = /^[A-Za-z]{2}\.\d+$/;
 
+// Every contact currently arrives over WhatsApp — this bot has no other
+// inbound channel wired up yet. Pulled out as its own function (rather
+// than a hardcoded string in the row markup) so a future channel (e.g. an
+// Instagram DM integration) is a one-line change here instead of a hunt
+// through renderContacts for every place "WhatsApp" got typed literally.
+function contactOrigin(_c) {
+  return "WhatsApp";
+}
+
 async function renderContacts() {
-  contentEl.innerHTML = `<h1>Contacts</h1><p class="muted">Every unique contact that has messaged the bot — phone numbers grouped by country, WhatsApp usernames (no number available) grouped separately.</p>
+  contentEl.innerHTML = `<h1>Contacts</h1>
+    <div class="filters" style="margin-bottom:0">
+      <button class="subtab-btn" data-subtab="numbers">Contacts</button>
+      <button class="subtab-btn" data-subtab="usernames">Usernames</button>
+    </div>
+    <p class="muted" id="contactsSubtitle"></p>
     <div class="filters">
-      <input type="search" id="contactSearch" placeholder="Search phone number or name..." style="flex:1" />
+      <input type="search" id="contactSearch" style="flex:1" />
       <button class="refresh" id="contactsExportCsv">Export CSV</button>
       <button class="refresh" id="contactsExportPdf">Export PDF</button>
     </div>
     <div id="contactsGroups"></div>`;
 
   const convs = await api("/conversations");
-  const phoneContacts = convs.filter((c) => !BSUID_RE.test(c.phone)).map((c) => ({ ...c, country: detectCountry(c.phone) }));
-  const usernameContacts = convs.filter((c) => BSUID_RE.test(c.phone));
+  const phoneContacts = convs
+    .filter((c) => !BSUID_RE.test(c.phone))
+    .map((c) => ({ ...c, country: detectCountry(c.phone), origin: contactOrigin(c) }));
+  const usernameContacts = convs
+    .filter((c) => BSUID_RE.test(c.phone))
+    .map((c) => ({ ...c, origin: contactOrigin(c) }));
   const groupsEl = document.getElementById("contactsGroups");
+  const searchEl = document.getElementById("contactSearch");
+  const subtitleEl = document.getElementById("contactsSubtitle");
 
-  function contactLabel(c) {
-    return c.displayName ? `${esc(c.displayName)} <span class="muted">(${esc(c.phone)})</span>` : esc(c.phone);
+  let subTab = "numbers";
+
+  function syncSubtabButtons() {
+    document.querySelectorAll(".subtab-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.subtab === subTab));
   }
 
-  function contactRow(c) {
+  const matchesQuery = (c, q) => c.phone.toLowerCase().includes(q) || (c.displayName || "").toLowerCase().includes(q);
+
+  // Phone contacts: Contact (the number) and Username are now two separate
+  // columns — a phone contact who's also set a WhatsApp display name shows
+  // both; one with no name on file just shows "—" in the Username column,
+  // per Tee (2026-09-11).
+  function phoneContactRow(c) {
     return `<tr>
-      <td>${contactLabel(c)}</td>
+      <td>${esc(c.phone)}</td>
+      <td>${c.displayName ? esc(c.displayName) : "—"}</td>
       <td>${fmtTime(c.firstTimestamp)}</td>
       <td>${fmtTime(c.lastTimestamp)}</td>
       <td>${c.messageCount}</td>
@@ -753,97 +782,118 @@ async function renderContacts() {
     </tr>`;
   }
 
-  function render() {
-    const q = document.getElementById("contactSearch").value.trim().toLowerCase();
-    const matches = (c) => c.phone.toLowerCase().includes(q) || (c.displayName || "").toLowerCase().includes(q);
-    const filteredPhones = q ? phoneContacts.filter(matches) : phoneContacts;
-    const filteredUsernames = q ? usernameContacts.filter(matches) : usernameContacts;
+  // Username-only contacts (no real phone number, e.g. a BSUID) keep the
+  // combined "Name (raw ID)" display they already had, but now also show
+  // where the contact came from.
+  function usernameContactRow(c) {
+    const label = c.displayName ? `${esc(c.displayName)} <span class="muted">(${esc(c.phone)})</span>` : esc(c.phone);
+    return `<tr>
+      <td>${label}</td>
+      <td>${esc(c.origin)}</td>
+      <td>${fmtTime(c.firstTimestamp)}</td>
+      <td>${fmtTime(c.lastTimestamp)}</td>
+      <td>${c.messageCount}</td>
+      <td>${c.unreadCount ? `<span class="unread-badge">${c.unreadCount}</span>` : "—"}</td>
+    </tr>`;
+  }
 
-    if (!filteredPhones.length && !filteredUsernames.length) {
+  function renderNumbersSubtab(q) {
+    subtitleEl.textContent = "Phone-number contacts, grouped by country.";
+    searchEl.placeholder = "Search phone number or name...";
+    const filtered = q ? phoneContacts.filter((c) => matchesQuery(c, q)) : phoneContacts;
+
+    if (!filtered.length) {
       groupsEl.innerHTML = `<p class="muted">No contacts match.</p>`;
-      bindExport([]);
+      bindExport([], "numbers");
       return;
     }
 
     const byCountry = new Map();
-    for (const c of filteredPhones) {
+    for (const c of filtered) {
       if (!byCountry.has(c.country.name)) byCountry.set(c.country.name, []);
       byCountry.get(c.country.name).push(c);
     }
-
     const otherNames = [...byCountry.keys()]
       .filter((n) => !CONTACT_COUNTRY_PRIORITY.includes(n))
       .sort((a, b) => a.localeCompare(b));
     const orderedNames = [...CONTACT_COUNTRY_PRIORITY.filter((n) => byCountry.has(n)), ...otherNames];
 
-    const countryCardsHtml = orderedNames
+    groupsEl.innerHTML = orderedNames
       .map((name) => {
         const rows = byCountry.get(name).sort((a, b) => (a.lastTimestamp < b.lastTimestamp ? 1 : -1));
         const flag = rows[0].country.alpha2 ? flagEmoji(rows[0].country.alpha2) : "🌍";
         return `<div class="card" style="margin-bottom:16px">
           <h2 style="margin-top:0">${flag} ${esc(name)} <span class="muted" style="font-weight:400">(${rows.length})</span></h2>
           <div class="table-wrap"><table>
-            <thead><tr><th>Contact</th><th>First contacted</th><th>Last contacted</th><th>Messages</th><th>New</th></tr></thead>
-            <tbody>${rows.map(contactRow).join("")}</tbody>
+            <thead><tr><th>Contact</th><th>Username</th><th>First contacted</th><th>Last contacted</th><th>Messages</th><th>New</th></tr></thead>
+            <tbody>${rows.map(phoneContactRow).join("")}</tbody>
           </table></div>
         </div>`;
       })
       .join("");
 
-    // WhatsApp usernames (BSUID) — no real phone number available, so
-    // these get their own section rather than a country group.
-    const sortedUsernames = [...filteredUsernames].sort((a, b) => (a.lastTimestamp < b.lastTimestamp ? 1 : -1));
-    const usernamesCardHtml = sortedUsernames.length
-      ? `<div class="card" style="margin-bottom:16px">
-          <h2 style="margin-top:0">🔒 Usernames <span class="muted" style="font-weight:400">(${sortedUsernames.length})</span></h2>
-          <p class="muted" style="margin-top:-4px">Customers who've hidden their phone number behind a WhatsApp username — no number available to group by country.</p>
-          <div class="table-wrap"><table>
-            <thead><tr><th>Contact</th><th>First contacted</th><th>Last contacted</th><th>Messages</th><th>New</th></tr></thead>
-            <tbody>${sortedUsernames.map(contactRow).join("")}</tbody>
-          </table></div>
-        </div>`
-      : "";
-
-    groupsEl.innerHTML = countryCardsHtml + usernamesCardHtml;
-
-    bindExport([...orderedNames.flatMap((name) => byCountry.get(name)), ...sortedUsernames]);
+    bindExport(orderedNames.flatMap((name) => byCountry.get(name)), "numbers");
   }
 
-  function bindExport(orderedRows) {
+  function renderUsernamesSubtab(q) {
+    subtitleEl.textContent =
+      "Contacts identified only by a WhatsApp username — no phone number available, so no country grouping either.";
+    searchEl.placeholder = "Search username or name...";
+    const filtered = q ? usernameContacts.filter((c) => matchesQuery(c, q)) : usernameContacts;
+
+    if (!filtered.length) {
+      groupsEl.innerHTML = `<p class="muted">No username-only contacts match.</p>`;
+      bindExport([], "usernames");
+      return;
+    }
+
+    const sorted = [...filtered].sort((a, b) => (a.lastTimestamp < b.lastTimestamp ? 1 : -1));
+    groupsEl.innerHTML = `<div class="card" style="margin-bottom:16px">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Contact</th><th>Origin</th><th>First contacted</th><th>Last contacted</th><th>Messages</th><th>New</th></tr></thead>
+        <tbody>${sorted.map(usernameContactRow).join("")}</tbody>
+      </table></div>
+    </div>`;
+
+    bindExport(sorted, "usernames");
+  }
+
+  function render() {
+    syncSubtabButtons();
+    const q = searchEl.value.trim().toLowerCase();
+    if (subTab === "numbers") renderNumbersSubtab(q);
+    else renderUsernamesSubtab(q);
+  }
+
+  function bindExport(rows, mode) {
+    const isNumbers = mode === "numbers";
+    const headers = isNumbers
+      ? ["Phone", "Username", "Country", "First contacted", "Last contacted", "Messages", "New messages"]
+      : ["Contact/Username", "Raw ID", "Origin", "First contacted", "Last contacted", "Messages", "New messages"];
+    const toRow = (c) =>
+      isNumbers
+        ? [c.phone, c.displayName || "", c.country.name, c.firstTimestamp, c.lastTimestamp, c.messageCount, c.unreadCount]
+        : [c.displayName || "", c.phone, c.origin, c.firstTimestamp, c.lastTimestamp, c.messageCount, c.unreadCount];
+    const filenameBase = isNumbers ? "hustleapp-contacts" : "hustleapp-usernames";
+    const title = isNumbers ? "Hustleapp Contacts" : "Hustleapp Usernames";
+
     document.getElementById("contactsExportCsv").onclick = () => {
-      exportCsv(
-        "hustleapp-contacts.csv",
-        ["Name", "Phone/Username", "Country", "First contacted", "Last contacted", "Messages", "New messages"],
-        orderedRows.map((c) => [
-          c.displayName || "",
-          c.phone,
-          c.country ? c.country.name : "Username",
-          c.firstTimestamp,
-          c.lastTimestamp,
-          c.messageCount,
-          c.unreadCount,
-        ])
-      );
+      exportCsv(`${filenameBase}.csv`, headers, rows.map(toRow));
     };
     document.getElementById("contactsExportPdf").onclick = () => {
-      exportPdf(
-        "hustleapp-contacts.pdf",
-        "Hustleapp Contacts",
-        ["Name", "Phone/Username", "Country", "First contacted", "Last contacted", "Messages", "New messages"],
-        orderedRows.map((c) => [
-          c.displayName || "",
-          c.phone,
-          c.country ? c.country.name : "Username",
-          c.firstTimestamp,
-          c.lastTimestamp,
-          c.messageCount,
-          c.unreadCount,
-        ])
-      );
+      exportPdf(`${filenameBase}.pdf`, title, headers, rows.map(toRow));
     };
   }
 
-  document.getElementById("contactSearch").addEventListener("input", render);
+  document.querySelectorAll(".subtab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.subtab === subTab) return;
+      subTab = btn.dataset.subtab;
+      searchEl.value = "";
+      render();
+    });
+  });
+  searchEl.addEventListener("input", render);
   render();
 }
 
