@@ -1286,6 +1286,34 @@ app.post("/webhook", async (req: Request, res: Response) => {
   // and bail out rather than wasting an API call on an empty "to".
   const from: string | undefined = message.from ?? change?.contacts?.[0]?.wa_id;
   if (!from) {
+    // Bug found live (2026-09-11, same day as the fix above): a DIFFERENT
+    // shape of "no from" keeps recurring — real people ("Hi", "Okay im
+    // good") landing on this webhook with no phone number anywhere in the
+    // payload at all. Instead, contacts[0] carries a "username" (not just
+    // "name") and messages[0] carries "from_user_id" — that's an Instagram
+    // DM, delivered here because this WABA's Meta Business App is also
+    // linked to an Instagram professional account, and Meta unifies both
+    // channels' messages onto the same webhook. There's no WhatsApp number
+    // to send a Cloud API reply to (that would need the separate Instagram
+    // Messaging API, not built here), but a real customer is on the other
+    // end getting silence — so at minimum, tell a human immediately rather
+    // than only leaving a trace in Railway's logs where nobody would see
+    // it in time to reply.
+    const igContact = change?.contacts?.[0];
+    const igUserId: string | undefined = message.from_user_id ?? igContact?.user_id;
+    if (igUserId) {
+      const igHandle = igContact?.profile?.username || igContact?.profile?.name || igUserId;
+      const igText: string =
+        message.text?.body || (message.type ? `[${message.type} message]` : "a message");
+      await notifyAgents(
+        `📸 Instagram DM from *@${igHandle}* landed on our WhatsApp webhook and the bot can't auto-reply (no phone number in an Instagram message) — please reply to them on Instagram directly.\n\nTheir message: "${igText}"`,
+        "an Instagram DM the bot can't reply to"
+      );
+      await logAlert(
+        `Instagram-routed message from @${igHandle} (${igUserId}) — no phone number, bot could not reply. Text: "${igText}"`
+      );
+      return;
+    }
     console.error("Inbound webhook message has no usable phone number (from/wa_id both missing) — raw payload:", JSON.stringify(req.body));
     return;
   }
