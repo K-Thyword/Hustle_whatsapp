@@ -1271,7 +1271,24 @@ app.post("/webhook", async (req: Request, res: Response) => {
   const message = change?.messages?.[0];
   if (!message) return; // status updates, etc. — ignore for now
 
-  const from: string = message.from; // phone number, e.g. "233241234567"
+  // Bug found live (2026-09-11): a real, recurring slice of inbound
+  // messages arrive with message.from missing/undefined — seen both on
+  // ad-referral opens and later on plain follow-ups from the same number,
+  // so it isn't only a referral-payload quirk. Previously this meant `from`
+  // silently became the literal string "undefined", every reply attempt
+  // failed at the WhatsApp API ("the parameter to is required"), and the
+  // customer got nothing back — exactly the "new numbers get no reply"
+  // report, since it's disproportionately a first contact. change.contacts
+  // carries the same phone number (as wa_id) alongside messages in every
+  // genuine WhatsApp webhook delivery, so it's a reliable fallback. If even
+  // that's missing, log the full raw payload — not just a derived summary
+  // — so a repeat of this can actually be diagnosed from Railway's logs,
+  // and bail out rather than wasting an API call on an empty "to".
+  const from: string | undefined = message.from ?? change?.contacts?.[0]?.wa_id;
+  if (!from) {
+    console.error("Inbound webhook message has no usable phone number (from/wa_id both missing) — raw payload:", JSON.stringify(req.body));
+    return;
+  }
 
   let text: string = message.text?.body?.trim() ?? "";
   let media: MediaAttachment | undefined;

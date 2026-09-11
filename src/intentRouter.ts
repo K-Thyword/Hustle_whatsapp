@@ -138,6 +138,19 @@ export async function routeIntent(message: string, context?: ConversationContext
     return { intent: "booking_intent" };
   }
 
+  // Found via live logs (2026-09-11): an empty/whitespace-only message —
+  // an unsupported message type with no caption, a sticker, a reaction,
+  // etc. — was reaching this point and getting sent to the Anthropic API
+  // as a user message with no content, which the API rejects outright
+  // (400: "messages.0: user messages must have non-empty content"). The
+  // catch block below already caught this and fell back to booking_intent,
+  // so it wasn't silently dropping the customer's message, but it was
+  // needlessly noisy and skipped classification for something easy to
+  // just call "greeting" directly instead.
+  if (!message.trim()) {
+    return { intent: "greeting" };
+  }
+
   try {
     const recentPosts = await getRecentPosts();
     const response = await anthropic.messages.create({
