@@ -1,4 +1,5 @@
 import "dotenv/config";
+import crypto from "crypto";
 import express, { Request, Response } from "express";
 import {
   getSession,
@@ -31,6 +32,7 @@ import {
   finalizeUsernameAndSubmission,
   buildPromoEntryConfirmation,
   buildUsernamePrompt,
+  buildAlreadyClaimedReply,
   PendingSubmission,
 } from "./promoEntry";
 import { getPromoStanding, buildPromoStandingReply, isAskingAboutOwnPromoStanding } from "./promoLeaderboard";
@@ -90,10 +92,61 @@ process.on("uncaughtException", (err) => {
 });
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    // Captures the exact raw bytes Meta sent, before JSON parsing —
+    // needed below to verify the webhook signature, which is an
+    // HMAC-SHA256 over the raw body. Verifying against a re-serialized
+    // copy of the parsed object would break on a genuine request too
+    // (whitespace/key-order can differ), so the raw buffer has to be kept
+    // around specifically for this.
+    verify: (req, _res, buf) => {
+      (req as Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET;
+
+// Confirms a /webhook POST actually came from Meta, not just anyone who
+// found the URL — flagged as missing in a 2026-09-11 security review.
+// WHATSAPP_VERIFY_TOKEN (used below in the one-time GET handshake) only
+// proves identity at initial setup; without this check, any POST to this
+// endpoint was processed as if it were a genuine WhatsApp message
+// delivery. Uses the Meta App Secret (Meta Business Manager > App
+// Settings > Basic > "App Secret" — NOT the same value as
+// WHATSAPP_ACCESS_TOKEN) to verify Meta's X-Hub-Signature-256 header.
+// Same conservative-fallback pattern as every other optional integration
+// in this app: if WHATSAPP_APP_SECRET isn't set, requests are still
+// allowed through unchanged (same behavior as before this existed)
+// rather than breaking the whole webhook, but a warning is logged once so
+// this doesn't just stay silently unset indefinitely.
+let warnedNoAppSecret = false;
+function isValidWebhookSignature(req: Request): boolean {
+  if (!WHATSAPP_APP_SECRET) {
+    if (!warnedNoAppSecret) {
+      console.warn(
+        "WHATSAPP_APP_SECRET not set — webhook signature verification is disabled; " +
+          "any request to /webhook is currently trusted without confirming it actually came from Meta."
+      );
+      warnedNoAppSecret = true;
+    }
+    return true;
+  }
+  const signatureHeader = req.header("x-hub-signature-256");
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+  if (!signatureHeader || !rawBody) return false;
+
+  const expected = "sha256=" + crypto.createHmac("sha256", WHATSAPP_APP_SECRET).update(rawBody).digest("hex");
+  const expectedBuf = Buffer.from(expected);
+  const actualBuf = Buffer.from(signatureHeader);
+  // Lengths must match before timingSafeEqual (it throws on mismatched
+  // lengths rather than just returning false).
+  if (expectedBuf.length !== actualBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, actualBuf);
+}
 
 // Any of these, anywhere in a message, hands the conversation to a human
 // agent — matches the Hustleapp policy that disputes/refunds and anything
@@ -1164,6 +1217,12 @@ export interface MediaAttachment {
 
 // --- 2. Inbound message handler ---
 app.post("/webhook", async (req: Request, res: Response) => {
+  if (!isValidWebhookSignature(req)) {
+    console.warn("Rejected a /webhook POST with a missing or invalid signature.");
+    res.sendStatus(403);
+    return;
+  }
+
   // Always 200 quickly — WhatsApp retries aggressively on non-200s.
   res.sendStatus(200);
 
@@ -1211,6 +1270,15 @@ app.post("/webhook", async (req: Request, res: Response) => {
       if (promoResult.status === "awaiting_username") {
         await updateSession(from, { data: { awaitingLeaderboardUsername: promoResult.pending } });
         await sendMessage(from, buildUsernamePrompt());
+        return;
+      }
+      if (promoResult.status === "already_claimed") {
+        // A different message, but the same one-time action already has a
+        // pending/approved submission on file for this entrant — logged to
+        // the DB as status='duplicate' for admin's awareness (see
+        // findExistingOneTimeClaim in promoEntry.ts) rather than a fresh
+        // item competing for approval a second time.
+        await sendMessage(from, buildAlreadyClaimedReply(promoResult.label));
         return;
       }
       if (promoResult.status === "duplicate") {

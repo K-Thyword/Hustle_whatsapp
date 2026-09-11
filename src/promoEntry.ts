@@ -299,6 +299,56 @@ function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as { code?: string }).code === "23505";
 }
 
+// Action types that only make sense claimed ONCE per entrant — you sign up
+// once, your profile becomes complete once, you follow an account once.
+// Deliberately excludes like_post/comment_post/post_hashtag_content (a
+// different post each time is a genuinely new, separate action) and
+// booking_completed (a different booking each time). tag_hustlers_comment
+// and share_anniversary are tied to "an anniversary post" (singular) in
+// their point_rules label, so treated as one-time too.
+const ONE_TIME_ACTION_TYPES = new Set<PromoActionType>([
+  "signup",
+  "complete_profile",
+  "follow_instagram",
+  "follow_facebook",
+  "follow_tiktok",
+  "follow_x",
+  "follow_youtube",
+  "share_anniversary",
+  "tag_hustlers_comment",
+]);
+
+// Found via a security/integrity review (2026-09-11): nothing at the
+// database level stopped the same entrant re-submitting a one-time action
+// and getting paid for it twice if two submissions both happened to get
+// approved. The schema already has exactly the right seam for this
+// (submissions.status supports a 'duplicate' value and a
+// duplicate_of_submission_id FK — admin.html even ships an unused
+// "Duplicate" filter chip for it) but nothing was ever writing to it.
+// This closes that gap on the bot's side: a second claim for a one-time
+// action a given entrant already has pending/approved gets logged (so
+// there's still a record/audit trail, and admin can override via the
+// existing Duplicate filter) but flagged, never inserted as a fresh
+// 'pending' item competing for approval.
+async function findExistingOneTimeClaim(entrantId: string, actionType: PromoActionType): Promise<string | undefined> {
+  if (!ONE_TIME_ACTION_TYPES.has(actionType)) return undefined;
+  const supabase = getSupabase();
+  if (!supabase) return undefined;
+  const { data, error } = await supabase
+    .from("submissions")
+    .select("id")
+    .eq("entrant_id", entrantId)
+    .eq("claimed_action_type", actionType)
+    .in("status", ["pending", "approved"])
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    console.error("[Promo entry] Failed to check for an existing claim:", error);
+    return undefined;
+  }
+  return (data as { id: string } | null)?.id ?? undefined;
+}
+
 async function insertSubmission(params: {
   entrantId: string;
   whatsappPhone: string;
@@ -306,7 +356,8 @@ async function insertSubmission(params: {
   screenshotPath: string;
   actionType: PromoActionType;
   targetRef: string | null;
-}): Promise<{ status: "logged" } | { status: "duplicate" } | { status: "error" }> {
+  duplicateOfSubmissionId?: string;
+}): Promise<{ status: "logged" } | { status: "already_claimed" } | { status: "duplicate" } | { status: "error" }> {
   const supabase = getSupabase();
   if (!supabase) return { status: "error" };
   const { error } = await supabase.from("submissions").insert({
@@ -316,19 +367,21 @@ async function insertSubmission(params: {
     image_url: params.screenshotPath,
     claimed_action_type: params.actionType,
     target_ref: params.targetRef,
-    status: "pending",
+    status: params.duplicateOfSubmissionId ? "duplicate" : "pending",
+    duplicate_of_submission_id: params.duplicateOfSubmissionId ?? null,
   });
   if (error) {
     if (isUniqueViolation(error)) {
       // Same whatsapp_message_id already logged — a webhook retry, not a
       // new entry. Silent no-op is correct: the customer already got a
-      // confirmation the first time.
+      // confirmation the first time. (Different concept from the DB's own
+      // 'duplicate' status above — this one never even inserts a new row.)
       return { status: "duplicate" };
     }
     console.error("[Promo entry] Failed to insert submission:", error);
     return { status: "error" };
   }
-  return { status: "logged" };
+  return params.duplicateOfSubmissionId ? { status: "already_claimed" } : { status: "logged" };
 }
 
 export interface PendingSubmission {
@@ -344,7 +397,8 @@ export type PromoEntryResult =
   | { status: "logged"; actionType: PromoActionType; label: string; points: number }
   | { status: "awaiting_username"; pending: PendingSubmission }
   | { status: "not_entry"; description?: string }
-  | { status: "duplicate" };
+  | { status: "duplicate" }
+  | { status: "already_claimed"; label: string };
 
 // The single entry point server.ts calls for an inbound image while the
 // promo is live. Downloads once, classifies once, and only for a
@@ -399,6 +453,8 @@ export async function processPromoScreenshot(
 
   await backfillEntrantIdentity(entrant, result.extractedName, result.extractedEmail);
 
+  const existingClaimId = await findExistingOneTimeClaim(entrant.id, actionType);
+
   const insertResult = await insertSubmission({
     entrantId: entrant.id,
     whatsappPhone,
@@ -406,10 +462,15 @@ export async function processPromoScreenshot(
     screenshotPath,
     actionType,
     targetRef: result.targetRef,
+    duplicateOfSubmissionId: existingClaimId,
   });
 
   if (insertResult.status === "duplicate") return { status: "duplicate" };
   if (insertResult.status === "error") return { status: "not_entry", description: result.description };
+  if (insertResult.status === "already_claimed") {
+    console.log(`[Promo entry] Flagged repeat ${actionType} claim from ${whatsappPhone} (entrant ${entrant.id}) as duplicate`);
+    return { status: "already_claimed", label: rule.label };
+  }
 
   console.log(`[Promo entry] Logged ${actionType} submission for ${whatsappPhone} (entrant ${entrant.id})`);
   return { status: "logged", actionType, label: rule.label, points: rule.points };
@@ -494,6 +555,15 @@ export async function finalizeUsernameAndSubmission(
 
 export function buildPromoEntryConfirmation(label: string, points: number): string {
   return `Got it — logged your entry for "${label}" (+${points} points) in the Hustle @1 promo! 🎉 Our team will review it and confirm soon.`;
+}
+
+// Sent when findExistingOneTimeClaim caught a repeat claim on a one-time
+// action — still recorded (status: 'duplicate' in the DB, visible to admin
+// via the existing Duplicate filter) but not treated as a fresh entry, so
+// the customer needs an honest, non-confusing reply rather than the usual
+// celebratory confirmation.
+export function buildAlreadyClaimedReply(label: string): string {
+  return `Looks like you've already got credit for "${label}" in the Hustle @1 promo — no need to resend that one. If that seems wrong, just say "agent" and we'll take a look.`;
 }
 
 export function buildUsernamePrompt(): string {
