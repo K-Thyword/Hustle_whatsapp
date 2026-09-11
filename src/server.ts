@@ -446,14 +446,35 @@ function describeEntryFlags(flags: EntryFlags | undefined): string | undefined {
   return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
-// Fires the notifyAgents ping for a just-logged promo submission, if
-// describeEntryFlags found anything worth a human look. Shared by every
-// place a promo submission can finish logging (a normal screenshot, one
-// that needed a username first, or one that needed a social handle first).
-async function notifyAgentsAboutEntryFlags(phone: string, label: string, flags: EntryFlags | undefined): Promise<void> {
-  const note = describeEntryFlags(flags);
-  if (!note) return;
-  await notifyAgents(`Hustle @1 submission from ${phone} ("${label}") needs a look: ${note}`, "a flagged promo submission");
+// Fires the notifyAgents ping for a just-logged promo submission. Shared
+// by every place a promo submission can finish logging (a normal
+// screenshot, one that needed a username first, one that needed a social
+// handle first, or one that only got logged after the customer clarified
+// what it was). Per Tee (2026-09-12): every submission gets an agent
+// alert now, not just flagged ones — every submission still lands as
+// status='pending' in Supabase either way, so this is purely about agents
+// hearing about it promptly instead of only finding it if they happen to
+// check the ops portal. describeEntryFlags' note (if any) gets folded in
+// as an extra "look closer at this one" line rather than being the only
+// reason a ping goes out at all.
+async function notifyAgentsAboutNewSubmission(
+  phone: string,
+  label: string,
+  points: number,
+  flags: EntryFlags | undefined,
+  bonus?: { label: string; points: number }
+): Promise<void> {
+  const flagNote = describeEntryFlags(flags);
+  let base = `New Hustle @1 submission from ${phone}: "${label}" (+${points} pts) — pending your approval in the promos.hustleapp.io admin dashboard.`;
+  if (bonus) {
+    // The same screenshot also earned a second, separate pending
+    // submission (see maybeAwardBonusCompleteProfile in promoEntry.ts) —
+    // flag it too, since it's its own row in the approval queue and easy
+    // to miss if only the primary label is mentioned.
+    base += ` Also logged "${bonus.label}" (+${bonus.points} pts) as a bonus from the same screenshot.`;
+  }
+  const message = flagNote ? `${base}\n⚠️ ${flagNote}` : base;
+  await notifyAgents(message, flagNote ? "a flagged promo submission" : "a promo submission to review");
 }
 
 // One unclear reply, a rejected date, a misread service type — any single
@@ -1396,7 +1417,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
       const promoResult = await processPromoScreenshot(from, message.image.id, message.id, caption || undefined);
       if (promoResult.status === "logged") {
         await sendMessage(from, buildPromoEntryConfirmation(promoResult.label, promoResult.points, promoResult.bonus));
-        await notifyAgentsAboutEntryFlags(from, promoResult.label, promoResult.flags);
+        await notifyAgentsAboutNewSubmission(from, promoResult.label, promoResult.points, promoResult.flags, promoResult.bonus);
         return;
       }
       if (promoResult.status === "awaiting_username") {
@@ -2102,7 +2123,7 @@ async function handleMessage(
       if (usernameResult.status === "logged") {
         await updateSession(phone, { data: { awaitingLeaderboardUsername: undefined } });
         await sendMessage(phone, buildPromoEntryConfirmation(usernameResult.label, usernameResult.points, usernameResult.bonus));
-        await notifyAgentsAboutEntryFlags(phone, usernameResult.label, usernameResult.flags);
+        await notifyAgentsAboutNewSubmission(phone, usernameResult.label, usernameResult.points, usernameResult.flags, usernameResult.bonus);
         return;
       }
       if (usernameResult.status === "awaiting_social_handle") {
@@ -2158,7 +2179,7 @@ async function handleMessage(
       if (handleResult.status === "logged") {
         await updateSession(phone, { data: { awaitingSocialHandle: undefined } });
         await sendMessage(phone, buildPromoEntryConfirmation(handleResult.label, handleResult.points));
-        await notifyAgentsAboutEntryFlags(phone, handleResult.label, handleResult.flags);
+        await notifyAgentsAboutNewSubmission(phone, handleResult.label, handleResult.points, handleResult.flags);
         return;
       }
       if (handleResult.status === "invalid") {
@@ -2199,7 +2220,7 @@ async function handleMessage(
       if (clarifyResult.status === "logged") {
         await updateSession(phone, { data: { awaitingPromoClarification: undefined } });
         await sendMessage(phone, buildPromoEntryConfirmation(clarifyResult.label, clarifyResult.points, clarifyResult.bonus));
-        await notifyAgentsAboutEntryFlags(phone, clarifyResult.label, clarifyResult.flags);
+        await notifyAgentsAboutNewSubmission(phone, clarifyResult.label, clarifyResult.points, clarifyResult.flags, clarifyResult.bonus);
         return;
       }
       if (clarifyResult.status === "awaiting_username") {
