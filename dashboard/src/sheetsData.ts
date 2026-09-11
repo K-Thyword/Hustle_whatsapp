@@ -207,17 +207,24 @@ export interface ConversationSummary {
 // "last seen per phone" state — there's no server-side notion of "read"
 // here, since the dashboard has no per-agent accounts to hang it off of
 // (see auth.ts) and stays deliberately stateless/read-only otherwise.
-// Same shape the bot enforces on write (src/googleSheet.ts) — kept here too
-// so any row already sitting in the sheet from before that validation
+// Same shapes the bot enforces on write (src/googleSheet.ts) — kept here
+// too so any row already sitting in the sheet from before that validation
 // existed (or typed in by hand) gets filtered out here rather than showing
 // up as an ungroupable, blank phantom "chat" (phone column holding
-// something like a business name instead of a real number).
+// something like a business name instead of a real number). A customer who
+// hides their number behind a WhatsApp username shows up here as a BSUID
+// (e.g. "GH.2522884254883161") instead of digits — just as valid a
+// conversation identity as a phone number, so it's accepted too.
 const PHONE_SHAPE_RE = /^\+?\d{7,15}$/;
+const BSUID_SHAPE_RE = /^[A-Za-z]{2}\.\d+$/;
+function isValidTranscriptPhone(value: string): boolean {
+  return PHONE_SHAPE_RE.test(value) || BSUID_SHAPE_RE.test(value);
+}
 
 export async function getTranscriptLines(): Promise<TranscriptLine[]> {
   const rows = await fetchTranscriptRows();
   return rows
-    .filter((row) => row.length >= 4 && PHONE_SHAPE_RE.test(row[1]))
+    .filter((row) => row.length >= 4 && isValidTranscriptPhone(row[1]))
     .map((row) => ({
       timestamp: row[0],
       phone: row[1],

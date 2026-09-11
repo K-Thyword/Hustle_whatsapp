@@ -599,7 +599,11 @@ const AGENT_COMMAND_RE =
 //   233241234567: Hi, this is Ama...    (chat directly — relayed with your name)
 //   233241234567: unclaim               (release it back to the team)
 //   233241234567: end                   (close it out, hand back to the bot)
-const LIVE_CHAT_COMMAND_RE = /^(\d{7,15})\s*:\s*([\s\S]*)$/;
+// Also matches a WhatsApp Business-Scoped User ID (BSUID, e.g.
+// "GH.2522884254883161") — see BSUID_RE below — so agents can still
+// claim/relay-chat with a customer who's hidden their phone number behind
+// a WhatsApp username, the same way they would for any other customer.
+const LIVE_CHAT_COMMAND_RE = /^(\d{7,15}|[A-Za-z]{2}\.\d+)\s*:\s*([\s\S]*)$/;
 
 const LIVE_CHAT_END_WORDS = ["end", "close", "resolved", "done"];
 
@@ -1280,41 +1284,30 @@ app.post("/webhook", async (req: Request, res: Response) => {
   // customer got nothing back — exactly the "new numbers get no reply"
   // report, since it's disproportionately a first contact. change.contacts
   // carries the same phone number (as wa_id) alongside messages in every
-  // genuine WhatsApp webhook delivery, so it's a reliable fallback. If even
-  // that's missing, log the full raw payload — not just a derived summary
-  // — so a repeat of this can actually be diagnosed from Railway's logs,
-  // and bail out rather than wasting an API call on an empty "to".
-  const from: string | undefined = message.from ?? change?.contacts?.[0]?.wa_id;
+  // genuine WhatsApp webhook delivery, so it's a reliable fallback.
+  //
+  // A first fix here (same day) wrongly diagnosed the remaining "still no
+  // from" cases as Instagram DMs, based on contacts[0] carrying a
+  // "username" and messages[0] carrying "from_user_id" instead of the
+  // usual wa_id/from — reasonable from the shape alone, but the customer
+  // then sent a screenshot of their own WhatsApp app proving these were
+  // genuine WhatsApp messages, delivered and read. The real explanation:
+  // Meta rolled out WhatsApp usernames in 2026, and a user who's enabled
+  // one can hide their phone number, in which case the webhook carries
+  // ONLY a Business-Scoped User ID (BSUID, format "GH.2522884254883161")
+  // in contacts[0].user_id / messages[0].from_user_id — no wa_id, no
+  // from — instead of a phone number. It's a second, parallel identifier
+  // space for the same real WhatsApp users, not a different channel. See
+  // https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids/
+  const from: string | undefined =
+    message.from ?? change?.contacts?.[0]?.wa_id ?? message.from_user_id ?? change?.contacts?.[0]?.user_id;
   if (!from) {
-    // Bug found live (2026-09-11, same day as the fix above): a DIFFERENT
-    // shape of "no from" keeps recurring — real people ("Hi", "Okay im
-    // good") landing on this webhook with no phone number anywhere in the
-    // payload at all. Instead, contacts[0] carries a "username" (not just
-    // "name") and messages[0] carries "from_user_id" — that's an Instagram
-    // DM, delivered here because this WABA's Meta Business App is also
-    // linked to an Instagram professional account, and Meta unifies both
-    // channels' messages onto the same webhook. There's no WhatsApp number
-    // to send a Cloud API reply to (that would need the separate Instagram
-    // Messaging API, not built here), but a real customer is on the other
-    // end getting silence — so at minimum, tell a human immediately rather
-    // than only leaving a trace in Railway's logs where nobody would see
-    // it in time to reply.
-    const igContact = change?.contacts?.[0];
-    const igUserId: string | undefined = message.from_user_id ?? igContact?.user_id;
-    if (igUserId) {
-      const igHandle = igContact?.profile?.username || igContact?.profile?.name || igUserId;
-      const igText: string =
-        message.text?.body || (message.type ? `[${message.type} message]` : "a message");
-      await notifyAgents(
-        `📸 Instagram DM from *@${igHandle}* landed on our WhatsApp webhook and the bot can't auto-reply (no phone number in an Instagram message) — please reply to them on Instagram directly.\n\nTheir message: "${igText}"`,
-        "an Instagram DM the bot can't reply to"
-      );
-      await logAlert(
-        `Instagram-routed message from @${igHandle} (${igUserId}) — no phone number, bot could not reply. Text: "${igText}"`
-      );
-      return;
-    }
-    console.error("Inbound webhook message has no usable phone number (from/wa_id both missing) — raw payload:", JSON.stringify(req.body));
+    // Per Meta's docs, a BSUID is always present once a message arrives at
+    // all — this should be unreachable in practice. Log the full raw
+    // payload rather than just a derived summary so a genuine new shape
+    // can actually be diagnosed from Railway's logs, and bail out rather
+    // than wasting an API call on an empty recipient.
+    console.error("Inbound webhook message has no usable phone number or BSUID — raw payload:", JSON.stringify(req.body));
     return;
   }
 
@@ -2915,6 +2908,25 @@ function startReminderSweep() {
 }
 
 // --- 5. Outbound sender ---
+
+// A WhatsApp Business-Scoped User ID (BSUID) — assigned to a customer who's
+// enabled a WhatsApp username and hidden their phone number, e.g.
+// "GH.2522884254883161". Looks nothing like a phone number, so it's a
+// reliable discriminator wherever `to`/`phone` might hold either kind of
+// id. See the webhook handler above for how these enter the system, and
+// whatsappRecipientField() below for how they go back out.
+const BSUID_RE = /^[A-Za-z]{2}\.\d+$/;
+
+// The WhatsApp Send Message API takes a phone number in `to`, OR — for a
+// customer who's hidden their number behind a username — a BSUID in a
+// separate `recipient` field instead; passing a BSUID in `to` fails
+// outright. Every outbound call below spreads this in rather than setting
+// `to` directly, so callers never have to know or care which kind of id
+// they're holding.
+function whatsappRecipientField(id: string): { to: string } | { recipient: string } {
+  return BSUID_RE.test(id) ? { recipient: id } : { to: id };
+}
+
 // If real WhatsApp credentials aren't set yet (local testing before Meta
 // access is sorted out), just log what would have been sent instead of
 // calling the real API and failing. Lets you test the full conversation
@@ -2947,7 +2959,7 @@ async function sendMessage(to: string, body: string) {
     },
     body: JSON.stringify({
       messaging_product: "whatsapp",
-      to,
+      ...whatsappRecipientField(to),
       text: { body },
     }),
   });
@@ -3006,7 +3018,7 @@ async function sendTemplateMessage(
     },
     body: JSON.stringify({
       messaging_product: "whatsapp",
-      to,
+      ...whatsappRecipientField(to),
       type: "template",
       template: {
         name: templateName,
@@ -3045,7 +3057,7 @@ async function sendMedia(to: string, media: MediaAttachment) {
     },
     body: JSON.stringify({
       messaging_product: "whatsapp",
-      to,
+      ...whatsappRecipientField(to),
       type: media.type,
       [media.type]: { id: media.id },
     }),

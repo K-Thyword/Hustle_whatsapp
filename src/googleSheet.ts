@@ -188,17 +188,25 @@ export type TranscriptDirection = "customer" | "bot";
 
 // WhatsApp phone numbers arrive as bare digit strings (country code +
 // number, e.g. "233556963137") — never letters, spaces, or punctuation
-// beyond an optional leading "+". The dashboard groups Transcript rows by
-// an exact match on this column (see dashboard/src/sheetsData.ts), so a
-// single malformed value here becomes a permanent, ungroupable phantom
-// "chat" in the UI. Guard at the write site rather than trusting every
-// call site upstream to already hold a validated phone.
+// beyond an optional leading "+". A customer who's hidden their number
+// behind a WhatsApp username instead carries a Business-Scoped User ID
+// (BSUID, e.g. "GH.2522884254883161" — see server.ts's BSUID_RE), which is
+// just as legitimate an identifier as a phone number. The dashboard groups
+// Transcript rows by an exact match on this column (see
+// dashboard/src/sheetsData.ts), so a value that's neither shape becomes a
+// permanent, ungroupable phantom "chat" in the UI. Guard at the write site
+// rather than trusting every call site upstream to already hold one or the
+// other.
 const PHONE_SHAPE_RE = /^\+?\d{7,15}$/;
+const BSUID_SHAPE_RE = /^[A-Za-z]{2}\.\d+$/;
+function isValidTranscriptPhone(value: string): boolean {
+  return PHONE_SHAPE_RE.test(value) || BSUID_SHAPE_RE.test(value);
+}
 
 export async function logTranscriptLine(phone: string, direction: TranscriptDirection, text: string): Promise<void> {
   if (!text) return;
-  if (!PHONE_SHAPE_RE.test(phone)) {
-    console.error(`Refusing to log a transcript line for a non-phone-shaped value: ${JSON.stringify(phone)}`);
+  if (!isValidTranscriptPhone(phone)) {
+    console.error(`Refusing to log a transcript line for a non-phone/non-BSUID value: ${JSON.stringify(phone)}`);
     return;
   }
   const client = getClient();
